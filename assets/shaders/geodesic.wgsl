@@ -70,8 +70,12 @@ fn init_ray(pos: vec3<f32>, dir: vec3<f32>) -> Ray {
     ray.dtheta = (cos(ray.theta)*cos(ray.phi)*dx
                + cos(ray.theta)*sin(ray.phi)*dy
                - sin(ray.theta)*dz) / ray.r;
-    ray.dphi   = (-sin(ray.phi)*dx + cos(ray.phi)*dy)
-               / (ray.r * sin(ray.theta));
+    let dphi_denom = ray.r * sin(ray.theta);
+    ray.dphi = select(
+        (-sin(ray.phi)*dx + cos(ray.phi)*dy) / dphi_denom,
+        0.0,
+        abs(dphi_denom) < 1e-10
+    );
 
     ray.l = ray.r * ray.r * sin(ray.theta) * ray.dphi;
 
@@ -106,28 +110,42 @@ fn geodesic_rhs(ray: Ray) -> Derivs {
              + r * (dtheta * dtheta + sin(theta) * sin(theta) * dphi * dphi);
     d.d2.y = -2.0 * dr * dtheta / r
              + sin(theta) * cos(theta) * dphi * dphi;
+    let sin_t  = sin(theta);
+    let cot_t  = select(cos(theta) / sin_t, 0.0, abs(sin_t) < 1e-10);
     d.d2.z = -2.0 * dr * dphi / r
-             - 2.0 * cos(theta) / sin(theta) * dtheta * dphi;
+             - 2.0 * cot_t * dtheta * dphi;
     return d;
 }
 
-// The original C++ uses a simplified "Euler with RK4 naming"; we preserve
-// that behaviour exactly so the visual output matches.
-fn step_ray(ray: Ray, dL: f32) -> Ray {
-    var r = ray;
-    let d = geodesic_rhs(r);
+fn rk4_state(base: Ray, k: Derivs, h: f32) -> Ray {
+    var s    = base;
+    s.r      = base.r      + h * k.d1.x;
+    s.theta  = base.theta  + h * k.d1.y;
+    s.phi    = base.phi    + h * k.d1.z;
+    s.dr     = base.dr     + h * k.d2.x;
+    s.dtheta = base.dtheta + h * k.d2.y;
+    s.dphi   = base.dphi   + h * k.d2.z;
+    return s;
+}
 
-    r.r      += dL * d.d1.x;
-    r.theta  += dL * d.d1.y;
-    r.phi    += dL * d.d1.z;
-    r.dr     += dL * d.d2.x;
-    r.dtheta += dL * d.d2.y;
-    r.dphi   += dL * d.d2.z;
+fn step_ray(ray: Ray, dL: f32) -> Ray {
+    let k1 = geodesic_rhs(ray);
+    let k2 = geodesic_rhs(rk4_state(ray, k1, 0.5 * dL));
+    let k3 = geodesic_rhs(rk4_state(ray, k2, 0.5 * dL));
+    let k4 = geodesic_rhs(rk4_state(ray, k3,       dL));
+
+    let s = dL / 6.0;
+    var r = ray;
+    r.r      += s * (k1.d1.x + 2.0*k2.d1.x + 2.0*k3.d1.x + k4.d1.x);
+    r.theta  += s * (k1.d1.y + 2.0*k2.d1.y + 2.0*k3.d1.y + k4.d1.y);
+    r.phi    += s * (k1.d1.z + 2.0*k2.d1.z + 2.0*k3.d1.z + k4.d1.z);
+    r.dr     += s * (k1.d2.x + 2.0*k2.d2.x + 2.0*k3.d2.x + k4.d2.x);
+    r.dtheta += s * (k1.d2.y + 2.0*k2.d2.y + 2.0*k3.d2.y + k4.d2.y);
+    r.dphi   += s * (k1.d2.z + 2.0*k2.d2.z + 2.0*k3.d2.z + k4.d2.z);
 
     r.x = r.r * sin(r.theta) * cos(r.phi);
     r.y = r.r * sin(r.theta) * sin(r.phi);
     r.z = r.r * cos(r.theta);
-
     return r;
 }
 

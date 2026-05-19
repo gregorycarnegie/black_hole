@@ -1,7 +1,7 @@
 # Black Hole Simulator — Road to 10/10
 
 ## Physics Accuracy
-- [ ] Fix geodesic integrator: replace mislabeled "RK4" (currently Euler) with true 4th-order Runge-Kutta
+- [x] Fix geodesic integrator: replace mislabeled "RK4" (currently Euler) with true 4th-order Runge-Kutta
 - [ ] Add adaptive step size to geodesic integration (smaller steps near event horizon, larger far away)
 - [ ] Fix multi-object physics inconsistency: light bending currently only uses Sag A* metric; other massive objects affect Newtonian gravity but not ray paths
 
@@ -10,7 +10,7 @@
 - [ ] Add temporal anti-aliasing / accumulation buffer for smoother output
 
 ## Robustness
-- [ ] Add NaN/infinity guards in geodesic shader (divide-by-zero risk when sin(θ) ≈ 0 near poles)
+- [x] Add NaN/infinity guards in geodesic shader (divide-by-zero risk when sin(θ) ≈ 0 near poles)
 - [ ] Guard against log(0) in spacetime grid displacement calculation
 
 ## Configurability
