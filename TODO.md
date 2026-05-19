@@ -6,7 +6,7 @@
 - [ ] Fix multi-object physics inconsistency: light bending currently only uses Sag A* metric; other massive objects affect Newtonian gravity but not ray paths
 
 ## Rendering Quality
-- [ ] Increase native compute shader resolution (200×150 → at least 800×600), or make it configurable at runtime
+- [x] Increase native compute shader resolution (200×150 → at least 800×600), or make it configurable at runtime
 - [ ] Add temporal anti-aliasing / accumulation buffer for smoother output
 
 ## Robustness
@@ -14,9 +14,9 @@
 - [ ] Guard against log(0) in spacetime grid displacement calculation
 
 ## Configurability
-- [ ] Remove hardcoded aspect ratio (800/600 in `src/camera.rs:75`) — derive from window size
+- [x] Remove hardcoded aspect ratio (800/600 in `src/camera.rs:75`) — derive from window size
 - [ ] Remove hardcoded FOV (60° in `src/camera.rs:72`) — expose as runtime parameter
-- [ ] Remove hardcoded resolution in compute pipeline — derive or expose via config
+- [x] Remove hardcoded resolution in compute pipeline — derive or expose via config
 
 ## Performance
 - [ ] Cache spacetime grid vertices; only recompute when object positions change

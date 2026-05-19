@@ -71,10 +71,6 @@ impl OrbitalCamera {
     pub fn tan_half_fov(&self) -> f32 {
         (60.0_f32.to_radians() * 0.5).tan()
     }
-
-    pub fn aspect(&self) -> f32 {
-        800.0 / 600.0
-    }
 }
 
 /// Marker for the 3D perspective camera used to render the grid.

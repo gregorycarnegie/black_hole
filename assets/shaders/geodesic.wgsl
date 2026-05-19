@@ -44,9 +44,7 @@ struct Objects {
 const SAGA_RS:        f32 = 1.269e10;
 const D_LAMBDA_BASE:  f32 = 1.0e7;   // step size at r == r_s
 const D_LAMBDA_MAX:   f32 = 1.0e10;  // cap for far-field rays
-const ESCAPE_R:       f32 = 1.0e30;
-const WIDTH:     i32 = 200;
-const HEIGHT:    i32 = 150;
+const ESCAPE_R:       f32 = 1.0e13;  // ~100x camera radius; reachable with adaptive dL
 
 // ── Ray state ────────────────────────────────────────────────────────────────
 
@@ -181,11 +179,12 @@ fn intersect_objects(pos: vec3<f32>) -> ObjectHit {
 
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pix = vec2<i32>(i32(gid.x), i32(gid.y));
-    if pix.x >= WIDTH || pix.y >= HEIGHT { return; }
+    let dims = textureDimensions(out_image);
+    let pix  = vec2<i32>(i32(gid.x), i32(gid.y));
+    if pix.x >= i32(dims.x) || pix.y >= i32(dims.y) { return; }
 
-    let u = (2.0 * (f32(pix.x) + 0.5) / f32(WIDTH)  - 1.0) * cam.aspect * cam.tan_half_fov;
-    let v = (1.0 - 2.0 * (f32(pix.y) + 0.5) / f32(HEIGHT)) * cam.tan_half_fov;
+    let u = (2.0 * (f32(pix.x) + 0.5) / f32(dims.x) - 1.0) * cam.aspect * cam.tan_half_fov;
+    let v = (1.0 - 2.0 * (f32(pix.y) + 0.5) / f32(dims.y)) * cam.tan_half_fov;
     let dir = normalize(u * cam.right - v * cam.up + cam.forward);
 
     var ray      = init_ray(cam.pos, dir);
@@ -197,7 +196,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var hit_object     = false;
     var obj_hit: ObjectHit;
 
-    for (var i = 0; i < 60000; i++) {
+    for (var i = 0; i < 10000; i++) {
         if ray.r <= SAGA_RS { hit_black_hole = true; break; }
 
         let dL = clamp(D_LAMBDA_BASE * (ray.r / SAGA_RS), D_LAMBDA_BASE, D_LAMBDA_MAX);

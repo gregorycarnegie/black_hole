@@ -1,6 +1,7 @@
 use bevy::{
     asset::RenderAssetUsages,
     prelude::*,
+    window::PrimaryWindow,
     render::{
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_graph::{RenderGraph, RenderLabel},
@@ -12,9 +13,6 @@ mod pipeline;
 use pipeline::{init_geodesic_pipeline, prepare_bind_group, GeodesicNode};
 
 use crate::{camera::OrbitalCamera, simulation::SimObjects};
-
-pub const COMPUTE_WIDTH: u32 = 200;
-pub const COMPUTE_HEIGHT: u32 = 150;
 
 pub struct GeodesicComputePlugin;
 
@@ -102,26 +100,30 @@ impl Plugin for GeodesicComputePlugin {
 
 // ── Startup: create output texture + display sprite ─────────────────────────
 
-fn setup_compute_texture(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+fn setup_compute_texture(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+) {
     use bevy::render::render_resource::{TextureFormat, TextureUsages};
 
-    let mut image = Image::new_target_texture(
-        COMPUTE_WIDTH,
-        COMPUTE_HEIGHT,
-        TextureFormat::Rgba8Unorm,
-        None,
-    );
+    let (win_w, win_h) = windows.single().ok()
+        .map(|win| (win.physical_width(), win.physical_height()))
+        .unwrap_or((800, 600));
+    // Render at half resolution, upscale 2× via sprite — halves GPU load
+    let (w, h) = ((win_w / 2).max(1), (win_h / 2).max(1));
+
+    let mut image = Image::new_target_texture(w, h, TextureFormat::Rgba8Unorm, None);
     image.asset_usage = RenderAssetUsages::RENDER_WORLD;
     image.texture_descriptor.usage =
         TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
 
     let handle = images.add(image);
 
-    // Scale the sprite to fill the 800×600 window.
     commands.spawn((
         Sprite {
             image: handle.clone(),
-            custom_size: Some(Vec2::new(800.0, 600.0)),
+            custom_size: Some(Vec2::new(win_w as f32, win_h as f32)),
             ..default()
         },
         Transform::default(),
@@ -132,7 +134,15 @@ fn setup_compute_texture(mut commands: Commands, mut images: ResMut<Assets<Image
 
 // ── Per-frame uniform syncs ──────────────────────────────────────────────────
 
-fn sync_camera_uniform(cam: Res<OrbitalCamera>, mut uniform: ResMut<CameraUniform>) {
+fn sync_camera_uniform(
+    cam: Res<OrbitalCamera>,
+    mut uniform: ResMut<CameraUniform>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+) {
+    let aspect = windows.single().ok()
+        .map(|w| if w.height() > 0.0 { w.width() / w.height() } else { 800.0 / 600.0 })
+        .unwrap_or(800.0 / 600.0);
+
     *uniform = CameraUniform {
         pos: cam.position(),
         _pad0: 0.0,
@@ -143,7 +153,7 @@ fn sync_camera_uniform(cam: Res<OrbitalCamera>, mut uniform: ResMut<CameraUnifor
         forward: cam.forward(),
         _pad3: 0.0,
         tan_half_fov: cam.tan_half_fov(),
-        aspect: cam.aspect(),
+        aspect,
         moving: cam.is_moving as u32,
         _pad4: 0,
     };

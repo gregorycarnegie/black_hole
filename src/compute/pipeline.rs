@@ -16,7 +16,7 @@ use bevy::{
 };
 use bytemuck::Zeroable;
 
-use super::{CameraUniform, GeodesicImage, ObjectsUniform, COMPUTE_HEIGHT, COMPUTE_WIDTH};
+use super::{CameraUniform, GeodesicImage, ObjectsUniform};
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
 
@@ -268,17 +268,19 @@ impl render_graph::Node for GeodesicNode {
             return Ok(());
         };
 
+        let (dispatch_x, dispatch_y) = world
+            .get_resource::<GeodesicImage>()
+            .and_then(|gi| world.resource::<RenderAssets<GpuImage>>().get(&gi.0))
+            .map(|img| (img.size.width.div_ceil(16), img.size.height.div_ceil(16)))
+            .unwrap_or((1, 1));
+
         let mut pass = render_context
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor::default());
 
         pass.set_bind_group(0, &bind_group.0, &[]);
         pass.set_pipeline(pipeline);
-        pass.dispatch_workgroups(
-            COMPUTE_WIDTH.div_ceil(16),
-            COMPUTE_HEIGHT.div_ceil(16),
-            1,
-        );
+        pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 
         Ok(())
     }
