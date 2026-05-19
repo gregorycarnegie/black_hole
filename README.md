@@ -1,71 +1,36 @@
 # **black**_**hole**
 
-Black hole simulation project
+Real-time black hole visualization using GPU ray-tracing in Bevy (Rust).
 
-Here is the black hole raw code, everything will be inside a src bin incase you want to copy the files
+Simulates null geodesics (light paths) in Schwarzschild spacetime around Sagittarius A*, with an accretion disk and a deformed spacetime grid.
 
-I'm writing this as I'm beginning this project (hopefully I complete it ;D) here is what I plan to do:
+## Features
 
-1. Ray-tracing : add ray tracing to the gravity simulation to simulate gravitational lensing
+1. **GPU ray-tracing** — compute shader integrates null geodesics using RK4 in Schwarzschild coordinates
+2. **Accretion disk** — rays that cross the equatorial plane within the disk radius render as an orange glow
+3. **Spacetime grid** — wireframe grid deformed by the Schwarzschild metric of each massive object
+4. **N-body gravity** — optional Newtonian gravity simulation between scene objects
 
-2. Accretion disk : simulate accreciate disk using the ray tracing + the halos
+## Controls
 
-3. Spacetime curvature : demonstrate visually the "trapdoor in spacetime" that is black holes using spacetime grid
+| Input | Action |
+|---|---|
+| Left mouse drag | Orbit camera |
+| Scroll wheel | Zoom in/out |
+| G | Toggle n-body gravity |
 
-4. [optional] try to make it run realtime ;D
+## Building
 
-I hope it works :/
-
-Edit: After completion of project -
-
-## **Building Requirements:**
-
-1. C++ Compiler supporting C++ 17 or newer
-
-2. [Cmake](https://cmake.org/)
-
-3. [Vcpkg](https://vcpkg.io/en/)
-
-4. [Git](https://git-scm.com/)
-
-## **Build Instructions:**
-
-1. Clone the repository:
-	-  `git clone https://github.com/kavan010/black_hole.git`
-2. CD into the newly cloned directory
-	- `cd ./black_hole` 
-3. Install dependencies with Vcpkg
-	- `vcpkg install`
-4. Get the vcpkg cmake toolchain file path
-	- `vcpkg integrate install`
-	- This will output something like : `CMake projects should use: "-DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake"`
-5. Create a build directory
-	- `mkdir build`
-6. Configure project with CMake
-	-  `cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake`
-	- Use the vcpkg cmake toolchain path from above
-7. Build the project
-	- `cmake --build build`
-8. Run the program
-	- The executables will be located in the build folder
-
-### Alternative: Debian/Ubuntu apt workaround
-
-If you don't want to use vcpkg, or you just need a quick way to install the native development packages on Debian/Ubuntu, install these packages and then run the normal CMake steps above:
+Requires [Rust](https://rustup.rs/) (stable).
 
 ```bash
-sudo apt update
-sudo apt install build-essential cmake \
-	libglew-dev libglfw3-dev libglm-dev libgl1-mesa-dev
+git clone https://github.com/kavan010/black_hole.git
+cd black_hole
+cargo run --release
 ```
 
-This provides the GLEW, GLFW, GLM and OpenGL development files so `find_package(...)` calls in `CMakeLists.txt` can locate the libraries. After installing, run the `cmake -B build -S .` and `cmake --build build` commands as shown in the Build Instructions.
+## How it works
 
-## **How the code works:**
-for 2D: simple, just run 2D_lensing.cpp with the nessesary dependencies installed.
+`src/compute/pipeline.rs` sets up a Bevy render graph node that dispatches `assets/shaders/geodesic.wgsl` — a WGSL compute shader — every frame. The shader receives the camera position, accretion disk parameters, and scene objects via uniform buffers, then traces each pixel as a null geodesic through curved spacetime, writing the result to a storage texture that is displayed as a fullscreen sprite.
 
-for 3D: black_hole.cpp and geodesic.comp work together to run the simuation faster using GPU, essentially it sends over a UBO and geodesic.comp runs heavy calculations using that data.
-
-should work with nessesary dependencies installed, however I have only run it on windows with my GPU so am not sure!
-
-LMK if you would like an in-depth explanation of how the code works aswell :)
+The spacetime grid is drawn each frame using Bevy's `Gizmos` API, with vertex Y-positions displaced by `2 * sqrt(r_s * (r - r_s))` (the Schwarzschild embedding).
