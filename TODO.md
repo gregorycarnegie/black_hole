@@ -2,7 +2,7 @@
 
 ## Physics Accuracy
 - [x] Fix geodesic integrator: replace mislabeled "RK4" (currently Euler) with true 4th-order Runge-Kutta
-- [ ] Add adaptive step size to geodesic integration (smaller steps near event horizon, larger far away)
+- [x] Add adaptive step size to geodesic integration (smaller steps near event horizon, larger far away)
 - [ ] Fix multi-object physics inconsistency: light bending currently only uses Sag A* metric; other massive objects affect Newtonian gravity but not ray paths
 
 ## Rendering Quality

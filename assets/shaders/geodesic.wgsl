@@ -41,9 +41,10 @@ struct Objects {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SAGA_RS:   f32 = 1.269e10;
-const D_LAMBDA:  f32 = 1.0e7;
-const ESCAPE_R:  f32 = 1.0e30;
+const SAGA_RS:        f32 = 1.269e10;
+const D_LAMBDA_BASE:  f32 = 1.0e7;   // step size at r == r_s
+const D_LAMBDA_MAX:   f32 = 1.0e10;  // cap for far-field rays
+const ESCAPE_R:       f32 = 1.0e30;
 const WIDTH:     i32 = 200;
 const HEIGHT:    i32 = 150;
 
@@ -199,7 +200,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i = 0; i < 60000; i++) {
         if ray.r <= SAGA_RS { hit_black_hole = true; break; }
 
-        ray = step_ray(ray, D_LAMBDA);
+        let dL = clamp(D_LAMBDA_BASE * (ray.r / SAGA_RS), D_LAMBDA_BASE, D_LAMBDA_MAX);
+        ray = step_ray(ray, dL);
 
         let new_pos = vec3<f32>(ray.x, ray.y, ray.z);
 
