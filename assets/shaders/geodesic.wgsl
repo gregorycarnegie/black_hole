@@ -218,9 +218,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     if hit_disk {
-        let r      = length(vec3<f32>(ray.x, ray.y, ray.z)) / disk.r2;
-        let disk_c = vec3<f32>(1.0, r, 0.2);
-        color      = vec4<f32>(disk_c, r);
+        // Project hit to equatorial plane for orbital mechanics.
+        let disk_pt   = vec3<f32>(ray.x, 0.0, ray.z);
+        let r_disk    = length(disk_pt);
+        let r_norm    = r_disk / disk.r2;
+
+        // Keplerian orbital speed in Schwarzschild coords: v/c = sqrt(r_s / 2r).
+        // Clamped so we never exceed c at the innermost stable orbit.
+        let beta      = sqrt(SAGA_RS / max(2.0 * r_disk, SAGA_RS));
+        // Prograde tangential direction in the equatorial plane.
+        let orbital   = normalize(vec3<f32>(-ray.z, 0.0, ray.x));
+        let to_cam    = normalize(cam.pos - disk_pt);
+        let cos_alpha = dot(orbital, to_cam);
+
+        // Relativistic Doppler factor D; guard denominator against singularity.
+        let denom  = max(1.0 - beta * cos_alpha, 1e-4);
+        let doppler = sqrt((1.0 + beta * cos_alpha) / denom);
+
+        // Base disk colour: orange-yellow gradient from inner to outer edge.
+        let base   = vec3<f32>(1.0, r_norm, 0.2);
+        // Doppler beaming: intensity scales as D^3 (power-law for synchrotron-like emission).
+        let bright  = pow(clamp(doppler, 0.1, 8.0), 3.0);
+        // Colour shift: blue side approaches, red side recedes.
+        let shift   = clamp((doppler - 1.0) * 2.0, -1.0, 1.0);
+        let disk_c  = clamp(
+            base + vec3<f32>(-shift * 0.35, -shift * 0.1, shift * 0.55),
+            vec3<f32>(0.0), vec3<f32>(1.0)
+        ) * bright;
+        color = vec4<f32>(disk_c, r_norm);
 
     } else if hit_black_hole {
         color = vec4<f32>(0.0, 0.0, 0.0, 1.0);

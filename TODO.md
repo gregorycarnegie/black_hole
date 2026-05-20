@@ -19,9 +19,9 @@
 - [x] Remove hardcoded resolution in compute pipeline — derive or expose via config
 
 ## Performance
-- [ ] Cache spacetime grid vertices; only recompute when object positions change
+- [x] Cache spacetime grid vertices; only recompute when object positions change
 - [ ] Consider adaptive LOD for grid density based on camera distance
 
 ## Visual Fidelity
 - [ ] Improve accretion disk: add thickness / 3D volume instead of infinitesimally thin equatorial plane
-- [ ] Add Doppler shift / blueshift coloring to accretion disk based on orbit velocity
+- [x] Add Doppler shift / blueshift coloring to accretion disk based on orbit velocity
