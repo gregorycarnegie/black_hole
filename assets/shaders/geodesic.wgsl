@@ -231,9 +231,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let to_cam    = normalize(cam.pos - disk_pt);
         let cos_alpha = dot(orbital, to_cam);
 
-        // Relativistic Doppler factor D; guard denominator against singularity.
-        let denom  = max(1.0 - beta * cos_alpha, 1e-4);
-        let doppler = sqrt((1.0 + beta * cos_alpha) / denom);
+        // Fully relativistic Doppler: D = 1 / (γ · (1 − β·cos_α)).
+        // The γ term captures transverse Doppler redshift absent from the
+        // naive longitudinal formula sqrt((1+β)/(1-β)).
+        let gamma   = 1.0 / sqrt(max(1.0 - beta * beta, 1e-6));
+        let denom   = max(gamma * (1.0 - beta * cos_alpha), 1e-4);
+        let doppler_kin = 1.0 / denom;
+
+        // Gravitational redshift: photons climbing out of the Schwarzschild well
+        // lose energy by D_grav = sqrt(1 - r_s/r).  Inner disk (~2.2 r_s) ≈ 26% redshift.
+        let d_grav  = sqrt(max(1.0 - SAGA_RS / r_disk, 0.0));
+        let doppler = doppler_kin * d_grav;
 
         // Base disk colour: orange-yellow gradient from inner to outer edge.
         let base   = vec3<f32>(1.0, r_norm, 0.2);
