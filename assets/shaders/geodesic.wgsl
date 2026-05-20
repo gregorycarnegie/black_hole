@@ -435,7 +435,7 @@ fn orbital_beta_kerr(r_disk: f32) -> f32 {
     let spin = spin_clamped();
     let orbit_sign = select(-1.0, 1.0, spin >= 0.0);
     let rho = max(r_disk / BH_M, 1.0);
-    let omega_orbit = orbit_sign / (BH_M * max(rho * sqrt(rho) + abs(spin), 1.0e-4));
+    let omega_orbit = orbit_sign / (BH_M * max(rho * sqrt(rho) + orbit_sign * abs(spin), 1.0e-4));
     let omega_drag = frame_drag_omega(r_disk, 0.5 * PI);
     let lapse = max(kerr_lapse(r_disk, 0.5 * PI), 1.0e-4);
 
@@ -513,10 +513,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
         }
 
-        let horizon_gap = max(ray.r - disk.horizon_r, 0.0);
-        let near_horizon_scale = max(horizon_gap / SAGA_RS, 0.1);
         let dL = clamp(
-            D_LAMBDA_BASE * min(ray.r / SAGA_RS, near_horizon_scale),
+            D_LAMBDA_BASE * (ray.r - disk.horizon_r) / SAGA_RS,
             D_LAMBDA_BASE * 0.25,
             D_LAMBDA_MAX
         );

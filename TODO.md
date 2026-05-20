@@ -4,6 +4,8 @@
 - [x] Fix geodesic integrator: replace mislabeled "RK4" (currently Euler) with true 4th-order Runge-Kutta
 - [x] Add adaptive step size to geodesic integration (smaller steps near event horizon, larger far away)
 - [ ] Fix multi-object physics inconsistency: light bending currently only uses Sag A* metric; other massive objects affect Newtonian gravity but not ray paths
+- [x] Fix `orbital_beta_kerr` retrograde denominator: formula uses `rho^(3/2) + |a|` for all spins; retrograde (spin < 0) needs `rho^(3/2) - |a|` (latent bug, no effect at KERR_SPIN = 0.82)
+- [x] Simplify near-horizon step size: `near_horizon_scale` floor of 0.1 is always overridden by the `clamp` minimum of 0.25 — dead code in `geodesic.wgsl` main loop
 
 ## Relativistic Effects
 - [x] Kinematic Doppler shift (fully relativistic: transverse Doppler via γ term)
