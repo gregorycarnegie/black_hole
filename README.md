@@ -1,9 +1,9 @@
-# **black**_**hole**
-
 [![Rust](https://img.shields.io/badge/Rust-2024-f74c00?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Bevy](https://img.shields.io/badge/Bevy-0.18.1-232326?logo=bevy&logoColor=white)](https://bevyengine.org/)
 ![WGSL](https://img.shields.io/badge/WGSL-compute%20shader-005a9c)
 ![Status](https://img.shields.io/badge/status-experimental-yellow)
+
+# **black**_**hole**
 
 Real-time black hole visualization using GPU ray-tracing in Bevy (Rust).
 
