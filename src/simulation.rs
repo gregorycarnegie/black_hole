@@ -149,7 +149,7 @@ fn gravity_system(mut objects: ResMut<SimObjects>, gravity: Res<GravityEnabled>)
     let n = objects.0.len();
     let mut accelerations = vec![Vec3::ZERO; n];
 
-    for i in 0..n {
+    for (i, acc_i) in accelerations.iter_mut().enumerate() {
         for j in 0..n {
             if i == j {
                 continue;
@@ -160,7 +160,7 @@ fn gravity_system(mut objects: ResMut<SimObjects>, gravity: Res<GravityEnabled>)
                 let force =
                     (G_CONST as f32 * objects.0[i].mass * objects.0[j].mass) / (dist * dist);
                 let acc = force / objects.0[i].mass;
-                accelerations[i] += diff.normalize() * acc;
+                *acc_i += diff.normalize() * acc;
             }
         }
     }

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use bevy::{
+    ecs::system::SystemParam,
     prelude::*,
     render::{
         render_asset::RenderAssets,
@@ -166,17 +167,17 @@ trait GpuSize {
 
 impl GpuSize for GpuCameraUniform {
     const SIZE: std::num::NonZeroU64 =
-        unsafe { std::num::NonZeroU64::new_unchecked(std::mem::size_of::<Self>() as u64) };
+        std::num::NonZeroU64::new(std::mem::size_of::<Self>() as u64).unwrap();
 }
 
 impl GpuSize for GpuDiskUniform {
     const SIZE: std::num::NonZeroU64 =
-        unsafe { std::num::NonZeroU64::new_unchecked(std::mem::size_of::<Self>() as u64) };
+        std::num::NonZeroU64::new(std::mem::size_of::<Self>() as u64).unwrap();
 }
 
 impl GpuSize for GpuObjectsUniform {
     const SIZE: std::num::NonZeroU64 =
-        unsafe { std::num::NonZeroU64::new_unchecked(std::mem::size_of::<Self>() as u64) };
+        std::num::NonZeroU64::new(std::mem::size_of::<Self>() as u64).unwrap();
 }
 
 // ── Bind group (recreated every frame) ──────────────────────────────────────
@@ -184,17 +185,27 @@ impl GpuSize for GpuObjectsUniform {
 #[derive(Resource)]
 pub struct GeodesicBindGroup(pub BindGroup);
 
+#[derive(SystemParam)]
+pub struct GeodesicSources<'w> {
+    pipeline: Option<Res<'w, GeodesicPipeline>>,
+    geodesic_image: Option<Res<'w, GeodesicImage>>,
+    camera_uniform: Option<Res<'w, CameraUniform>>,
+    objects_uniform: Option<Res<'w, ObjectsUniform>>,
+    disk_config: Option<Res<'w, DiskConfigUniform>>,
+}
+
+#[derive(SystemParam)]
+pub struct RenderGpu<'w> {
+    gpu_images: Res<'w, RenderAssets<GpuImage>>,
+    device: Res<'w, RenderDevice>,
+    queue: Res<'w, RenderQueue>,
+    pipeline_cache: Res<'w, PipelineCache>,
+}
+
 pub fn prepare_bind_group(
     mut commands: Commands,
-    pipeline: Option<Res<GeodesicPipeline>>,
-    gpu_images: Res<RenderAssets<GpuImage>>,
-    geodesic_image: Option<Res<GeodesicImage>>,
-    camera_uniform: Option<Res<CameraUniform>>,
-    objects_uniform: Option<Res<ObjectsUniform>>,
-    disk_config: Option<Res<DiskConfigUniform>>,
-    device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-    pipeline_cache: Res<PipelineCache>,
+    sources: GeodesicSources,
+    gpu: RenderGpu,
 ) {
     let (
         Some(pipeline),
@@ -203,16 +214,16 @@ pub fn prepare_bind_group(
         Some(objects_uniform),
         Some(disk_config),
     ) = (
-        pipeline,
-        geodesic_image,
-        camera_uniform,
-        objects_uniform,
-        disk_config,
+        sources.pipeline,
+        sources.geodesic_image,
+        sources.camera_uniform,
+        sources.objects_uniform,
+        sources.disk_config,
     )
     else {
         return;
     };
-    let Some(gpu_image) = gpu_images.get(&geodesic_image.0) else {
+    let Some(gpu_image) = gpu.gpu_images.get(&geodesic_image.0) else {
         return;
     };
 
@@ -235,7 +246,8 @@ pub fn prepare_bind_group(
         _pad6: 0.0,
         _pad7: 0.0,
     };
-    queue.write_buffer(&pipeline.camera_buf, 0, bytemuck::bytes_of(&gpu_cam));
+    gpu.queue
+        .write_buffer(&pipeline.camera_buf, 0, bytemuck::bytes_of(&gpu_cam));
 
     // Write objects data
     let mut gpu_objs = GpuObjectsUniform::zeroed();
@@ -243,14 +255,16 @@ pub fn prepare_bind_group(
     gpu_objs.pos_radius = objects_uniform.pos_radius;
     gpu_objs.color = objects_uniform.color;
     gpu_objs.mass = objects_uniform.mass;
-    queue.write_buffer(&pipeline.objects_buf, 0, bytemuck::bytes_of(&gpu_objs));
+    gpu.queue
+        .write_buffer(&pipeline.objects_buf, 0, bytemuck::bytes_of(&gpu_objs));
 
     // Write disk/Kerr data (dynamic: spin and outer radius adjustable at runtime).
     let gpu_disk = build_disk_uniform(disk_config.spin, disk_config.r_outer_rs);
-    queue.write_buffer(&pipeline.disk_buf, 0, bytemuck::bytes_of(&gpu_disk));
+    gpu.queue
+        .write_buffer(&pipeline.disk_buf, 0, bytemuck::bytes_of(&gpu_disk));
 
-    let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
-    let bind_group = device.create_bind_group(
+    let layout = gpu.pipeline_cache.get_bind_group_layout(&pipeline.layout);
+    let bind_group = gpu.device.create_bind_group(
         None,
         &layout,
         &BindGroupEntries::sequential((

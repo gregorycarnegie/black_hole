@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use bevy::{
+    ecs::system::SystemParam,
     prelude::*,
     render::{
         render_asset::RenderAssets,
@@ -99,30 +100,45 @@ pub struct AccumulateBindGroups {
     pub b_prev: BindGroup,
 }
 
+#[derive(SystemParam)]
+pub struct AccumulateSources<'w> {
+    pipeline: Option<Res<'w, AccumulatePipeline>>,
+    geodesic: Option<Res<'w, GeodesicImage>>,
+    accum_a: Option<Res<'w, AccumA>>,
+    accum_b: Option<Res<'w, AccumB>>,
+    display: Option<Res<'w, DisplayImage>>,
+    frame_count: Option<Res<'w, RenderFrameCount>>,
+}
+
+#[derive(SystemParam)]
+pub struct RenderGpu<'w> {
+    gpu_images: Res<'w, RenderAssets<GpuImage>>,
+    device: Res<'w, RenderDevice>,
+    queue: Res<'w, RenderQueue>,
+    pipeline_cache: Res<'w, PipelineCache>,
+}
+
 pub fn prepare_accumulate_bind_group(
     mut commands: Commands,
-    pipeline: Option<Res<AccumulatePipeline>>,
-    gpu_images: Res<RenderAssets<GpuImage>>,
-    geodesic: Option<Res<GeodesicImage>>,
-    accum_a: Option<Res<AccumA>>,
-    accum_b: Option<Res<AccumB>>,
-    display: Option<Res<DisplayImage>>,
-    frame_count: Option<Res<RenderFrameCount>>,
-    device: Res<RenderDevice>,
-    queue: Res<RenderQueue>,
-    pipeline_cache: Res<PipelineCache>,
+    sources: AccumulateSources,
+    gpu: RenderGpu,
 ) {
-    let (Some(pipeline), Some(geo), Some(a), Some(b), Some(disp), Some(fc)) =
-        (pipeline, geodesic, accum_a, accum_b, display, frame_count)
-    else {
+    let (Some(pipeline), Some(geo), Some(a), Some(b), Some(disp), Some(fc)) = (
+        sources.pipeline,
+        sources.geodesic,
+        sources.accum_a,
+        sources.accum_b,
+        sources.display,
+        sources.frame_count,
+    ) else {
         return;
     };
 
     let (Some(geo_gpu), Some(a_gpu), Some(b_gpu), Some(disp_gpu)) = (
-        gpu_images.get(&geo.0),
-        gpu_images.get(&a.0),
-        gpu_images.get(&b.0),
-        gpu_images.get(&disp.0),
+        gpu.gpu_images.get(&geo.0),
+        gpu.gpu_images.get(&a.0),
+        gpu.gpu_images.get(&b.0),
+        gpu.gpu_images.get(&disp.0),
     ) else {
         return;
     };
@@ -131,12 +147,13 @@ pub fn prepare_accumulate_bind_group(
         frame_count: fc.0,
         _pad: [0; 3],
     };
-    queue.write_buffer(&pipeline.blend_buf, 0, bytemuck::bytes_of(&blend));
+    gpu.queue
+        .write_buffer(&pipeline.blend_buf, 0, bytemuck::bytes_of(&blend));
 
-    let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
+    let layout = gpu.pipeline_cache.get_bind_group_layout(&pipeline.layout);
 
     // a_prev: prev = AccumA, curr = AccumB
-    let a_prev = device.create_bind_group(
+    let a_prev = gpu.device.create_bind_group(
         None,
         &layout,
         &BindGroupEntries::sequential((
@@ -149,7 +166,7 @@ pub fn prepare_accumulate_bind_group(
     );
 
     // b_prev: prev = AccumB, curr = AccumA
-    let b_prev = device.create_bind_group(
+    let b_prev = gpu.device.create_bind_group(
         None,
         &layout,
         &BindGroupEntries::sequential((
