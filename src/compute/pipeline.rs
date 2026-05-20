@@ -148,7 +148,7 @@ fn disk_data() -> GpuDiskUniform {
     let isco_r = kerr_isco_radius(KERR_SPIN);
     GpuDiskUniform {
         r1: isco_r,
-        r2: SAGA_RS * 5.2,
+        r2: SAGA_RS * 15.0,
         num: 2.0,
         thickness: 1e9,
         spin: KERR_SPIN,
