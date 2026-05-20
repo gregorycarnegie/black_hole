@@ -16,8 +16,8 @@ use bevy::{
 };
 use bytemuck::Zeroable;
 
-use super::{CameraUniform, GeodesicImage, ObjectsUniform};
-use crate::simulation::{KERR_SPIN, SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
+use super::{CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform};
+use crate::simulation::{SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
 
@@ -110,11 +110,11 @@ pub fn init_geodesic_pipeline(
         mapped_at_creation: false,
     });
 
-    let disk_uniform = disk_data();
-    let disk_buf = device.create_buffer_with_data(&BufferInitDescriptor {
+    let disk_buf = device.create_buffer(&BufferDescriptor {
         label: Some("disk_buf"),
-        contents: bytemuck::bytes_of(&disk_uniform),
+        size: GpuDiskUniform::SIZE.get(),
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
 
     let objects_buf = device.create_buffer(&BufferDescriptor {
@@ -143,16 +143,16 @@ pub fn init_geodesic_pipeline(
     });
 }
 
-/// Disk/Kerr parameters. The inner edge follows the prograde Kerr ISCO.
-fn disk_data() -> GpuDiskUniform {
-    let isco_r = kerr_isco_radius(KERR_SPIN);
+/// Build a GPU disk uniform from runtime parameters.
+fn build_disk_uniform(spin: f32, r_outer_rs: f32) -> GpuDiskUniform {
+    let isco_r = kerr_isco_radius(spin);
     GpuDiskUniform {
         r1: isco_r,
-        r2: SAGA_RS * 15.0,
+        r2: SAGA_RS * r_outer_rs,
         num: 2.0,
         thickness: 1e9,
-        spin: KERR_SPIN,
-        horizon_r: kerr_horizon_radius(KERR_SPIN),
+        spin,
+        horizon_r: kerr_horizon_radius(spin),
         isco_r,
         _pad0: 0.0,
     }
@@ -191,12 +191,24 @@ pub fn prepare_bind_group(
     geodesic_image: Option<Res<GeodesicImage>>,
     camera_uniform: Option<Res<CameraUniform>>,
     objects_uniform: Option<Res<ObjectsUniform>>,
+    disk_config: Option<Res<DiskConfigUniform>>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    let (Some(pipeline), Some(geodesic_image), Some(camera_uniform), Some(objects_uniform)) =
-        (pipeline, geodesic_image, camera_uniform, objects_uniform)
+    let (
+        Some(pipeline),
+        Some(geodesic_image),
+        Some(camera_uniform),
+        Some(objects_uniform),
+        Some(disk_config),
+    ) = (
+        pipeline,
+        geodesic_image,
+        camera_uniform,
+        objects_uniform,
+        disk_config,
+    )
     else {
         return;
     };
@@ -232,6 +244,10 @@ pub fn prepare_bind_group(
     gpu_objs.color = objects_uniform.color;
     gpu_objs.mass = objects_uniform.mass;
     queue.write_buffer(&pipeline.objects_buf, 0, bytemuck::bytes_of(&gpu_objs));
+
+    // Write disk/Kerr data (dynamic: spin and outer radius adjustable at runtime).
+    let gpu_disk = build_disk_uniform(disk_config.spin, disk_config.r_outer_rs);
+    queue.write_buffer(&pipeline.disk_buf, 0, bytemuck::bytes_of(&gpu_disk));
 
     let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
     let bind_group = device.create_bind_group(

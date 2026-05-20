@@ -2,7 +2,7 @@ use bevy::{
     input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
     prelude::*,
 };
-use std::f32::consts::PI;
+use std::f64::consts::PI;
 
 pub struct OrbitalCameraPlugin;
 
@@ -17,16 +17,21 @@ impl Plugin for OrbitalCameraPlugin {
 
 /// Tracks the logical orbital camera state. Updated from mouse/keyboard input
 /// each frame, then synced to the actual Bevy Camera3d transform.
+///
+/// Orbital parameters (`radius`, `azimuth`, `elevation`) are stored as `f64`
+/// so that accumulated mouse/scroll input doesn't lose precision when the
+/// camera is very close to the event horizon (~1e10 m). The GPU uniform is
+/// still written as `f32` — the precision gain is on the CPU accumulation side.
 #[derive(Resource)]
 pub struct OrbitalCamera {
-    pub radius: f32,
-    pub azimuth: f32,
-    pub elevation: f32,
-    pub min_radius: f32,
-    pub max_radius: f32,
-    pub orbit_speed: f32,
-    pub zoom_speed: f32,
-    pub fov_degrees: f32,
+    pub radius: f64,
+    pub azimuth: f64,
+    pub elevation: f64,
+    pub min_radius: f64,
+    pub max_radius: f64,
+    pub orbit_speed: f64,
+    pub zoom_speed: f64,
+    pub fov_degrees: f64,
     pub dragging: bool,
     pub is_moving: bool,
 }
@@ -49,12 +54,13 @@ impl Default for OrbitalCamera {
 }
 
 impl OrbitalCamera {
+    /// Camera position in world space. Trig computed in f64; result cast to Vec3 (f32).
     pub fn position(&self) -> Vec3 {
         let elev = self.elevation.clamp(0.01, PI - 0.01);
         Vec3::new(
-            self.radius * elev.sin() * self.azimuth.cos(),
-            self.radius * elev.cos(),
-            self.radius * elev.sin() * self.azimuth.sin(),
+            (self.radius * elev.sin() * self.azimuth.cos()) as f32,
+            (self.radius * elev.cos()) as f32,
+            (self.radius * elev.sin() * self.azimuth.sin()) as f32,
         )
     }
 
@@ -71,7 +77,7 @@ impl OrbitalCamera {
     }
 
     pub fn tan_half_fov(&self) -> f32 {
-        (self.fov_degrees.to_radians() * 0.5).tan()
+        (self.fov_degrees.to_radians() * 0.5).tan() as f32
     }
 }
 
@@ -85,7 +91,14 @@ pub struct BackgroundCamera;
 
 fn setup_cameras(mut commands: Commands) {
     // 2D camera renders the compute-output sprite as a background (order 0).
-    commands.spawn((Camera2d, Camera { order: 0, ..default() }, BackgroundCamera));
+    commands.spawn((
+        Camera2d,
+        Camera {
+            order: 0,
+            ..default()
+        },
+        BackgroundCamera,
+    ));
 
     // 3D camera renders the spacetime grid on top (order 1, no color clear).
     commands.spawn((
@@ -110,14 +123,15 @@ fn update_orbital_camera(
     cam.is_moving = false;
 
     if cam.dragging && mouse_motion.delta != Vec2::ZERO {
-        cam.azimuth += mouse_motion.delta.x * cam.orbit_speed;
-        cam.elevation -= mouse_motion.delta.y * cam.orbit_speed;
+        // Cast f32 mouse deltas to f64 before accumulating to preserve precision.
+        cam.azimuth += mouse_motion.delta.x as f64 * cam.orbit_speed;
+        cam.elevation -= mouse_motion.delta.y as f64 * cam.orbit_speed;
         cam.elevation = cam.elevation.clamp(0.01, PI - 0.01);
         cam.is_moving = true;
     }
 
     if scroll.delta.y != 0.0 {
-        cam.radius -= scroll.delta.y * cam.zoom_speed;
+        cam.radius -= scroll.delta.y as f64 * cam.zoom_speed;
         cam.radius = cam.radius.clamp(cam.min_radius, cam.max_radius);
         cam.is_moving = true;
     }
@@ -140,4 +154,149 @@ fn sync_camera_transform(
         return;
     };
     *transform = Transform::from_translation(cam.position()).looking_at(Vec3::ZERO, Vec3::Y);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ── Unit tests ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn position_length_equals_radius() {
+        let cam = OrbitalCamera::default();
+        let pos = cam.position();
+        let rel_err = (pos.length() as f64 - cam.radius).abs() / cam.radius;
+        assert!(
+            rel_err < 1e-5,
+            "position length {} ≠ radius {}",
+            pos.length(),
+            cam.radius
+        );
+    }
+
+    #[test]
+    fn frame_is_orthonormal_at_default() {
+        let cam = OrbitalCamera::default();
+        let f = cam.forward();
+        let r = cam.right();
+        let u = cam.up();
+        assert!(
+            (f.length() - 1.0).abs() < 1e-5,
+            "forward not unit: {}",
+            f.length()
+        );
+        assert!(
+            (r.length() - 1.0).abs() < 1e-5,
+            "right not unit: {}",
+            r.length()
+        );
+        assert!(
+            (u.length() - 1.0).abs() < 1e-5,
+            "up not unit: {}",
+            u.length()
+        );
+        assert!(f.dot(r).abs() < 1e-5, "forward·right = {}", f.dot(r));
+        assert!(f.dot(u).abs() < 1e-5, "forward·up = {}", f.dot(u));
+        assert!(r.dot(u).abs() < 1e-5, "right·up = {}", r.dot(u));
+    }
+
+    #[test]
+    fn forward_points_toward_origin() {
+        let cam = OrbitalCamera::default();
+        let pos = cam.position();
+        let dot = cam.forward().dot((-pos).normalize());
+        assert!(
+            dot > 0.999,
+            "forward should point toward origin, got dot={dot}"
+        );
+    }
+
+    #[test]
+    fn tan_half_fov_positive_for_valid_range() {
+        for &deg in &[10.0_f64, 30.0, 60.0, 90.0, 120.0, 170.0] {
+            let cam = OrbitalCamera {
+                fov_degrees: deg,
+                ..OrbitalCamera::default()
+            };
+            assert!(
+                cam.tan_half_fov() > 0.0,
+                "tan_half_fov non-positive at {deg}°"
+            );
+        }
+    }
+
+    #[test]
+    fn north_pole_has_positive_y() {
+        let cam = OrbitalCamera {
+            elevation: 0.01,
+            ..OrbitalCamera::default()
+        };
+        assert!(cam.position().y > 0.0, "north pole should have positive y");
+    }
+
+    #[test]
+    fn south_pole_has_negative_y() {
+        let cam = OrbitalCamera {
+            elevation: PI - 0.01,
+            ..OrbitalCamera::default()
+        };
+        assert!(cam.position().y < 0.0, "south pole should have negative y");
+    }
+
+    #[test]
+    fn equator_has_near_zero_y() {
+        let cam = OrbitalCamera {
+            elevation: PI * 0.5,
+            ..OrbitalCamera::default()
+        };
+        // f64 cos(π/2) ≈ 6.1e-17; after f32 cast still negligible relative to radius.
+        let rel_err = cam.position().y.abs() as f64 / cam.radius;
+        assert!(rel_err < 1e-5, "equator y not near zero: rel_err={rel_err}");
+    }
+
+    // ── Proptest ─────────────────────────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn position_radius_preserved(
+            radius    in 1e10_f64..=1e12_f64,
+            azimuth   in -100.0_f64..=100.0_f64,
+            elevation in 0.01_f64..=(PI - 0.01),
+        ) {
+            let cam = OrbitalCamera { radius, azimuth, elevation, ..OrbitalCamera::default() };
+            // Compare in f64: cast the f32 position length back up for comparison.
+            let rel_err = (cam.position().length() as f64 - radius).abs() / radius;
+            prop_assert!(rel_err < 1e-4,
+                "position length {} ≠ radius {radius}", cam.position().length());
+        }
+
+        // Stay 0.1 rad from the poles to avoid the right() singularity where
+        // forward ∥ Y and the cross product collapses.
+        #[test]
+        fn frame_orthonormal_across_orientations(
+            radius    in 1e10_f64..=1e12_f64,
+            azimuth   in -100.0_f64..=100.0_f64,
+            elevation in 0.1_f64..=(PI - 0.1),
+        ) {
+            let cam = OrbitalCamera { radius, azimuth, elevation, ..OrbitalCamera::default() };
+            let f = cam.forward();
+            let r = cam.right();
+            let u = cam.up();
+            prop_assert!((f.length() - 1.0).abs() < 1e-4, "forward not unit: {}", f.length());
+            prop_assert!((r.length() - 1.0).abs() < 1e-4, "right not unit: {}", r.length());
+            prop_assert!((u.length() - 1.0).abs() < 1e-4, "up not unit: {}", u.length());
+            prop_assert!(f.dot(r).abs() < 1e-3, "forward·right = {}", f.dot(r));
+            prop_assert!(f.dot(u).abs() < 1e-3, "forward·up = {}", f.dot(u));
+            prop_assert!(r.dot(u).abs() < 1e-3, "right·up = {}", r.dot(u));
+        }
+
+        #[test]
+        fn tan_half_fov_always_positive(fov in 10.0_f64..=170.0_f64) {
+            let cam = OrbitalCamera { fov_degrees: fov, ..OrbitalCamera::default() };
+            prop_assert!(cam.tan_half_fov() > 0.0,
+                "tan_half_fov non-positive at {fov}°: {}", cam.tan_half_fov());
+        }
+    }
 }

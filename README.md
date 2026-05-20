@@ -18,11 +18,14 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 
 ## Controls
 
-| Input           | Action                |
-|-----------------|-----------------------|
-| Left mouse drag | Orbit camera          |
-| Scroll wheel    | Zoom in/out           |
-| G               | Toggle n-body gravity |
+| Input           | Action                             |
+|-----------------|------------------------------------|
+| Left mouse drag | Orbit camera                       |
+| Scroll wheel    | Zoom in/out                        |
+| `[` / `]`       | Decrease / increase FOV            |
+| G               | Toggle n-body gravity              |
+| Q / E           | Decrease / increase black hole spin a* (±0.05) |
+| Z / X           | Decrease / increase outer disk radius (±1 r_s) |
 
 ## Building
 

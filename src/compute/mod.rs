@@ -1,24 +1,25 @@
 use bevy::{
     asset::RenderAssetUsages,
     prelude::*,
-    window::PrimaryWindow,
     render::{
+        Render, RenderApp, RenderStartup, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_graph::{RenderGraph, RenderLabel},
         render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
-        Render, RenderApp, RenderStartup, RenderSystems,
     },
+    window::PrimaryWindow,
 };
 
 mod pipeline;
-use pipeline::{init_geodesic_pipeline, prepare_bind_group, GeodesicNode};
+use pipeline::{GeodesicNode, init_geodesic_pipeline, prepare_bind_group};
 
 mod accumulate;
-use accumulate::{
-    init_accumulate_pipeline, prepare_accumulate_bind_group, AccumulateNode,
-};
+use accumulate::{AccumulateNode, init_accumulate_pipeline, prepare_accumulate_bind_group};
 
-use crate::{camera::OrbitalCamera, simulation::SimObjects};
+use crate::{
+    camera::OrbitalCamera,
+    simulation::{DiskConfig, KERR_SPIN, SimObjects},
+};
 
 pub struct GeodesicComputePlugin;
 
@@ -94,6 +95,22 @@ impl Default for ObjectsUniform {
     }
 }
 
+/// Disk/BH parameters extracted from `DiskConfig` each frame for the render world.
+#[derive(Resource, Clone, ExtractResource)]
+pub struct DiskConfigUniform {
+    pub spin: f32,
+    pub r_outer_rs: f32,
+}
+
+impl Default for DiskConfigUniform {
+    fn default() -> Self {
+        Self {
+            spin: KERR_SPIN,
+            r_outer_rs: 15.0,
+        }
+    }
+}
+
 /// Running count of still frames (main-world only, not extracted).
 /// Drives jitter and frame_count sent to the GPU.
 #[derive(Resource, Default)]
@@ -120,16 +137,25 @@ impl Plugin for GeodesicComputePlugin {
             ExtractResourcePlugin::<ObjectsUniform>::default(),
             ExtractResourcePlugin::<RenderFrameCount>::default(),
             ExtractResourcePlugin::<FrameParity>::default(),
+            ExtractResourcePlugin::<DiskConfigUniform>::default(),
         ));
 
         app.init_resource::<CameraUniform>()
             .init_resource::<ObjectsUniform>()
             .init_resource::<RenderFrameCount>()
             .init_resource::<FrameParity>()
+            .init_resource::<DiskConfigUniform>()
             .init_resource::<StillFrameCounter>();
 
         app.add_systems(Startup, setup_compute_texture);
-        app.add_systems(Update, (sync_camera_uniform, sync_objects_uniform));
+        app.add_systems(
+            Update,
+            (
+                sync_camera_uniform,
+                sync_objects_uniform,
+                sync_disk_config_uniform,
+            ),
+        );
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
@@ -163,7 +189,11 @@ fn make_rgba8_tex(w: u32, h: u32, images: &mut Assets<Image>) -> Handle<Image> {
 
 fn make_rgba32f_tex(w: u32, h: u32, images: &mut Assets<Image>) -> Handle<Image> {
     let mut img = Image::new_fill(
-        Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         &[0u8; 16], // 4 × f32 = 16 bytes; represents [0,0,0,0]
         TextureFormat::Rgba32Float,
@@ -227,7 +257,13 @@ fn sync_camera_uniform(
     let aspect = windows
         .single()
         .ok()
-        .map(|w| if w.height() > 0.0 { w.width() / w.height() } else { 800.0 / 600.0 })
+        .map(|w| {
+            if w.height() > 0.0 {
+                w.width() / w.height()
+            } else {
+                800.0 / 600.0
+            }
+        })
         .unwrap_or(800.0 / 600.0);
 
     // fc = frame_count sent to the GPU for THIS render frame.
@@ -278,4 +314,9 @@ fn sync_objects_uniform(objects: Res<SimObjects>, mut uniform: ResMut<ObjectsUni
         uniform.color[i] = obj.color.to_array();
         uniform.mass[i] = [obj.mass, 0.0, 0.0, 0.0];
     }
+}
+
+fn sync_disk_config_uniform(disk: Res<DiskConfig>, mut uniform: ResMut<DiskConfigUniform>) {
+    uniform.spin = disk.spin;
+    uniform.r_outer_rs = disk.r_outer_rs;
 }

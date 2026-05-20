@@ -1,30 +1,33 @@
 use bevy::prelude::*;
 
+use crate::camera::OrbitalCamera;
+
+// Re-export so compute::pipeline can keep its existing `use crate::simulation::…` imports.
+pub use black_hole::physics::{SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
+
 pub const C: f64 = 299_792_458.0;
 pub const G_CONST: f64 = 6.6743e-11;
 pub const SAGA_MASS: f64 = 8.54e36;
-// Schwarzschild radius of Sag A* in meters
-pub const SAGA_RS: f32 = 1.269e10;
-/// Dimensionless Kerr spin parameter a* = J/M^2. Positive values are prograde
-/// relative to the accretion disk's +Y spin axis.
-pub const KERR_SPIN: f32 = 0.82;
-const KERR_SPIN_LIMIT: f32 = 0.999;
 
-pub fn kerr_horizon_radius(spin: f32) -> f32 {
-    let a = spin.abs().min(KERR_SPIN_LIMIT);
-    0.5 * SAGA_RS * (1.0 + (1.0 - a * a).sqrt())
+/// Default dimensionless Kerr spin parameter a* = J/M². Positive = prograde.
+pub const KERR_SPIN: f32 = 0.82;
+
+/// Runtime-adjustable accretion disk and black hole parameters.
+#[derive(Resource, Clone, Debug)]
+pub struct DiskConfig {
+    /// Dimensionless Kerr spin parameter a* ∈ (−0.999, 0.999).
+    pub spin: f32,
+    /// Outer disk radius in units of SAGA_RS.
+    pub r_outer_rs: f32,
 }
 
-pub fn kerr_isco_radius(spin: f32) -> f32 {
-    let a = spin.clamp(-KERR_SPIN_LIMIT, KERR_SPIN_LIMIT);
-    let abs_a = a.abs();
-    let z1 = 1.0
-        + (1.0 - abs_a * abs_a).powf(1.0 / 3.0)
-            * ((1.0 + abs_a).powf(1.0 / 3.0) + (1.0 - abs_a).powf(1.0 / 3.0));
-    let z2 = (3.0 * abs_a * abs_a + z1 * z1).sqrt();
-    let direction = if a >= 0.0 { -1.0 } else { 1.0 };
-    let r_over_m = 3.0 + z2 + direction * ((3.0 - z1) * (3.0 + z1 + 2.0 * z2)).sqrt();
-    0.5 * SAGA_RS * r_over_m
+impl Default for DiskConfig {
+    fn default() -> Self {
+        Self {
+            spin: KERR_SPIN,
+            r_outer_rs: 15.0,
+        }
+    }
 }
 
 pub struct SimulationPlugin;
@@ -33,7 +36,9 @@ impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SimObjects>()
             .init_resource::<GravityEnabled>()
-            .add_systems(Update, (toggle_gravity, gravity_system).chain());
+            .init_resource::<DiskConfig>()
+            .add_systems(Update, (toggle_gravity, gravity_system).chain())
+            .add_systems(Update, update_disk_config);
     }
 }
 
@@ -79,23 +84,50 @@ impl Default for SimObjects {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Keyboard handler for runtime disk / BH parameter adjustment.
+///
+/// | Key | Action                              |
+/// |-----|-------------------------------------|
+/// | Q   | Decrease spin a* by 0.05            |
+/// | E   | Increase spin a* by 0.05            |
+/// | Z   | Decrease outer disk radius by 1 r_s |
+/// | X   | Increase outer disk radius by 1 r_s |
+fn update_disk_config(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut disk: ResMut<DiskConfig>,
+    mut cam: ResMut<OrbitalCamera>,
+    mut objects: ResMut<SimObjects>,
+) {
+    let mut changed = false;
 
-    #[test]
-    fn kerr_helpers_match_schwarzschild_at_zero_spin() {
-        assert!((kerr_horizon_radius(0.0) - SAGA_RS).abs() < 1.0);
-        assert!((kerr_isco_radius(0.0) - 3.0 * SAGA_RS).abs() < 1024.0);
+    if keys.just_pressed(KeyCode::KeyQ) {
+        disk.spin = (disk.spin - 0.05).clamp(-0.999, 0.999);
+        changed = true;
+    }
+    if keys.just_pressed(KeyCode::KeyE) {
+        disk.spin = (disk.spin + 0.05).clamp(-0.999, 0.999);
+        changed = true;
+    }
+    if keys.just_pressed(KeyCode::KeyZ) {
+        disk.r_outer_rs = (disk.r_outer_rs - 1.0).max(4.0);
+        changed = true;
+    }
+    if keys.just_pressed(KeyCode::KeyX) {
+        disk.r_outer_rs = (disk.r_outer_rs + 1.0).min(30.0);
+        changed = true;
     }
 
-    #[test]
-    fn prograde_spin_moves_isco_inward_but_outside_horizon() {
-        let horizon = kerr_horizon_radius(KERR_SPIN);
-        let isco = kerr_isco_radius(KERR_SPIN);
-        assert!(horizon < SAGA_RS);
-        assert!(isco < 3.0 * SAGA_RS);
-        assert!(isco > horizon);
+    if changed {
+        info!(
+            "Disk: spin={:.2}, r_outer={:.0} r_s",
+            disk.spin, disk.r_outer_rs
+        );
+        // Keep the black hole sphere radius in sync with the new horizon.
+        if let Some(bh) = objects.0.last_mut() {
+            bh.radius = kerr_horizon_radius(disk.spin);
+        }
+        // Trigger TAA reset so the accumulation buffer clears immediately.
+        cam.is_moving = true;
     }
 }
 

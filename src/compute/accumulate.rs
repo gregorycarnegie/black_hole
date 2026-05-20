@@ -81,7 +81,11 @@ pub fn init_accumulate_pipeline(
         zero_initialize_workgroup_memory: false,
     });
 
-    commands.insert_resource(AccumulatePipeline { layout, pipeline_id, blend_buf });
+    commands.insert_resource(AccumulatePipeline {
+        layout,
+        pipeline_id,
+        blend_buf,
+    });
 }
 
 // ── Bind groups (ping-pong) ──────────────────────────────────────────────────
@@ -123,7 +127,10 @@ pub fn prepare_accumulate_bind_group(
         return;
     };
 
-    let blend = BlendUniform { frame_count: fc.0, _pad: [0; 3] };
+    let blend = BlendUniform {
+        frame_count: fc.0,
+        _pad: [0; 3],
+    };
     queue.write_buffer(&pipeline.blend_buf, 0, bytemuck::bytes_of(&blend));
 
     let layout = pipeline_cache.get_bind_group_layout(&pipeline.layout);
@@ -159,17 +166,28 @@ pub fn prepare_accumulate_bind_group(
 
 // ── Render graph node ────────────────────────────────────────────────────────
 
-enum NodeState { Loading, Ready }
+enum NodeState {
+    Loading,
+    Ready,
+}
 
-pub struct AccumulateNode { state: NodeState }
+pub struct AccumulateNode {
+    state: NodeState,
+}
 
 impl Default for AccumulateNode {
-    fn default() -> Self { Self { state: NodeState::Loading } }
+    fn default() -> Self {
+        Self {
+            state: NodeState::Loading,
+        }
+    }
 }
 
 impl render_graph::Node for AccumulateNode {
     fn update(&mut self, world: &mut World) {
-        let Some(pipeline) = world.get_resource::<AccumulatePipeline>() else { return };
+        let Some(pipeline) = world.get_resource::<AccumulatePipeline>() else {
+            return;
+        };
         let cache = world.resource::<PipelineCache>();
         if let NodeState::Loading = self.state {
             match cache.get_compute_pipeline_state(pipeline.pipeline_id) {
@@ -187,7 +205,9 @@ impl render_graph::Node for AccumulateNode {
         render_context: &mut RenderContext,
         world: &World,
     ) -> Result<(), render_graph::NodeRunError> {
-        if matches!(self.state, NodeState::Loading) { return Ok(()); }
+        if matches!(self.state, NodeState::Loading) {
+            return Ok(());
+        }
 
         let (Some(groups), Some(pipeline_res), Some(parity), Some(display)) = (
             world.get_resource::<AccumulateBindGroups>(),
@@ -204,7 +224,9 @@ impl render_graph::Node for AccumulateNode {
         };
 
         let gpu_images = world.resource::<RenderAssets<GpuImage>>();
-        let Some(disp_gpu) = gpu_images.get(&display.0) else { return Ok(()); };
+        let Some(disp_gpu) = gpu_images.get(&display.0) else {
+            return Ok(());
+        };
 
         let (dispatch_x, dispatch_y) = (
             disp_gpu.size.width.div_ceil(16),
@@ -213,7 +235,11 @@ impl render_graph::Node for AccumulateNode {
 
         // frame_count even → parity=true → prev=B, curr=A → use b_prev
         // frame_count odd  → parity=false → prev=A, curr=B → use a_prev
-        let bind_group = if parity.0 { &groups.b_prev } else { &groups.a_prev };
+        let bind_group = if parity.0 {
+            &groups.b_prev
+        } else {
+            &groups.a_prev
+        };
 
         let mut pass = render_context
             .command_encoder()

@@ -38,3 +38,16 @@
 ## Visual Fidelity
 - [ ] Improve accretion disk: add thickness / 3D volume instead of infinitesimally thin equatorial plane
 - [x] Add Doppler shift / blueshift coloring to accretion disk based on orbit velocity
+
+## Test Coverage
+- [x] Extract pure Kerr physics into `src/physics.rs` (no Bevy dep) to enable doc tests
+- [x] Add doc tests to `kerr_horizon_radius` and `kerr_isco_radius`
+- [x] Add unit tests: Schwarzschild limits, monotonicity, ISCO/horizon ordering at known spins
+- [x] Add proptest invariants: horizon bounded by r_s, ISCO outside horizon, monotonicity over all valid spins
+- [x] Add unit + proptest tests for `OrbitalCamera` (position radius, orthonormal frame, tan_half_fov)
+
+## Precision
+- [x] Use f64 for camera position accumulation on CPU; convert to f32 only when writing the GPU uniform
+
+## Configurability
+- [x] Expose KERR_SPIN and disk geometry (r1, r2) as runtime parameters (Q/E for spin, Z/X for outer radius)
