@@ -18,12 +18,12 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 
 ## Controls
 
-| Input           | Action                             |
-|-----------------|------------------------------------|
-| Left mouse drag | Orbit camera                       |
-| Scroll wheel    | Zoom in/out                        |
-| `[` / `]`       | Decrease / increase FOV            |
-| G               | Toggle n-body gravity              |
+| Input           | Action                                         |
+|-----------------|------------------------------------------------|
+| Left mouse drag | Orbit camera                                   |
+| Scroll wheel    | Zoom in/out                                    |
+| `[` / `]`       | Decrease / increase FOV                        |
+| G               | Toggle n-body gravity                          |
 | Q / E           | Decrease / increase black hole spin a* (±0.05) |
 | Z / X           | Decrease / increase outer disk radius (±1 r_s) |
 
@@ -32,7 +32,7 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 Requires [Rust](https://rustup.rs/) (stable).
 
 ```bash
-git clone https://github.com/kavan010/black_hole.git
+git clone https://github.com/gregorycarnegie/black_hole.git
 cd black_hole
 cargo run --release
 ```
