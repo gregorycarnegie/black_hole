@@ -26,6 +26,7 @@ pub struct OrbitalCamera {
     pub max_radius: f32,
     pub orbit_speed: f32,
     pub zoom_speed: f32,
+    pub fov_degrees: f32,
     pub dragging: bool,
     pub is_moving: bool,
 }
@@ -40,6 +41,7 @@ impl Default for OrbitalCamera {
             max_radius: 1e12,
             orbit_speed: 0.005,
             zoom_speed: 25e9,
+            fov_degrees: 60.0,
             dragging: false,
             is_moving: false,
         }
@@ -69,7 +71,7 @@ impl OrbitalCamera {
     }
 
     pub fn tan_half_fov(&self) -> f32 {
-        (60.0_f32.to_radians() * 0.5).tan()
+        (self.fov_degrees.to_radians() * 0.5).tan()
     }
 }
 
@@ -102,6 +104,7 @@ fn update_orbital_camera(
     mouse_button: Res<ButtonInput<MouseButton>>,
     mouse_motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
+    keys: Res<ButtonInput<KeyCode>>,
 ) {
     cam.dragging = mouse_button.pressed(MouseButton::Left);
     cam.is_moving = false;
@@ -116,6 +119,15 @@ fn update_orbital_camera(
     if scroll.delta.y != 0.0 {
         cam.radius -= scroll.delta.y * cam.zoom_speed;
         cam.radius = cam.radius.clamp(cam.min_radius, cam.max_radius);
+        cam.is_moving = true;
+    }
+
+    if keys.just_pressed(KeyCode::BracketLeft) {
+        cam.fov_degrees = (cam.fov_degrees - 5.0).clamp(10.0, 170.0);
+        cam.is_moving = true;
+    }
+    if keys.just_pressed(KeyCode::BracketRight) {
+        cam.fov_degrees = (cam.fov_degrees + 5.0).clamp(10.0, 170.0);
         cam.is_moving = true;
     }
 }

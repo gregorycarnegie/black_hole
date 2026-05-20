@@ -34,11 +34,7 @@ fn draw_spacetime_grid(mut gizmos: Gizmos, objects: Res<SimObjects>) {
                 let dz = world_z - obj.position.z;
                 let dist = (dx * dx + dz * dz).sqrt();
 
-                if dist > r_s {
-                    y += 2.0 * (r_s * (dist - r_s)).sqrt() - 3e10;
-                } else {
-                    y += 2.0 * r_s - 3e10;
-                }
+                y += 2.0 * (r_s * (dist - r_s).max(0.0)).sqrt() - 3e10;
             }
 
             verts[zi as usize * count + xi as usize] = Vec3::new(world_x, y, world_z);

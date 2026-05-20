@@ -11,11 +11,11 @@
 
 ## Robustness
 - [x] Add NaN/infinity guards in geodesic shader (divide-by-zero risk when sin(θ) ≈ 0 near poles)
-- [ ] Guard against log(0) in spacetime grid displacement calculation
+- [x] Guard against log(0) in spacetime grid displacement calculation
 
 ## Configurability
 - [x] Remove hardcoded aspect ratio (800/600 in `src/camera.rs:75`) — derive from window size
-- [ ] Remove hardcoded FOV (60° in `src/camera.rs:72`) — expose as runtime parameter
+- [x] Remove hardcoded FOV (60° in `src/camera.rs:72`) — expose as runtime parameter
 - [x] Remove hardcoded resolution in compute pipeline — derive or expose via config
 
 ## Performance
