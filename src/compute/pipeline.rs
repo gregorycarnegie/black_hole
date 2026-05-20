@@ -20,7 +20,7 @@ use super::{CameraUniform, GeodesicImage, ObjectsUniform};
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
 
-/// Matches the Camera uniform in geodesic.wgsl (std140, 80 bytes).
+/// Matches the Camera uniform in geodesic.wgsl (std140, 96 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuCameraUniform {
@@ -35,7 +35,11 @@ struct GpuCameraUniform {
     tan_half_fov: f32,
     aspect: f32,
     moving: u32,
-    _pad4: u32,
+    jitter_x: f32,
+    jitter_y: f32,
+    _pad5: f32,
+    _pad6: f32,
+    _pad7: f32,
 }
 
 /// Matches the Objects uniform in geodesic.wgsl.
@@ -183,7 +187,11 @@ pub fn prepare_bind_group(
         tan_half_fov: camera_uniform.tan_half_fov,
         aspect: camera_uniform.aspect,
         moving: camera_uniform.moving,
-        _pad4: 0,
+        jitter_x: camera_uniform.jitter_x,
+        jitter_y: camera_uniform.jitter_y,
+        _pad5: 0.0,
+        _pad6: 0.0,
+        _pad7: 0.0,
     };
     queue.write_buffer(&pipeline.camera_buf, 0, bytemuck::bytes_of(&gpu_cam));
 

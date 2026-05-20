@@ -5,6 +5,7 @@ use bevy::{
     render::{
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_graph::{RenderGraph, RenderLabel},
+        render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
         Render, RenderApp, RenderStartup, RenderSystems,
     },
 };
@@ -12,17 +13,45 @@ use bevy::{
 mod pipeline;
 use pipeline::{init_geodesic_pipeline, prepare_bind_group, GeodesicNode};
 
+mod accumulate;
+use accumulate::{
+    init_accumulate_pipeline, prepare_accumulate_bind_group, AccumulateNode,
+};
+
 use crate::{camera::OrbitalCamera, simulation::SimObjects};
 
 pub struct GeodesicComputePlugin;
 
 // ── Resources extracted from main world → render world ──────────────────────
 
-/// Handle to the texture the compute shader writes into.
+/// Raw frame written by geodesic.wgsl each tick.
 #[derive(Resource, Clone, ExtractResource)]
 pub struct GeodesicImage(pub Handle<Image>);
 
-/// Camera data packed for the uniform buffer (matches the WGSL struct layout).
+/// Ping-pong accumulation buffer A (rgba32float).
+#[derive(Resource, Clone, ExtractResource)]
+pub struct AccumA(pub Handle<Image>);
+
+/// Ping-pong accumulation buffer B (rgba32float).
+#[derive(Resource, Clone, ExtractResource)]
+pub struct AccumB(pub Handle<Image>);
+
+/// Final blended output shown by the sprite.
+#[derive(Resource, Clone, ExtractResource)]
+pub struct DisplayImage(pub Handle<Image>);
+
+/// frame_count sent to the accumulate shader for this render frame.
+/// 0 = reset history; ≥1 = blend with α=0.1.
+#[derive(Resource, Clone, Default, ExtractResource)]
+pub struct RenderFrameCount(pub u32);
+
+/// Determines which ping-pong buffer is "prev" for this frame.
+/// true → frame_count even → use b_prev bind group (writes to AccumA)
+/// false → frame_count odd  → use a_prev bind group (writes to AccumB)
+#[derive(Resource, Clone, Default, ExtractResource)]
+pub struct FrameParity(pub bool);
+
+/// Camera data packed for the uniform buffer (matches Camera struct in geodesic.wgsl, 96 bytes).
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct CameraUniform {
     pub pos: Vec3,
@@ -36,7 +65,11 @@ pub struct CameraUniform {
     pub tan_half_fov: f32,
     pub aspect: f32,
     pub moving: u32,
-    pub _pad4: u32,
+    pub jitter_x: f32,
+    pub jitter_y: f32,
+    pub _pad5: f32,
+    pub _pad6: f32,
+    pub _pad7: f32,
 }
 
 /// Object data packed for the uniform buffer.
@@ -44,10 +77,8 @@ pub struct CameraUniform {
 pub struct ObjectsUniform {
     pub num_objects: i32,
     pub _pad: [f32; 3],
-    /// xyz = position, w = radius
     pub pos_radius: [[f32; 4]; 16],
     pub color: [[f32; 4]; 16],
-    /// std140 pads f32 array elements to 16 bytes; only [0] used
     pub mass: [[f32; 4]; 16],
 }
 
@@ -63,10 +94,18 @@ impl Default for ObjectsUniform {
     }
 }
 
-// ── Render graph node label ──────────────────────────────────────────────────
+/// Running count of still frames (main-world only, not extracted).
+/// Drives jitter and frame_count sent to the GPU.
+#[derive(Resource, Default)]
+struct StillFrameCounter(u32);
+
+// ── Render graph labels ──────────────────────────────────────────────────────
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
 pub struct GeodesicLabel;
+
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
+pub struct AccumulateLabel;
 
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
@@ -74,74 +113,143 @@ impl Plugin for GeodesicComputePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
             ExtractResourcePlugin::<GeodesicImage>::default(),
+            ExtractResourcePlugin::<AccumA>::default(),
+            ExtractResourcePlugin::<AccumB>::default(),
+            ExtractResourcePlugin::<DisplayImage>::default(),
             ExtractResourcePlugin::<CameraUniform>::default(),
             ExtractResourcePlugin::<ObjectsUniform>::default(),
+            ExtractResourcePlugin::<RenderFrameCount>::default(),
+            ExtractResourcePlugin::<FrameParity>::default(),
         ));
 
         app.init_resource::<CameraUniform>()
-            .init_resource::<ObjectsUniform>();
+            .init_resource::<ObjectsUniform>()
+            .init_resource::<RenderFrameCount>()
+            .init_resource::<FrameParity>()
+            .init_resource::<StillFrameCounter>();
 
         app.add_systems(Startup, setup_compute_texture);
         app.add_systems(Update, (sync_camera_uniform, sync_objects_uniform));
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
-            .add_systems(RenderStartup, init_geodesic_pipeline)
+            .add_systems(
+                RenderStartup,
+                (init_geodesic_pipeline, init_accumulate_pipeline),
+            )
             .add_systems(
                 Render,
-                prepare_bind_group.in_set(RenderSystems::PrepareBindGroups),
+                (prepare_bind_group, prepare_accumulate_bind_group)
+                    .in_set(RenderSystems::PrepareBindGroups),
             );
 
         let mut graph = render_app.world_mut().resource_mut::<RenderGraph>();
         graph.add_node(GeodesicLabel, GeodesicNode::default());
-        graph.add_node_edge(GeodesicLabel, bevy::render::graph::CameraDriverLabel);
+        graph.add_node(AccumulateLabel, AccumulateNode::default());
+        graph.add_node_edge(GeodesicLabel, AccumulateLabel);
+        graph.add_node_edge(AccumulateLabel, bevy::render::graph::CameraDriverLabel);
     }
 }
 
-// ── Startup: create output texture + display sprite ─────────────────────────
+// ── Startup: create all textures + display sprite ────────────────────────────
+
+fn make_rgba8_tex(w: u32, h: u32, images: &mut Assets<Image>) -> Handle<Image> {
+    let mut img = Image::new_target_texture(w, h, TextureFormat::Rgba8Unorm, None);
+    img.asset_usage = RenderAssetUsages::RENDER_WORLD;
+    img.texture_descriptor.usage =
+        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    images.add(img)
+}
+
+fn make_rgba32f_tex(w: u32, h: u32, images: &mut Assets<Image>) -> Handle<Image> {
+    let mut img = Image::new_fill(
+        Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        &[0u8; 16], // 4 × f32 = 16 bytes; represents [0,0,0,0]
+        TextureFormat::Rgba32Float,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.texture_descriptor.usage =
+        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    images.add(img)
+}
 
 fn setup_compute_texture(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     windows: Query<&Window, With<PrimaryWindow>>,
 ) {
-    use bevy::render::render_resource::{TextureFormat, TextureUsages};
-
-    let (win_w, win_h) = windows.single().ok()
+    let (win_w, win_h) = windows
+        .single()
+        .ok()
         .map(|win| (win.physical_width(), win.physical_height()))
         .unwrap_or((800, 600));
-    // Render at half resolution, upscale 2× via sprite — halves GPU load
     let (w, h) = ((win_w / 2).max(1), (win_h / 2).max(1));
 
-    let mut image = Image::new_target_texture(w, h, TextureFormat::Rgba8Unorm, None);
-    image.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    image.texture_descriptor.usage =
-        TextureUsages::COPY_DST | TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING;
+    commands.insert_resource(GeodesicImage(make_rgba8_tex(w, h, &mut images)));
+    commands.insert_resource(AccumA(make_rgba32f_tex(w, h, &mut images)));
+    commands.insert_resource(AccumB(make_rgba32f_tex(w, h, &mut images)));
 
-    let handle = images.add(image);
-
+    let disp = make_rgba8_tex(w, h, &mut images);
     commands.spawn((
         Sprite {
-            image: handle.clone(),
+            image: disp.clone(),
             custom_size: Some(Vec2::new(win_w as f32, win_h as f32)),
             ..default()
         },
         Transform::default(),
     ));
-
-    commands.insert_resource(GeodesicImage(handle));
+    commands.insert_resource(DisplayImage(disp));
 }
 
 // ── Per-frame uniform syncs ──────────────────────────────────────────────────
 
+/// Halton low-discrepancy sequence, 1-indexed. Returns value in [0, 1).
+fn halton(mut i: u32, base: u32) -> f32 {
+    let mut f = 1.0_f32;
+    let mut r = 0.0_f32;
+    while i > 0 {
+        f /= base as f32;
+        r += f * (i % base) as f32;
+        i /= base;
+    }
+    r
+}
+
 fn sync_camera_uniform(
     cam: Res<OrbitalCamera>,
     mut uniform: ResMut<CameraUniform>,
+    mut counter: ResMut<StillFrameCounter>,
+    mut render_fc: ResMut<RenderFrameCount>,
+    mut parity: ResMut<FrameParity>,
     windows: Query<&Window, With<PrimaryWindow>>,
 ) {
-    let aspect = windows.single().ok()
+    let aspect = windows
+        .single()
+        .ok()
         .map(|w| if w.height() > 0.0 { w.width() / w.height() } else { 800.0 / 600.0 })
         .unwrap_or(800.0 / 600.0);
+
+    // fc = frame_count sent to the GPU for THIS render frame.
+    // 0 means "reset accumulation", ≥1 means "blend".
+    let fc = if cam.is_moving { 0u32 } else { counter.0 };
+    render_fc.0 = fc;
+    // even fc → parity=true → b_prev bind group (writes into AccumA)
+    parity.0 = fc % 2 == 0;
+
+    let (jx, jy) = if cam.is_moving {
+        (0.0f32, 0.0f32)
+    } else {
+        // Halton(1,2)=0.5 → jx=0 on first still frame, varies thereafter.
+        (halton(fc + 1, 2) - 0.5, halton(fc + 1, 3) - 0.5)
+    };
+
+    // Advance counter for the next frame.
+    if cam.is_moving {
+        counter.0 = 0;
+    } else {
+        counter.0 = counter.0.saturating_add(1);
+    }
 
     *uniform = CameraUniform {
         pos: cam.position(),
@@ -155,7 +263,11 @@ fn sync_camera_uniform(
         tan_half_fov: cam.tan_half_fov(),
         aspect,
         moving: cam.is_moving as u32,
-        _pad4: 0,
+        jitter_x: jx,
+        jitter_y: jy,
+        _pad5: 0.0,
+        _pad6: 0.0,
+        _pad7: 0.0,
     };
 }
 

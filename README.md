@@ -1,5 +1,10 @@
 # **black**_**hole**
 
+[![Rust](https://img.shields.io/badge/Rust-2024-f74c00?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Bevy](https://img.shields.io/badge/Bevy-0.18.1-232326?logo=bevy&logoColor=white)](https://bevyengine.org/)
+![WGSL](https://img.shields.io/badge/WGSL-compute%20shader-005a9c)
+![Status](https://img.shields.io/badge/status-experimental-yellow)
+
 Real-time black hole visualization using GPU ray-tracing in Bevy (Rust).
 
 Simulates null geodesics (light paths) in Schwarzschild spacetime around Sagittarius A*, with an accretion disk and a deformed spacetime grid.
@@ -13,11 +18,11 @@ Simulates null geodesics (light paths) in Schwarzschild spacetime around Sagitta
 
 ## Controls
 
-| Input | Action |
-|---|---|
-| Left mouse drag | Orbit camera |
-| Scroll wheel | Zoom in/out |
-| G | Toggle n-body gravity |
+| Input           | Action                |
+|-----------------|-----------------------|
+| Left mouse drag | Orbit camera          |
+| Scroll wheel    | Zoom in/out           |
+| G               | Toggle n-body gravity |
 
 ## Building
 

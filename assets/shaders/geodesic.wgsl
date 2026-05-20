@@ -15,7 +15,11 @@ struct Camera {
     tan_half_fov: f32,
     aspect:       f32,
     moving:       u32,
-    _pad4:        u32,
+    jitter_x:     f32,   // sub-pixel offset in pixel units, 0 when moving
+    jitter_y:     f32,
+    _pad5:        f32,
+    _pad6:        f32,
+    _pad7:        f32,
 }
 @group(0) @binding(1) var<uniform> cam: Camera;
 
@@ -183,8 +187,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pix  = vec2<i32>(i32(gid.x), i32(gid.y));
     if pix.x >= i32(dims.x) || pix.y >= i32(dims.y) { return; }
 
-    let u = (2.0 * (f32(pix.x) + 0.5) / f32(dims.x) - 1.0) * cam.aspect * cam.tan_half_fov;
-    let v = (1.0 - 2.0 * (f32(pix.y) + 0.5) / f32(dims.y)) * cam.tan_half_fov;
+    let u = (2.0 * (f32(pix.x) + 0.5 + cam.jitter_x) / f32(dims.x) - 1.0) * cam.aspect * cam.tan_half_fov;
+    let v = (1.0 - 2.0 * (f32(pix.y) + 0.5 + cam.jitter_y) / f32(dims.y)) * cam.tan_half_fov;
     let dir = normalize(u * cam.right - v * cam.up + cam.forward);
 
     var ray      = init_ray(cam.pos, dir);

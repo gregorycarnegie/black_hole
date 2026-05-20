@@ -7,7 +7,7 @@
 
 ## Rendering Quality
 - [x] Increase native compute shader resolution (200×150 → at least 800×600), or make it configurable at runtime
-- [ ] Add temporal anti-aliasing / accumulation buffer for smoother output
+- [x] Add temporal anti-aliasing / accumulation buffer for smoother output
 
 ## Robustness
 - [x] Add NaN/infinity guards in geodesic shader (divide-by-zero risk when sin(θ) ≈ 0 near poles)
