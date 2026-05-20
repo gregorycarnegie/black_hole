@@ -128,9 +128,10 @@ pub fn init_geodesic_pipeline(
 }
 
 /// Disk parameters: inner/outer radii relative to Sag A* Schwarzschild radius.
+/// Inner edge is the ISCO: 3 r_s for a non-rotating (Schwarzschild) black hole.
 fn disk_data() -> [f32; 4] {
     const SAGA_RS: f32 = 1.269e10;
-    [SAGA_RS * 2.2, SAGA_RS * 5.2, 2.0, 1e9]
+    [SAGA_RS * 3.0, SAGA_RS * 5.2, 2.0, 1e9]
 }
 
 // ── Bind group size helpers ──────────────────────────────────────────────────

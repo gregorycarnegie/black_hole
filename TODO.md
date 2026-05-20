@@ -5,6 +5,17 @@
 - [x] Add adaptive step size to geodesic integration (smaller steps near event horizon, larger far away)
 - [ ] Fix multi-object physics inconsistency: light bending currently only uses Sag A* metric; other massive objects affect Newtonian gravity but not ray paths
 
+## Relativistic Effects
+- [x] Kinematic Doppler shift (fully relativistic: transverse Doppler via γ term)
+- [x] Gravitational redshift: sqrt(1 − r_s/r) applied at disk emission point
+- [x] Relativistic beaming: D³ brightness scaling
+- [x] Fix orbital velocity formula: using sqrt(r_s/2r), correct is sqrt(r_s/(2r−2r_s))
+- [x] Fix inner disk edge: r1 = 2.2 r_s is inside ISCO; should be 3 r_s for Schwarzschild
+- [ ] Fix Doppler ray direction: use actual photon direction at emission, not straight line to camera
+- [ ] Multiple disk images / photon ring: currently break on first equatorial crossing; secondary images from photons that orbit the BH are missing
+- [ ] Temperature-based disk color: Novikov-Thorne T(r) ∝ r^(−3/4) blackbody spectrum instead of heuristic gradient
+- [ ] Kerr metric (frame dragging): Schwarzschild assumes zero spin; Kerr moves ISCO inward, asymmetric light bending, ergosphere
+
 ## Rendering Quality
 - [x] Increase native compute shader resolution (200×150 → at least 800×600), or make it configurable at runtime
 - [x] Add temporal anti-aliasing / accumulation buffer for smoother output

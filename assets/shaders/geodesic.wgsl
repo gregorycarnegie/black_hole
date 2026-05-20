@@ -223,9 +223,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let r_disk    = length(disk_pt);
         let r_norm    = r_disk / disk.r2;
 
-        // Keplerian orbital speed in Schwarzschild coords: v/c = sqrt(r_s / 2r).
-        // Clamped so we never exceed c at the innermost stable orbit.
-        let beta      = sqrt(SAGA_RS / max(2.0 * r_disk, SAGA_RS));
+        // Locally-measured Schwarzschild circular orbit speed: v/c = sqrt(r_s / (2r − 2r_s)).
+        // Clamp denominator so beta stays < 1 approaching the horizon.
+        let beta      = sqrt(SAGA_RS / max(2.0 * (r_disk - SAGA_RS), SAGA_RS));
         // Prograde tangential direction in the equatorial plane.
         let orbital   = normalize(vec3<f32>(-ray.z, 0.0, ray.x));
         let to_cam    = normalize(cam.pos - disk_pt);
