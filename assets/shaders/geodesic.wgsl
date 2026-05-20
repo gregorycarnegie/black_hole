@@ -179,6 +179,74 @@ fn intersect_objects(pos: vec3<f32>) -> ObjectHit {
     return result;
 }
 
+// ── Disk shading ──────────────────────────────────────────────────────────────
+
+// Novikov-Thorne temperature profile: zero at ISCO, peaks at r ≈ 1.36 r_isco,
+// falls as r^(−3/4) outward.  Returns unnormalised value; peak ≈ 0.488.
+fn nt_temp(r_disk: f32) -> f32 {
+    let f = max(1.0 - sqrt(disk.r1 / r_disk), 0.0);
+    return pow(disk.r1 / r_disk, 0.75) * pow(f, 0.25);
+}
+
+// Rough blackbody colour ramp over the visible range:
+// t=0 → cool red/orange, t=1 → blue-white.
+fn blackbody_color(t: f32) -> vec3<f32> {
+    let s = clamp(t, 0.0, 1.0);
+    if s < 0.4 {
+        return mix(vec3<f32>(0.05, 0.0, 0.0), vec3<f32>(1.0, 0.35, 0.02), s / 0.4);
+    } else if s < 0.75 {
+        return mix(vec3<f32>(1.0, 0.35, 0.02), vec3<f32>(1.0, 0.95, 0.80), (s - 0.4) / 0.35);
+    } else {
+        return mix(vec3<f32>(1.0, 0.95, 0.80), vec3<f32>(0.65, 0.80, 1.0), (s - 0.75) / 0.25);
+    }
+}
+
+// Convert the ray's spherical velocity to a Cartesian unit direction.
+// Since we trace camera→scene, negate this to get the photon direction (scene→camera)
+// used in the Doppler angle calculation.
+fn ray_cart_dir(ray: Ray) -> vec3<f32> {
+    let sin_t = sin(ray.theta); let cos_t = cos(ray.theta);
+    let sin_p = sin(ray.phi);   let cos_p = cos(ray.phi);
+    return normalize(vec3<f32>(
+        sin_t*cos_p*ray.dr + ray.r*(cos_t*cos_p*ray.dtheta - sin_t*sin_p*ray.dphi),
+        sin_t*sin_p*ray.dr + ray.r*(cos_t*sin_p*ray.dtheta + sin_t*cos_p*ray.dphi),
+        cos_t*ray.dr        - ray.r*sin_t*ray.dtheta
+    ));
+}
+
+fn shade_disk(ray: Ray) -> vec4<f32> {
+    let disk_pt = vec3<f32>(ray.x, 0.0, ray.z);
+    let r_disk  = length(disk_pt);
+
+    // Novikov-Thorne base colour.  Divide by peak value to normalise to [0,1].
+    let base    = blackbody_color(nt_temp(r_disk) / 0.488);
+
+    // Locally-measured Schwarzschild circular orbit speed: v/c = sqrt(r_s/(2r−2r_s)).
+    let beta    = sqrt(SAGA_RS / max(2.0 * (r_disk - SAGA_RS), SAGA_RS));
+    let orbital = normalize(vec3<f32>(-ray.z, 0.0, ray.x));
+
+    // Use actual geodesic direction at emission (not straight line to camera).
+    let to_cam    = -ray_cart_dir(ray);
+    let cos_alpha = dot(orbital, to_cam);
+
+    // Fully relativistic kinematic Doppler D = 1/(γ(1−β·cos α)).
+    let gamma       = 1.0 / sqrt(max(1.0 - beta * beta, 1e-6));
+    let doppler_kin = 1.0 / max(gamma * (1.0 - beta * cos_alpha), 1e-4);
+    // Gravitational redshift: sqrt(1 − r_s/r).
+    let d_grav      = sqrt(max(1.0 - SAGA_RS / r_disk, 0.0));
+    let doppler     = doppler_kin * d_grav;
+
+    // Relativistic beaming (D³) + colour shift toward blue/red.
+    let bright  = pow(clamp(doppler, 0.05, 8.0), 3.0);
+    let shift   = clamp((doppler - 1.0) * 2.0, -1.0, 1.0);
+    let disk_c  = clamp(
+        base + vec3<f32>(-shift * 0.35, -shift * 0.1, shift * 0.55),
+        vec3<f32>(0.0), vec3<f32>(1.0)
+    ) * bright;
+
+    return vec4<f32>(disk_c, r_disk / disk.r2);
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 @compute @workgroup_size(16, 16, 1)
@@ -195,8 +263,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var prev_pos = vec3<f32>(ray.x, ray.y, ray.z);
     var color    = vec4<f32>(0.0);
 
+    // Accumulate contributions from multiple equatorial crossings.
+    // Each successive image (photon ring order n) receives half the weight of n-1.
+    var disk_rgb    = vec3<f32>(0.0);
+    var disk_alpha  = 0.0;
+    var disk_weight = 1.0;
+    var any_disk    = false;
+
     var hit_black_hole = false;
-    var hit_disk       = false;
     var hit_object     = false;
     var obj_hit: ObjectHit;
 
@@ -208,7 +282,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let new_pos = vec3<f32>(ray.x, ray.y, ray.z);
 
-        if crosses_equatorial(prev_pos, new_pos) { hit_disk = true; break; }
+        if crosses_equatorial(prev_pos, new_pos) {
+            let c     = shade_disk(ray);
+            disk_rgb   += c.rgb * disk_weight;
+            disk_alpha  = max(disk_alpha, c.a * disk_weight);
+            disk_weight *= 0.5;
+            any_disk     = true;
+            // Stop accumulating once the contribution is negligible.
+            if disk_weight < 0.05 { break; }
+            // Otherwise continue: the ray may orbit and produce secondary images.
+        }
 
         obj_hit = intersect_objects(new_pos);
         if obj_hit.hit { hit_object = true; break; }
@@ -217,47 +300,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if ray.r > ESCAPE_R { break; }
     }
 
-    if hit_disk {
-        // Project hit to equatorial plane for orbital mechanics.
-        let disk_pt   = vec3<f32>(ray.x, 0.0, ray.z);
-        let r_disk    = length(disk_pt);
-        let r_norm    = r_disk / disk.r2;
-
-        // Locally-measured Schwarzschild circular orbit speed: v/c = sqrt(r_s / (2r − 2r_s)).
-        // Clamp denominator so beta stays < 1 approaching the horizon.
-        let beta      = sqrt(SAGA_RS / max(2.0 * (r_disk - SAGA_RS), SAGA_RS));
-        // Prograde tangential direction in the equatorial plane.
-        let orbital   = normalize(vec3<f32>(-ray.z, 0.0, ray.x));
-        let to_cam    = normalize(cam.pos - disk_pt);
-        let cos_alpha = dot(orbital, to_cam);
-
-        // Fully relativistic Doppler: D = 1 / (γ · (1 − β·cos_α)).
-        // The γ term captures transverse Doppler redshift absent from the
-        // naive longitudinal formula sqrt((1+β)/(1-β)).
-        let gamma   = 1.0 / sqrt(max(1.0 - beta * beta, 1e-6));
-        let denom   = max(gamma * (1.0 - beta * cos_alpha), 1e-4);
-        let doppler_kin = 1.0 / denom;
-
-        // Gravitational redshift: photons climbing out of the Schwarzschild well
-        // lose energy by D_grav = sqrt(1 - r_s/r).  Inner disk (~2.2 r_s) ≈ 26% redshift.
-        let d_grav  = sqrt(max(1.0 - SAGA_RS / r_disk, 0.0));
-        let doppler = doppler_kin * d_grav;
-
-        // Base disk colour: orange-yellow gradient from inner to outer edge.
-        let base   = vec3<f32>(1.0, r_norm, 0.2);
-        // Doppler beaming: intensity scales as D^3 (power-law for synchrotron-like emission).
-        let bright  = pow(clamp(doppler, 0.1, 8.0), 3.0);
-        // Colour shift: blue side approaches, red side recedes.
-        let shift   = clamp((doppler - 1.0) * 2.0, -1.0, 1.0);
-        let disk_c  = clamp(
-            base + vec3<f32>(-shift * 0.35, -shift * 0.1, shift * 0.55),
-            vec3<f32>(0.0), vec3<f32>(1.0)
-        ) * bright;
-        color = vec4<f32>(disk_c, r_norm);
-
+    if any_disk {
+        color = vec4<f32>(disk_rgb, disk_alpha);
     } else if hit_black_hole {
         color = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-
     } else if hit_object {
         let P         = vec3<f32>(ray.x, ray.y, ray.z);
         let N         = normalize(P - obj_hit.center);
@@ -265,7 +311,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let diff      = max(dot(N, V), 0.0);
         let intensity = 0.1 + 0.9 * diff;
         color         = vec4<f32>(obj_hit.color.rgb * intensity, obj_hit.color.a);
-
     } else {
         color = vec4<f32>(0.0);
     }

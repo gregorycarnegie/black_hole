@@ -11,9 +11,9 @@
 - [x] Relativistic beaming: D³ brightness scaling
 - [x] Fix orbital velocity formula: using sqrt(r_s/2r), correct is sqrt(r_s/(2r−2r_s))
 - [x] Fix inner disk edge: r1 = 2.2 r_s is inside ISCO; should be 3 r_s for Schwarzschild
-- [ ] Fix Doppler ray direction: use actual photon direction at emission, not straight line to camera
-- [ ] Multiple disk images / photon ring: currently break on first equatorial crossing; secondary images from photons that orbit the BH are missing
-- [ ] Temperature-based disk color: Novikov-Thorne T(r) ∝ r^(−3/4) blackbody spectrum instead of heuristic gradient
+- [x] Fix Doppler ray direction: use actual photon direction at emission, not straight line to camera
+- [x] Multiple disk images / photon ring: currently break on first equatorial crossing; secondary images from photons that orbit the BH are missing
+- [x] Temperature-based disk color: Novikov-Thorne T(r) ∝ r^(−3/4) blackbody spectrum instead of heuristic gradient
 - [ ] Kerr metric (frame dragging): Schwarzschild assumes zero spin; Kerr moves ISCO inward, asymmetric light bending, ergosphere
 
 ## Rendering Quality
