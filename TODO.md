@@ -14,7 +14,7 @@
 - [x] Fix Doppler ray direction: use actual photon direction at emission, not straight line to camera
 - [x] Multiple disk images / photon ring: currently break on first equatorial crossing; secondary images from photons that orbit the BH are missing
 - [x] Temperature-based disk color: Novikov-Thorne T(r) ∝ r^(−3/4) blackbody spectrum instead of heuristic gradient
-- [ ] Kerr metric (frame dragging): Schwarzschild assumes zero spin; Kerr moves ISCO inward, asymmetric light bending, ergosphere
+- [x] Kerr metric (frame dragging): Schwarzschild assumes zero spin; Kerr moves ISCO inward, asymmetric light bending, ergosphere
 
 ## Rendering Quality
 - [x] Increase native compute shader resolution (200×150 → at least 800×600), or make it configurable at runtime

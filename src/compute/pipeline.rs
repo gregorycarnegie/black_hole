@@ -17,6 +17,7 @@ use bevy::{
 use bytemuck::Zeroable;
 
 use super::{CameraUniform, GeodesicImage, ObjectsUniform};
+use crate::simulation::{KERR_SPIN, SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
 
@@ -40,6 +41,20 @@ struct GpuCameraUniform {
     _pad5: f32,
     _pad6: f32,
     _pad7: f32,
+}
+
+/// Matches the Disk uniform in geodesic.wgsl (std140, 32 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuDiskUniform {
+    r1: f32,
+    r2: f32,
+    num: f32,
+    thickness: f32,
+    spin: f32,
+    horizon_r: f32,
+    isco_r: f32,
+    _pad0: f32,
 }
 
 /// Matches the Objects uniform in geodesic.wgsl.
@@ -80,8 +95,8 @@ pub fn init_geodesic_pipeline(
                 texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
                 // binding 1 – camera uniform (80 bytes)
                 uniform_buffer_sized(false, Some(GpuCameraUniform::SIZE)),
-                // binding 2 – disk uniform (16 bytes)
-                uniform_buffer_sized(false, Some(std::num::NonZeroU64::new(16).unwrap())),
+                // binding 2 – disk/Kerr uniform
+                uniform_buffer_sized(false, Some(GpuDiskUniform::SIZE)),
                 // binding 3 – objects uniform
                 uniform_buffer_sized(false, Some(GpuObjectsUniform::SIZE)),
             ),
@@ -95,9 +110,10 @@ pub fn init_geodesic_pipeline(
         mapped_at_creation: false,
     });
 
+    let disk_uniform = disk_data();
     let disk_buf = device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("disk_buf"),
-        contents: bytemuck::cast_slice(&disk_data()),
+        contents: bytemuck::bytes_of(&disk_uniform),
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
     });
 
@@ -127,11 +143,19 @@ pub fn init_geodesic_pipeline(
     });
 }
 
-/// Disk parameters: inner/outer radii relative to Sag A* Schwarzschild radius.
-/// Inner edge is the ISCO: 3 r_s for a non-rotating (Schwarzschild) black hole.
-fn disk_data() -> [f32; 4] {
-    const SAGA_RS: f32 = 1.269e10;
-    [SAGA_RS * 3.0, SAGA_RS * 5.2, 2.0, 1e9]
+/// Disk/Kerr parameters. The inner edge follows the prograde Kerr ISCO.
+fn disk_data() -> GpuDiskUniform {
+    let isco_r = kerr_isco_radius(KERR_SPIN);
+    GpuDiskUniform {
+        r1: isco_r,
+        r2: SAGA_RS * 5.2,
+        num: 2.0,
+        thickness: 1e9,
+        spin: KERR_SPIN,
+        horizon_r: kerr_horizon_radius(KERR_SPIN),
+        isco_r,
+        _pad0: 0.0,
+    }
 }
 
 // ── Bind group size helpers ──────────────────────────────────────────────────
@@ -141,6 +165,11 @@ trait GpuSize {
 }
 
 impl GpuSize for GpuCameraUniform {
+    const SIZE: std::num::NonZeroU64 =
+        unsafe { std::num::NonZeroU64::new_unchecked(std::mem::size_of::<Self>() as u64) };
+}
+
+impl GpuSize for GpuDiskUniform {
     const SIZE: std::num::NonZeroU64 =
         unsafe { std::num::NonZeroU64::new_unchecked(std::mem::size_of::<Self>() as u64) };
 }

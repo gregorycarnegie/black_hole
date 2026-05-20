@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::simulation::{G_CONST, SimObjects};
+use crate::simulation::{C, G_CONST, SimObjects};
 
 pub struct GridPlugin;
 
@@ -18,14 +18,9 @@ struct GridCache {
 
 /// Draws a 25×25 wireframe grid deformed by the Schwarzschild metric of each
 /// object. Vertices are cached and only recomputed when object positions change.
-fn draw_spacetime_grid(
-    mut gizmos: Gizmos,
-    objects: Res<SimObjects>,
-    mut cache: ResMut<GridCache>,
-) {
+fn draw_spacetime_grid(mut gizmos: Gizmos, objects: Res<SimObjects>, mut cache: ResMut<GridCache>) {
     const GRID_SIZE: i32 = 25;
     const SPACING: f32 = 1e10;
-    const C: f64 = 299_792_458.0;
 
     let count = (GRID_SIZE + 1) as usize;
 
@@ -47,8 +42,7 @@ fn draw_spacetime_grid(
                     y += 2.0 * (r_s * (dist - r_s).max(0.0)).sqrt() - 3e10;
                 }
 
-                cache.verts[zi as usize * count + xi as usize] =
-                    Vec3::new(world_x, y, world_z);
+                cache.verts[zi as usize * count + xi as usize] = Vec3::new(world_x, y, world_z);
             }
         }
     }
