@@ -27,7 +27,7 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 | G               | Toggle n-body gravity                          |
 | Q / E           | Decrease / increase black hole spin a* (±0.05) |
 | Z / X           | Decrease / increase outer disk radius (±1 r_s) |
-| O               | Toggle debug bodies                             |
+| O               | Toggle debug bodies                            |
 | B               | Cycle HDR skybox                               |
 
 ## Building
