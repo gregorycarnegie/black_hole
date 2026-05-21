@@ -433,17 +433,28 @@ fn ray_cart_dir(ray: Ray) -> vec3<f32> {
     return normalize(v);
 }
 
-fn orbital_beta_kerr(r_disk: f32) -> f32 {
-    let spin = spin_clamped();
-    let orbit_sign = select(-1.0, 1.0, spin >= 0.0);
-    let rho = max(r_disk / BH_M, 1.0);
-    let omega_orbit = orbit_sign / (BH_M * max(rho * sqrt(rho) + orbit_sign * abs(spin), 1.0e-4));
+struct OrbitalResult {
+    beta:       f32,
+    lapse:      f32,
+    orbit_sign: f32,
+}
+
+// Returns orbital beta, gravitational lapse, and orbit direction in one pass
+// so shade_disk can reuse lapse and orbit_sign without recomputing them.
+fn orbital_kerr(r_disk: f32) -> OrbitalResult {
+    let a = spin_clamped();
+    let orbit_sign = select(-1.0, 1.0, a >= 0.0);
+    let rho_k = max(r_disk / BH_M, 1.0);
+    let omega_orbit = orbit_sign / (BH_M * max(rho_k * sqrt(rho_k) + orbit_sign * abs(a), 1.0e-4));
     let omega_drag = frame_drag_omega(r_disk, 0.5 * PI);
     let lapse = max(kerr_lapse(r_disk, 0.5 * PI), 1.0e-4);
 
-    let sigma = kerr_sigma_hat(metric_rho(r_disk), 0.5 * PI);
-    let g_phiphi = (BH_M * BH_M) * kerr_big_a_hat(metric_rho(r_disk), 0.5 * PI) / sigma;
-    return clamp(abs((omega_orbit - omega_drag) * sqrt(max(g_phiphi, 0.0)) / lapse), 0.0, 0.95);
+    // metric_rho computed once and reused for both sigma and g_phiphi.
+    let rho_m = metric_rho(r_disk);
+    let sigma = kerr_sigma_hat(rho_m, 0.5 * PI);
+    let g_phiphi = (BH_M * BH_M) * kerr_big_a_hat(rho_m, 0.5 * PI) / sigma;
+    let beta = clamp(abs((omega_orbit - omega_drag) * sqrt(max(g_phiphi, 0.0)) / lapse), 0.0, 0.95);
+    return OrbitalResult(beta, lapse, orbit_sign);
 }
 
 fn shade_disk(ray: Ray) -> vec4<f32> {
@@ -451,17 +462,15 @@ fn shade_disk(ray: Ray) -> vec4<f32> {
     let r_disk = length(disk_pt);
 
     let base = blackbody_color(nt_temp(r_disk) / 0.488);
-    let beta = orbital_beta_kerr(r_disk);
-    let spin_dir = select(-1.0, 1.0, spin_clamped() >= 0.0);
-    let orbital = spin_dir * normalize(vec3<f32>(-ray.z, 0.0, ray.x));
+    let orb = orbital_kerr(r_disk);
+    let orbital = orb.orbit_sign * normalize(vec3<f32>(-ray.z, 0.0, ray.x));
 
     let to_cam = -ray_cart_dir(ray);
     let cos_alpha = dot(orbital, to_cam);
 
-    let gamma = 1.0 / sqrt(max(1.0 - beta * beta, 1.0e-6));
-    let doppler_kin = 1.0 / max(gamma * (1.0 - beta * cos_alpha), 1.0e-4);
-    let d_grav = kerr_lapse(r_disk, 0.5 * PI);
-    let doppler = doppler_kin * d_grav;
+    let gamma = 1.0 / sqrt(max(1.0 - orb.beta * orb.beta, 1.0e-6));
+    let doppler_kin = 1.0 / max(gamma * (1.0 - orb.beta * cos_alpha), 1.0e-4);
+    let doppler = doppler_kin * orb.lapse;
 
     let bright = pow(clamp(doppler, 0.05, 8.0), 3.0);
     let shift = clamp((doppler - 1.0) * 2.0, -1.0, 1.0);

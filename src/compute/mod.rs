@@ -127,6 +127,22 @@ impl Default for DiskConfigUniform {
 #[derive(Resource, Default)]
 struct StillFrameCounter(u32);
 
+/// Fraction of the window resolution used for compute textures (0.25–1.0).
+/// Press `[` / `]` to cycle through presets at runtime.
+#[derive(Resource)]
+struct RenderScale(f32);
+
+impl Default for RenderScale {
+    fn default() -> Self {
+        Self(0.5)
+    }
+}
+
+/// Marks the sprite that displays the final rendered image so it can be
+/// found and updated when the render scale changes.
+#[derive(Component)]
+struct DisplaySprite;
+
 // ── Render graph labels ──────────────────────────────────────────────────────
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
@@ -157,7 +173,8 @@ impl Plugin for GeodesicComputePlugin {
             .init_resource::<RenderFrameCount>()
             .init_resource::<FrameParity>()
             .init_resource::<DiskConfigUniform>()
-            .init_resource::<StillFrameCounter>();
+            .init_resource::<StillFrameCounter>()
+            .init_resource::<RenderScale>();
 
         app.add_systems(Startup, (setup_compute_texture, load_skyboxes));
         app.add_systems(
@@ -167,6 +184,7 @@ impl Plugin for GeodesicComputePlugin {
                 sync_objects_uniform,
                 sync_disk_config_uniform,
                 cycle_skybox,
+                update_render_scale,
             ),
         );
 
@@ -221,13 +239,15 @@ fn setup_compute_texture(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    scale: Res<RenderScale>,
 ) {
     let (win_w, win_h) = windows
         .single()
         .ok()
         .map(|win| (win.physical_width(), win.physical_height()))
         .unwrap_or((800, 600));
-    let (w, h) = ((win_w / 2).max(1), (win_h / 2).max(1));
+    let w = ((win_w as f32 * scale.0) as u32).max(1);
+    let h = ((win_h as f32 * scale.0) as u32).max(1);
 
     commands.insert_resource(GeodesicImage(make_rgba8_tex(w, h, &mut images)));
     commands.insert_resource(AccumA(make_rgba32f_tex(w, h, &mut images)));
@@ -241,6 +261,7 @@ fn setup_compute_texture(
             ..default()
         },
         Transform::default(),
+        DisplaySprite,
     ));
     commands.insert_resource(DisplayImage(disp));
 }
@@ -321,6 +342,9 @@ fn sync_camera_uniform(
 }
 
 fn sync_objects_uniform(objects: Res<SimObjects>, mut uniform: ResMut<ObjectsUniform>) {
+    if !objects.is_changed() {
+        return;
+    }
     uniform.num_objects = objects.0.len().min(16) as i32;
     for (i, obj) in objects.0.iter().take(16).enumerate() {
         uniform.pos_radius[i] = [obj.position.x, obj.position.y, obj.position.z, obj.radius];
@@ -330,8 +354,68 @@ fn sync_objects_uniform(objects: Res<SimObjects>, mut uniform: ResMut<ObjectsUni
 }
 
 fn sync_disk_config_uniform(disk: Res<DiskConfig>, mut uniform: ResMut<DiskConfigUniform>) {
+    if !disk.is_changed() {
+        return;
+    }
     uniform.spin = disk.spin;
     uniform.r_outer_rs = disk.r_outer_rs;
+}
+
+const SCALE_PRESETS: &[f32] = &[0.25, 0.5, 0.75, 1.0];
+
+/// Press `[` to halve / `]` to increase render scale through 25 % → 50 % → 75 % → 100 %.
+/// Recreates all compute textures at the new resolution and resets TAA history.
+fn update_render_scale(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut scale: ResMut<RenderScale>,
+    mut images: ResMut<Assets<Image>>,
+    mut geo: ResMut<GeodesicImage>,
+    mut accum_a: ResMut<AccumA>,
+    mut accum_b: ResMut<AccumB>,
+    mut display: ResMut<DisplayImage>,
+    mut sprites: Query<&mut Sprite, With<DisplaySprite>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut cam: ResMut<OrbitalCamera>,
+) {
+    let idx = SCALE_PRESETS
+        .iter()
+        .position(|&s| (s - scale.0).abs() < 0.01)
+        .unwrap_or(1);
+
+    let new_idx = if keys.just_pressed(KeyCode::BracketLeft) {
+        idx.saturating_sub(1)
+    } else if keys.just_pressed(KeyCode::BracketRight) {
+        (idx + 1).min(SCALE_PRESETS.len() - 1)
+    } else {
+        return;
+    };
+
+    if new_idx == idx {
+        return;
+    }
+
+    scale.0 = SCALE_PRESETS[new_idx];
+
+    let (win_w, win_h) = windows
+        .single()
+        .ok()
+        .map(|w| (w.physical_width(), w.physical_height()))
+        .unwrap_or((800, 600));
+    let w = ((win_w as f32 * scale.0) as u32).max(1);
+    let h = ((win_h as f32 * scale.0) as u32).max(1);
+
+    geo.0 = make_rgba8_tex(w, h, &mut images);
+    accum_a.0 = make_rgba32f_tex(w, h, &mut images);
+    accum_b.0 = make_rgba32f_tex(w, h, &mut images);
+    let disp = make_rgba8_tex(w, h, &mut images);
+    display.0 = disp.clone();
+
+    if let Ok(mut sprite) = sprites.single_mut() {
+        sprite.image = disp;
+    }
+
+    cam.is_moving = true;
+    info!("Render scale: {:.0}% ({}×{})", scale.0 * 100.0, w, h);
 }
 
 const SKYBOXES: &[&str] = &[

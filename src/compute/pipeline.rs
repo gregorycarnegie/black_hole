@@ -46,7 +46,7 @@ struct GpuCameraUniform {
 
 /// Matches the Disk uniform in geodesic.wgsl (std140, 32 bytes).
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuDiskUniform {
     r1: f32,
     r2: f32,
@@ -61,7 +61,7 @@ struct GpuDiskUniform {
 /// Matches the Objects uniform in geodesic.wgsl.
 /// std140 pads f32 array elements to 16 bytes → use [f32;4].
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuObjectsUniform {
     num_objects: i32,
     _pad: [f32; 3],
@@ -79,6 +79,13 @@ pub struct GeodesicPipeline {
     camera_buf: Buffer,
     disk_buf: Buffer,
     objects_buf: Buffer,
+    /// Handles of textures currently bound in the active GeodesicBindGroup.
+    /// `None` until the first bind group is successfully created.
+    bound_geo_handle: Option<Handle<Image>>,
+    bound_sky_handle: Option<Handle<Image>>,
+    /// Last values written to the GPU buffers; skip write when unchanged.
+    last_objects: Option<GpuObjectsUniform>,
+    last_disk: Option<GpuDiskUniform>,
 }
 
 pub fn init_geodesic_pipeline(
@@ -143,6 +150,10 @@ pub fn init_geodesic_pipeline(
         camera_buf,
         disk_buf,
         objects_buf,
+        bound_geo_handle: None,
+        bound_sky_handle: None,
+        last_objects: None,
+        last_disk: None,
     });
 }
 
@@ -182,14 +193,14 @@ impl GpuSize for GpuObjectsUniform {
         std::num::NonZeroU64::new(std::mem::size_of::<Self>() as u64).unwrap();
 }
 
-// ── Bind group (recreated every frame) ──────────────────────────────────────
+// ── Bind group ───────────────────────────────────────────────────────────────
 
 #[derive(Resource)]
 pub struct GeodesicBindGroup(pub BindGroup);
 
 #[derive(SystemParam)]
 pub struct GeodesicSources<'w> {
-    pipeline: Option<Res<'w, GeodesicPipeline>>,
+    pipeline: Option<ResMut<'w, GeodesicPipeline>>,
     geodesic_image: Option<Res<'w, GeodesicImage>>,
     camera_uniform: Option<Res<'w, CameraUniform>>,
     objects_uniform: Option<Res<'w, ObjectsUniform>>,
@@ -211,7 +222,7 @@ pub fn prepare_bind_group(
     gpu: RenderGpu,
 ) {
     let (
-        Some(pipeline),
+        Some(mut pipeline),
         Some(geodesic_image),
         Some(camera_uniform),
         Some(objects_uniform),
@@ -228,13 +239,8 @@ pub fn prepare_bind_group(
     else {
         return;
     };
-    let (Some(gpu_image), Some(skybox_gpu)) =
-        (gpu.gpu_images.get(&geodesic_image.0), gpu.gpu_images.get(&skybox.0))
-    else {
-        return;
-    };
 
-    // Write camera data
+    // Camera changes every still frame (jitter) — always write.
     let gpu_cam = GpuCameraUniform {
         pos: camera_uniform.pos.into(),
         _pad0: 0.0,
@@ -256,19 +262,39 @@ pub fn prepare_bind_group(
     gpu.queue
         .write_buffer(&pipeline.camera_buf, 0, bytemuck::bytes_of(&gpu_cam));
 
-    // Write objects data
+    // Objects buffer — write only when data actually changed.
     let mut gpu_objs = GpuObjectsUniform::zeroed();
     gpu_objs.num_objects = objects_uniform.num_objects;
     gpu_objs.pos_radius = objects_uniform.pos_radius;
     gpu_objs.color = objects_uniform.color;
     gpu_objs.mass = objects_uniform.mass;
-    gpu.queue
-        .write_buffer(&pipeline.objects_buf, 0, bytemuck::bytes_of(&gpu_objs));
+    if pipeline.last_objects != Some(gpu_objs) {
+        gpu.queue
+            .write_buffer(&pipeline.objects_buf, 0, bytemuck::bytes_of(&gpu_objs));
+        pipeline.last_objects = Some(gpu_objs);
+    }
 
-    // Write disk/Kerr data (dynamic: spin and outer radius adjustable at runtime).
+    // Disk/Kerr buffer — write only when spin or outer radius changed.
     let gpu_disk = build_disk_uniform(disk_config.spin, disk_config.r_outer_rs);
-    gpu.queue
-        .write_buffer(&pipeline.disk_buf, 0, bytemuck::bytes_of(&gpu_disk));
+    if pipeline.last_disk != Some(gpu_disk) {
+        gpu.queue
+            .write_buffer(&pipeline.disk_buf, 0, bytemuck::bytes_of(&gpu_disk));
+        pipeline.last_disk = Some(gpu_disk);
+    }
+
+    // Bind group — recreate only when output texture or skybox handle changes.
+    let geo_changed = pipeline.bound_geo_handle.as_ref() != Some(&geodesic_image.0);
+    let sky_changed = pipeline.bound_sky_handle.as_ref() != Some(&skybox.0);
+    if !geo_changed && !sky_changed {
+        return;
+    }
+
+    let (Some(gpu_image), Some(skybox_gpu)) = (
+        gpu.gpu_images.get(&geodesic_image.0),
+        gpu.gpu_images.get(&skybox.0),
+    ) else {
+        return; // GPU textures not yet uploaded; retry next frame.
+    };
 
     let layout = gpu.pipeline_cache.get_bind_group_layout(&pipeline.layout);
     let bind_group = gpu.device.create_bind_group(
@@ -284,6 +310,8 @@ pub fn prepare_bind_group(
     );
 
     commands.insert_resource(GeodesicBindGroup(bind_group));
+    pipeline.bound_geo_handle = Some(geodesic_image.0.clone());
+    pipeline.bound_sky_handle = Some(skybox.0.clone());
 }
 
 // ── Render graph node ────────────────────────────────────────────────────────

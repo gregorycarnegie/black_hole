@@ -36,6 +36,12 @@ pub struct AccumulatePipeline {
     layout: BindGroupLayoutDescriptor,
     pipeline_id: CachedComputePipelineId,
     blend_buf: Buffer,
+    /// Handles of textures currently bound in the active AccumulateBindGroups.
+    /// `None` until the first bind groups are successfully created.
+    bound_geo: Option<Handle<Image>>,
+    bound_a: Option<Handle<Image>>,
+    bound_b: Option<Handle<Image>>,
+    bound_disp: Option<Handle<Image>>,
 }
 
 pub fn init_accumulate_pipeline(
@@ -86,6 +92,10 @@ pub fn init_accumulate_pipeline(
         layout,
         pipeline_id,
         blend_buf,
+        bound_geo: None,
+        bound_a: None,
+        bound_b: None,
+        bound_disp: None,
     });
 }
 
@@ -102,7 +112,7 @@ pub struct AccumulateBindGroups {
 
 #[derive(SystemParam)]
 pub struct AccumulateSources<'w> {
-    pipeline: Option<Res<'w, AccumulatePipeline>>,
+    pipeline: Option<ResMut<'w, AccumulatePipeline>>,
     geodesic: Option<Res<'w, GeodesicImage>>,
     accum_a: Option<Res<'w, AccumA>>,
     accum_b: Option<Res<'w, AccumB>>,
@@ -123,7 +133,7 @@ pub fn prepare_accumulate_bind_group(
     sources: AccumulateSources,
     gpu: RenderGpu,
 ) {
-    let (Some(pipeline), Some(geo), Some(a), Some(b), Some(disp), Some(fc)) = (
+    let (Some(mut pipeline), Some(geo), Some(a), Some(b), Some(disp), Some(fc)) = (
         sources.pipeline,
         sources.geodesic,
         sources.accum_a,
@@ -134,21 +144,32 @@ pub fn prepare_accumulate_bind_group(
         return;
     };
 
-    let (Some(geo_gpu), Some(a_gpu), Some(b_gpu), Some(disp_gpu)) = (
-        gpu.gpu_images.get(&geo.0),
-        gpu.gpu_images.get(&a.0),
-        gpu.gpu_images.get(&b.0),
-        gpu.gpu_images.get(&disp.0),
-    ) else {
-        return;
-    };
-
+    // Blend uniform changes every still frame — always write.
     let blend = BlendUniform {
         frame_count: fc.0,
         _pad: [0; 3],
     };
     gpu.queue
         .write_buffer(&pipeline.blend_buf, 0, bytemuck::bytes_of(&blend));
+
+    // Bind groups — recreate only when any texture handle changes.
+    let needs_rebuild = pipeline.bound_geo.as_ref() != Some(&geo.0)
+        || pipeline.bound_a.as_ref() != Some(&a.0)
+        || pipeline.bound_b.as_ref() != Some(&b.0)
+        || pipeline.bound_disp.as_ref() != Some(&disp.0);
+
+    if !needs_rebuild {
+        return;
+    }
+
+    let (Some(geo_gpu), Some(a_gpu), Some(b_gpu), Some(disp_gpu)) = (
+        gpu.gpu_images.get(&geo.0),
+        gpu.gpu_images.get(&a.0),
+        gpu.gpu_images.get(&b.0),
+        gpu.gpu_images.get(&disp.0),
+    ) else {
+        return; // GPU textures not yet uploaded; retry next frame.
+    };
 
     let layout = gpu.pipeline_cache.get_bind_group_layout(&pipeline.layout);
 
@@ -179,6 +200,10 @@ pub fn prepare_accumulate_bind_group(
     );
 
     commands.insert_resource(AccumulateBindGroups { a_prev, b_prev });
+    pipeline.bound_geo = Some(geo.0.clone());
+    pipeline.bound_a = Some(a.0.clone());
+    pipeline.bound_b = Some(b.0.clone());
+    pipeline.bound_disp = Some(disp.0.clone());
 }
 
 // ── Render graph node ────────────────────────────────────────────────────────
