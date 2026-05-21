@@ -41,6 +41,17 @@ pub struct AccumB(pub Handle<Image>);
 #[derive(Resource, Clone, ExtractResource)]
 pub struct DisplayImage(pub Handle<Image>);
 
+/// HDR equirectangular skybox currently bound to the geodesic shader.
+#[derive(Resource, Clone, ExtractResource)]
+pub struct SkyboxImage(pub Handle<Image>);
+
+/// All loaded skyboxes; main-world-only, drives the cycle-on-B-key UI.
+#[derive(Resource)]
+pub struct SkyboxSet {
+    pub handles: Vec<Handle<Image>>,
+    pub current: usize,
+}
+
 /// frame_count sent to the accumulate shader for this render frame.
 /// 0 = reset history; ≥1 = blend with α=0.1.
 #[derive(Resource, Clone, Default, ExtractResource)]
@@ -138,6 +149,7 @@ impl Plugin for GeodesicComputePlugin {
             ExtractResourcePlugin::<RenderFrameCount>::default(),
             ExtractResourcePlugin::<FrameParity>::default(),
             ExtractResourcePlugin::<DiskConfigUniform>::default(),
+            ExtractResourcePlugin::<SkyboxImage>::default(),
         ));
 
         app.init_resource::<CameraUniform>()
@@ -147,13 +159,14 @@ impl Plugin for GeodesicComputePlugin {
             .init_resource::<DiskConfigUniform>()
             .init_resource::<StillFrameCounter>();
 
-        app.add_systems(Startup, setup_compute_texture);
+        app.add_systems(Startup, (setup_compute_texture, load_skyboxes));
         app.add_systems(
             Update,
             (
                 sync_camera_uniform,
                 sync_objects_uniform,
                 sync_disk_config_uniform,
+                cycle_skybox,
             ),
         );
 
@@ -319,4 +332,34 @@ fn sync_objects_uniform(objects: Res<SimObjects>, mut uniform: ResMut<ObjectsUni
 fn sync_disk_config_uniform(disk: Res<DiskConfig>, mut uniform: ResMut<DiskConfigUniform>) {
     uniform.spin = disk.spin;
     uniform.r_outer_rs = disk.r_outer_rs;
+}
+
+const SKYBOXES: &[&str] = &[
+    "hdr/HDR_galactic_plane_1.hdr",
+    "hdr/HDR_blue_nebulae_3.hdr",
+    "hdr/HDR_white_local_star_and_nebulae.hdr",
+];
+
+fn load_skyboxes(mut commands: Commands, asset_server: Res<AssetServer>) {
+    let handles: Vec<Handle<Image>> = SKYBOXES.iter().map(|p| asset_server.load(*p)).collect();
+    commands.insert_resource(SkyboxImage(handles[0].clone()));
+    commands.insert_resource(SkyboxSet {
+        handles,
+        current: 0,
+    });
+}
+
+/// Press B to cycle through the loaded HDR skyboxes.
+fn cycle_skybox(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut set: ResMut<SkyboxSet>,
+    mut active: ResMut<SkyboxImage>,
+    mut cam: ResMut<OrbitalCamera>,
+) {
+    if keys.just_pressed(KeyCode::KeyB) {
+        set.current = (set.current + 1) % set.handles.len();
+        active.0 = set.handles[set.current].clone();
+        cam.is_moving = true; // reset TAA history
+        info!("Skybox: {} ({})", set.current, SKYBOXES[set.current]);
+    }
 }

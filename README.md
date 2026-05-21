@@ -15,6 +15,7 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 2. **Accretion disk** — rays that cross the equatorial plane render with Kerr ISCO, frame dragging, Doppler beaming, and gravitational redshift
 3. **Spacetime grid** — wireframe grid deformed by the Schwarzschild metric of each massive object
 4. **N-body gravity** — optional Newtonian gravity simulation between scene objects
+5. **HDR skyboxes** — equirectangular space backgrounds sampled along each ray's lensed escape direction
 
 ## Controls
 
@@ -26,6 +27,7 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 | G               | Toggle n-body gravity                          |
 | Q / E           | Decrease / increase black hole spin a* (±0.05) |
 | Z / X           | Decrease / increase outer disk radius (±1 r_s) |
+| B               | Cycle HDR skybox                               |
 
 ## Building
 

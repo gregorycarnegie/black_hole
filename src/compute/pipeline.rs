@@ -7,7 +7,7 @@ use bevy::{
         render_asset::RenderAssets,
         render_graph,
         render_resource::{
-            binding_types::{texture_storage_2d, uniform_buffer_sized},
+            binding_types::{texture_2d, texture_storage_2d, uniform_buffer_sized},
             *,
         },
         renderer::{RenderContext, RenderDevice, RenderQueue},
@@ -17,7 +17,7 @@ use bevy::{
 };
 use bytemuck::Zeroable;
 
-use super::{CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform};
+use super::{CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform, SkyboxImage};
 use crate::simulation::{SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
@@ -100,6 +100,8 @@ pub fn init_geodesic_pipeline(
                 uniform_buffer_sized(false, Some(GpuDiskUniform::SIZE)),
                 // binding 3 – objects uniform
                 uniform_buffer_sized(false, Some(GpuObjectsUniform::SIZE)),
+                // binding 4 – skybox HDR (sampled via textureLoad, no filtering)
+                texture_2d(TextureSampleType::Float { filterable: false }),
             ),
         ),
     );
@@ -192,6 +194,7 @@ pub struct GeodesicSources<'w> {
     camera_uniform: Option<Res<'w, CameraUniform>>,
     objects_uniform: Option<Res<'w, ObjectsUniform>>,
     disk_config: Option<Res<'w, DiskConfigUniform>>,
+    skybox: Option<Res<'w, SkyboxImage>>,
 }
 
 #[derive(SystemParam)]
@@ -213,17 +216,21 @@ pub fn prepare_bind_group(
         Some(camera_uniform),
         Some(objects_uniform),
         Some(disk_config),
+        Some(skybox),
     ) = (
         sources.pipeline,
         sources.geodesic_image,
         sources.camera_uniform,
         sources.objects_uniform,
         sources.disk_config,
+        sources.skybox,
     )
     else {
         return;
     };
-    let Some(gpu_image) = gpu.gpu_images.get(&geodesic_image.0) else {
+    let (Some(gpu_image), Some(skybox_gpu)) =
+        (gpu.gpu_images.get(&geodesic_image.0), gpu.gpu_images.get(&skybox.0))
+    else {
         return;
     };
 
@@ -272,6 +279,7 @@ pub fn prepare_bind_group(
             pipeline.camera_buf.as_entire_binding(),
             pipeline.disk_buf.as_entire_binding(),
             pipeline.objects_buf.as_entire_binding(),
+            &skybox_gpu.texture_view,
         )),
     );
 

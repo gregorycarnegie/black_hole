@@ -47,6 +47,8 @@ struct Objects {
 }
 @group(0) @binding(3) var<uniform> objects: Objects;
 
+@group(0) @binding(4) var skybox: texture_2d<f32>;
+
 // -- Constants ---------------------------------------------------------------
 
 const PI:             f32 = 3.141592653589793;
@@ -471,6 +473,43 @@ fn shade_disk(ray: Ray) -> vec4<f32> {
     return vec4<f32>(disk_c, r_disk / disk.r2);
 }
 
+// -- Skybox ------------------------------------------------------------------
+
+// Equirectangular HDR sample with manual bilinear (texture is Rgba32Float
+// and we can't rely on float32-filterable). Reinhard-tonemapped to [0, 1].
+fn sample_skybox(dir: vec3<f32>) -> vec3<f32> {
+    let dims_u = textureDimensions(skybox);
+    let w = i32(dims_u.x);
+    let h = i32(dims_u.y);
+    let dims = vec2<f32>(f32(w), f32(h));
+
+    let d = normalize(dir);
+    let u = atan2(d.z, d.x) * (1.0 / (2.0 * PI)) + 0.5;
+    let v = acos(clamp(d.y, -1.0, 1.0)) * (1.0 / PI);
+
+    let px = u * dims.x - 0.5;
+    let py = v * dims.y - 0.5;
+
+    let x0_raw = i32(floor(px));
+    let y0 = clamp(i32(floor(py)), 0, h - 1);
+    let x1_raw = x0_raw + 1;
+    let y1 = clamp(y0 + 1, 0, h - 1);
+    let fx = px - floor(px);
+    let fy = py - floor(py);
+
+    let x0 = ((x0_raw % w) + w) % w;
+    let x1 = ((x1_raw % w) + w) % w;
+
+    let c00 = textureLoad(skybox, vec2<i32>(x0, y0), 0).rgb;
+    let c10 = textureLoad(skybox, vec2<i32>(x1, y0), 0).rgb;
+    let c01 = textureLoad(skybox, vec2<i32>(x0, y1), 0).rgb;
+    let c11 = textureLoad(skybox, vec2<i32>(x1, y1), 0).rgb;
+    let hdr = mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
+
+    // Reinhard tonemap so bright nebulae/stars don't clip.
+    return hdr / (hdr + vec3<f32>(1.0));
+}
+
 // -- Main --------------------------------------------------------------------
 
 @compute @workgroup_size(16, 16, 1)
@@ -538,9 +577,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if ray.r > ESCAPE_R { break; }
     }
 
-    if any_disk {
-        color = vec4<f32>(disk_rgb, disk_alpha);
-    } else if hit_black_hole {
+    if hit_black_hole {
         color = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     } else if hit_object {
         let p = vec3<f32>(ray.x, ray.y, ray.z);
@@ -549,10 +586,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let diff = max(dot(n, view), 0.0);
         let intensity = 0.1 + 0.9 * diff;
         color = vec4<f32>(obj_hit.color.rgb * intensity, obj_hit.color.a);
-    } else if passed_ergosphere {
-        color = vec4<f32>(0.95, 0.42, 0.08, 0.18 * ergosphere_alpha);
     } else {
-        color = vec4<f32>(0.0);
+        var rgb = sample_skybox(ray_cart_dir(ray));
+        if passed_ergosphere {
+            rgb = mix(rgb, vec3<f32>(0.95, 0.42, 0.08), 0.18 * ergosphere_alpha);
+        }
+        if any_disk {
+            rgb = mix(rgb, disk_rgb, disk_alpha);
+        }
+        color = vec4<f32>(rgb, 1.0);
     }
 
     textureStore(out_image, pix, color);
