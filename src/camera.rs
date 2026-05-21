@@ -42,9 +42,9 @@ pub struct OrbitalCamera {
 impl Default for OrbitalCamera {
     fn default() -> Self {
         Self {
-            radius: 6.34194e10,
+            radius: 3.0e11,
             azimuth: 0.0,
-            elevation: PI / 2.0,
+            elevation: PI / 2.0 - 0.35,
             min_radius: 1e10,
             max_radius: 1e12,
             orbit_speed: 0.005,

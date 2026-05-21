@@ -164,7 +164,7 @@ fn build_disk_uniform(spin: f32, r_outer_rs: f32) -> GpuDiskUniform {
         r1: isco_r,
         r2: SAGA_RS * r_outer_rs,
         num: 2.0,
-        thickness: 1e9,
+        thickness: 0.1,
         spin,
         horizon_r: kerr_horizon_radius(spin),
         isco_r,

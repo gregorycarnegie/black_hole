@@ -36,9 +36,10 @@ impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SimObjects>()
             .init_resource::<GravityEnabled>()
+            .init_resource::<DebugBodiesEnabled>()
             .init_resource::<DiskConfig>()
             .add_systems(Update, (toggle_gravity, gravity_system).chain())
-            .add_systems(Update, update_disk_config);
+            .add_systems(Update, (toggle_debug_bodies, update_disk_config).chain());
     }
 }
 
@@ -57,7 +58,25 @@ pub struct SimObjects(pub Vec<SimObject>);
 
 impl Default for SimObjects {
     fn default() -> Self {
-        Self(vec![
+        Self(scene_objects(KERR_SPIN, false))
+    }
+}
+
+fn black_hole_object(spin: f32) -> SimObject {
+    SimObject {
+        position: Vec3::ZERO,
+        radius: kerr_horizon_radius(spin),
+        color: Vec4::new(0., 0., 0., 1.),
+        mass: SAGA_MASS as f32,
+        velocity: Vec3::ZERO,
+    }
+}
+
+fn scene_objects(spin: f32, include_debug_bodies: bool) -> Vec<SimObject> {
+    let mut objects = Vec::new();
+
+    if include_debug_bodies {
+        objects.extend([
             SimObject {
                 position: Vec3::new(4e11, 0.0, 0.0),
                 radius: 4e10,
@@ -72,16 +91,12 @@ impl Default for SimObjects {
                 mass: 1.98892e30,
                 velocity: Vec3::ZERO,
             },
-            // Black hole at origin (last so objects loop skips it for gravity source)
-            SimObject {
-                position: Vec3::ZERO,
-                radius: kerr_horizon_radius(KERR_SPIN),
-                color: Vec4::new(0., 0., 0., 1.),
-                mass: SAGA_MASS as f32,
-                velocity: Vec3::ZERO,
-            },
-        ])
+        ]);
     }
+
+    // Keep the black hole last so systems can update its radius cheaply.
+    objects.push(black_hole_object(spin));
+    objects
 }
 
 /// Keyboard handler for runtime disk / BH parameter adjustment.
@@ -92,6 +107,7 @@ impl Default for SimObjects {
 /// | E   | Increase spin a* by 0.05            |
 /// | Z   | Decrease outer disk radius by 1 r_s |
 /// | X   | Increase outer disk radius by 1 r_s |
+/// | O   | Toggle debug orbiting bodies        |
 fn update_disk_config(
     keys: Res<ButtonInput<KeyCode>>,
     mut disk: ResMut<DiskConfig>,
@@ -134,10 +150,28 @@ fn update_disk_config(
 #[derive(Resource, Default)]
 pub struct GravityEnabled(pub bool);
 
+#[derive(Resource, Default)]
+pub struct DebugBodiesEnabled(pub bool);
+
 fn toggle_gravity(keys: Res<ButtonInput<KeyCode>>, mut gravity: ResMut<GravityEnabled>) {
     if keys.just_pressed(KeyCode::KeyG) {
         gravity.0 = !gravity.0;
         info!("Gravity: {}", if gravity.0 { "ON" } else { "OFF" });
+    }
+}
+
+fn toggle_debug_bodies(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut enabled: ResMut<DebugBodiesEnabled>,
+    disk: Res<DiskConfig>,
+    mut objects: ResMut<SimObjects>,
+    mut cam: ResMut<OrbitalCamera>,
+) {
+    if keys.just_pressed(KeyCode::KeyO) {
+        enabled.0 = !enabled.0;
+        objects.0 = scene_objects(disk.spin, enabled.0);
+        cam.is_moving = true;
+        info!("Debug bodies: {}", if enabled.0 { "ON" } else { "OFF" });
     }
 }
 

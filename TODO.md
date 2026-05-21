@@ -45,7 +45,7 @@
 - [ ] Investigate filterable skybox sampling or a preprocessed skybox format; escaped rays currently do four `textureLoad`s for manual bilinear sampling (`geodesic.wgsl:476-509`)
 
 ## Visual Fidelity
-- [ ] Improve accretion disk: add thickness / 3D volume instead of infinitesimally thin equatorial plane
+- [x] Improve accretion disk: add thickness / 3D volume instead of infinitesimally thin equatorial plane
 - [x] Add Doppler shift / blueshift coloring to accretion disk based on orbit velocity
 
 ## Test Coverage

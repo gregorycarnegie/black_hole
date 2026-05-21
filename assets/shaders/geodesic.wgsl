@@ -369,12 +369,6 @@ fn step_ray(ray: Ray, dL: f32) -> Ray {
 
 // -- Intersection tests ------------------------------------------------------
 
-fn crosses_equatorial(old_pos: vec3<f32>, new_pos: vec3<f32>) -> bool {
-    let crossed = (old_pos.y * new_pos.y) < 0.0;
-    let r_xz = length(vec2<f32>(new_pos.x, new_pos.z));
-    return crossed && (r_xz >= disk.r1) && (r_xz <= disk.r2);
-}
-
 struct ObjectHit { hit: bool, color: vec4<f32>, center: vec3<f32>, radius: f32 }
 
 fn intersect_objects(pos: vec3<f32>) -> ObjectHit {
@@ -412,6 +406,13 @@ fn blackbody_color(t: f32) -> vec3<f32> {
     } else {
         return mix(vec3<f32>(1.0, 0.95, 0.80), vec3<f32>(0.65, 0.80, 1.0), (s - 0.75) / 0.25);
     }
+}
+
+fn disk_edge_fade(r_disk: f32) -> f32 {
+    let edge_width = max(0.06 * (disk.r2 - disk.r1), 0.35 * SAGA_RS);
+    let inner = smoothstep(disk.r1, disk.r1 + edge_width, r_disk);
+    let outer = 1.0 - smoothstep(disk.r2 - edge_width, disk.r2, r_disk);
+    return clamp(inner * outer, 0.0, 1.0);
 }
 
 fn ray_cart_dir(ray: Ray) -> vec3<f32> {
@@ -478,8 +479,10 @@ fn shade_disk(ray: Ray) -> vec4<f32> {
         base + vec3<f32>(-shift * 0.35, -shift * 0.1, shift * 0.55),
         vec3<f32>(0.0), vec3<f32>(1.0)
     ) * bright;
+    let mapped = disk_c / (disk_c + vec3<f32>(1.0));
+    let fade = disk_edge_fade(r_disk);
 
-    return vec4<f32>(disk_c, r_disk / disk.r2);
+    return vec4<f32>(mapped * fade, fade);
 }
 
 // -- Skybox ------------------------------------------------------------------
@@ -549,7 +552,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var disk_rgb = vec3<f32>(0.0);
     var disk_alpha = 0.0;
-    var disk_weight = 1.0;
+    var disk_accum = 0.0;
     var any_disk = false;
 
     var hit_black_hole = false;
@@ -584,13 +587,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let new_pos = vec3<f32>(ray.x, ray.y, ray.z);
 
-        if crosses_equatorial(prev_pos, new_pos) {
-            let c = shade_disk(ray);
-            disk_rgb += c.rgb * disk_weight;
-            disk_alpha = max(disk_alpha, c.a * disk_weight);
-            disk_weight *= 0.5;
-            any_disk = true;
-            if disk_weight < 0.05 { break; }
+        let r_xz = length(vec2<f32>(new_pos.x, new_pos.z));
+        if r_xz >= disk.r1 && r_xz <= disk.r2 && disk_accum < 2.5 && disk_alpha < 0.995 {
+            let H = disk.thickness * r_xz;
+            let z_norm = new_pos.y / max(H, 1.0e-4 * SAGA_RS);
+            if abs(z_norm) < 4.0 {
+                let density = exp(-0.5 * z_norm * z_norm);
+                // ds: coordinate path length this step; weight by fraction of H traversed.
+                // Normaliser 0.4 ≈ 1/√(2π) so a perpendicular crossing totals ~1.0.
+                let ds = length(new_pos - prev_pos);
+                let contrib = density * ds / max(H, 1.0e-4 * SAGA_RS) * 0.4;
+                if contrib > 1.0e-5 {
+                    let c = shade_disk(ray);
+                    let w = min(contrib, 2.5 - disk_accum);
+                    disk_accum += w;
+                    let sample_alpha = clamp(c.a * (1.0 - exp(-0.7 * w)), 0.0, 0.98);
+                    if sample_alpha > 1.0e-5 {
+                        let remaining = 1.0 - disk_alpha;
+                        disk_rgb += remaining * c.rgb * sample_alpha;
+                        disk_alpha += remaining * sample_alpha;
+                        any_disk = true;
+                    }
+                }
+            }
         }
 
         obj_hit = intersect_objects(new_pos);
@@ -606,25 +625,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    var scene_rgb: vec3<f32>;
     if hit_black_hole {
-        color = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        scene_rgb = vec3<f32>(0.0);
     } else if hit_object {
         let p = vec3<f32>(ray.x, ray.y, ray.z);
         let n = normalize(p - obj_hit.center);
         let view = normalize(cam.pos - p);
         let diff = max(dot(n, view), 0.0);
         let intensity = 0.1 + 0.9 * diff;
-        color = vec4<f32>(obj_hit.color.rgb * intensity, obj_hit.color.a);
+        scene_rgb = obj_hit.color.rgb * intensity;
     } else {
-        var rgb = sample_skybox(ray_cart_dir(ray));
+        scene_rgb = sample_skybox(ray_cart_dir(ray));
         if passed_ergosphere {
-            rgb = mix(rgb, vec3<f32>(0.95, 0.42, 0.08), 0.18 * ergosphere_alpha);
+            scene_rgb = mix(scene_rgb, vec3<f32>(0.95, 0.42, 0.08), 0.18 * ergosphere_alpha);
         }
-        if any_disk {
-            rgb = mix(rgb, disk_rgb, disk_alpha);
-        }
-        color = vec4<f32>(rgb, 1.0);
     }
+
+    if any_disk {
+        scene_rgb = disk_rgb + (1.0 - disk_alpha) * scene_rgb;
+    }
+    color = vec4<f32>(scene_rgb, 1.0);
 
     textureStore(out_image, pix, color);
 }
