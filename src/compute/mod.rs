@@ -79,7 +79,8 @@ pub struct CameraUniform {
     pub moving: u32,
     pub jitter_x: f32,
     pub jitter_y: f32,
-    pub _pad5: f32,
+    /// 1 = output iteration-count heatmap; 0 = normal render.
+    pub debug_heatmap: u32,
     pub _pad6: f32,
     pub _pad7: f32,
 }
@@ -143,6 +144,16 @@ impl Default for RenderScale {
 #[derive(Component)]
 struct DisplaySprite;
 
+/// Tracks the (physical window size, render scale) that the current compute
+/// textures were created for. `sync_compute_textures` compares against this
+/// and recreates textures only when something changes.
+#[derive(Resource)]
+struct ComputeTexState {
+    win_w: u32,
+    win_h: u32,
+    scale: f32,
+}
+
 // ── Render graph labels ──────────────────────────────────────────────────────
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
@@ -184,7 +195,7 @@ impl Plugin for GeodesicComputePlugin {
                 sync_objects_uniform,
                 sync_disk_config_uniform,
                 cycle_skybox,
-                update_render_scale,
+                (cycle_render_scale, sync_compute_textures).chain(),
             ),
         );
 
@@ -264,6 +275,7 @@ fn setup_compute_texture(
         DisplaySprite,
     ));
     commands.insert_resource(DisplayImage(disp));
+    commands.insert_resource(ComputeTexState { win_w, win_h, scale: scale.0 });
 }
 
 // ── Per-frame uniform syncs ──────────────────────────────────────────────────
@@ -307,7 +319,9 @@ fn sync_camera_uniform(
     // even fc → parity=true → b_prev bind group (writes into AccumA)
     parity.0 = fc % 2 == 0;
 
-    let (jx, jy) = if cam.is_moving {
+    // Suppress jitter in heatmap mode: each frame is deterministic so averaging
+    // slightly-shifted heatmaps would blur the per-pixel iteration counts.
+    let (jx, jy) = if cam.is_moving || cam.debug_heatmap {
         (0.0f32, 0.0f32)
     } else {
         // Halton(1,2)=0.5 → jx=0 on first still frame, varies thereafter.
@@ -335,7 +349,7 @@ fn sync_camera_uniform(
         moving: cam.is_moving as u32,
         jitter_x: jx,
         jitter_y: jy,
-        _pad5: 0.0,
+        debug_heatmap: cam.debug_heatmap as u32,
         _pad6: 0.0,
         _pad7: 0.0,
     };
@@ -363,11 +377,32 @@ fn sync_disk_config_uniform(disk: Res<DiskConfig>, mut uniform: ResMut<DiskConfi
 
 const SCALE_PRESETS: &[f32] = &[0.25, 0.5, 0.75, 1.0];
 
-/// Press `[` to halve / `]` to increase render scale through 25 % → 50 % → 75 % → 100 %.
-/// Recreates all compute textures at the new resolution and resets TAA history.
-fn update_render_scale(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut scale: ResMut<RenderScale>,
+/// Press `-` / `=` to step render scale down / up through 25 % → 50 % → 75 % → 100 %.
+fn cycle_render_scale(keys: Res<ButtonInput<KeyCode>>, mut scale: ResMut<RenderScale>) {
+    let idx = SCALE_PRESETS
+        .iter()
+        .position(|&s| (s - scale.0).abs() < 0.01)
+        .unwrap_or(1);
+
+    let new_idx = if keys.just_pressed(KeyCode::Minus) {
+        idx.saturating_sub(1)
+    } else if keys.just_pressed(KeyCode::Equal) {
+        (idx + 1).min(SCALE_PRESETS.len() - 1)
+    } else {
+        return;
+    };
+
+    if new_idx != idx {
+        scale.0 = SCALE_PRESETS[new_idx];
+        info!("Render scale: {:.0}%", scale.0 * 100.0);
+    }
+}
+
+/// Recreates compute/accum/display textures whenever the physical window size
+/// or render scale changes. Also handles initial sizing at startup.
+fn sync_compute_textures(
+    mut state: ResMut<ComputeTexState>,
+    scale: Res<RenderScale>,
     mut images: ResMut<Assets<Image>>,
     mut geo: ResMut<GeodesicImage>,
     mut accum_a: ResMut<AccumA>,
@@ -377,30 +412,24 @@ fn update_render_scale(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cam: ResMut<OrbitalCamera>,
 ) {
-    let idx = SCALE_PRESETS
-        .iter()
-        .position(|&s| (s - scale.0).abs() < 0.01)
-        .unwrap_or(1);
-
-    let new_idx = if keys.just_pressed(KeyCode::BracketLeft) {
-        idx.saturating_sub(1)
-    } else if keys.just_pressed(KeyCode::BracketRight) {
-        (idx + 1).min(SCALE_PRESETS.len() - 1)
-    } else {
-        return;
-    };
-
-    if new_idx == idx {
-        return;
-    }
-
-    scale.0 = SCALE_PRESETS[new_idx];
-
     let (win_w, win_h) = windows
         .single()
         .ok()
         .map(|w| (w.physical_width(), w.physical_height()))
         .unwrap_or((800, 600));
+
+    if win_w == 0 || win_h == 0 {
+        return;
+    }
+
+    if win_w == state.win_w && win_h == state.win_h && scale.0 == state.scale {
+        return;
+    }
+
+    state.win_w = win_w;
+    state.win_h = win_h;
+    state.scale = scale.0;
+
     let w = ((win_w as f32 * scale.0) as u32).max(1);
     let h = ((win_h as f32 * scale.0) as u32).max(1);
 
@@ -412,10 +441,18 @@ fn update_render_scale(
 
     if let Ok(mut sprite) = sprites.single_mut() {
         sprite.image = disp;
+        sprite.custom_size = Some(Vec2::new(win_w as f32, win_h as f32));
     }
 
     cam.is_moving = true;
-    info!("Render scale: {:.0}% ({}×{})", scale.0 * 100.0, w, h);
+    info!(
+        "Compute textures: {}×{} (window {}×{}, scale {:.0}%)",
+        w,
+        h,
+        win_w,
+        win_h,
+        scale.0 * 100.0
+    );
 }
 
 const SKYBOXES: &[&str] = &[

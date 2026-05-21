@@ -10,7 +10,7 @@ impl Plugin for OrbitalCameraPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<OrbitalCamera>()
             .add_systems(Startup, setup_cameras)
-            .add_systems(Update, update_orbital_camera)
+            .add_systems(Update, (update_orbital_camera, toggle_heatmap))
             .add_systems(Update, sync_camera_transform.after(update_orbital_camera));
     }
 }
@@ -34,6 +34,9 @@ pub struct OrbitalCamera {
     pub fov_degrees: f64,
     pub dragging: bool,
     pub is_moving: bool,
+    /// When true the geodesic shader outputs an iteration-count heatmap instead
+    /// of the normal render. Toggle with H.
+    pub debug_heatmap: bool,
 }
 
 impl Default for OrbitalCamera {
@@ -49,6 +52,7 @@ impl Default for OrbitalCamera {
             fov_degrees: 60.0,
             dragging: false,
             is_moving: false,
+            debug_heatmap: false,
         }
     }
 }
@@ -143,6 +147,15 @@ fn update_orbital_camera(
     if keys.just_pressed(KeyCode::BracketRight) {
         cam.fov_degrees = (cam.fov_degrees + 5.0).clamp(10.0, 170.0);
         cam.is_moving = true;
+    }
+}
+
+/// Press H to toggle the GPU iteration-count heatmap. Resets TAA history.
+fn toggle_heatmap(keys: Res<ButtonInput<KeyCode>>, mut cam: ResMut<OrbitalCamera>) {
+    if keys.just_pressed(KeyCode::KeyH) {
+        cam.debug_heatmap = !cam.debug_heatmap;
+        cam.is_moving = true;
+        info!("Heatmap: {}", if cam.debug_heatmap { "ON" } else { "OFF" });
     }
 }
 

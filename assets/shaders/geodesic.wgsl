@@ -12,14 +12,14 @@ struct Camera {
     _pad2:        f32,
     forward:      vec3<f32>,
     _pad3:        f32,
-    tan_half_fov: f32,
-    aspect:       f32,
-    moving:       u32,
-    jitter_x:     f32,
-    jitter_y:     f32,
-    _pad5:        f32,
-    _pad6:        f32,
-    _pad7:        f32,
+    tan_half_fov:  f32,
+    aspect:        f32,
+    moving:        u32,
+    jitter_x:      f32,
+    jitter_y:      f32,
+    debug_heatmap: u32,
+    _pad6:         f32,
+    _pad7:         f32,
 }
 @group(0) @binding(1) var<uniform> cam: Camera;
 
@@ -519,6 +519,18 @@ fn sample_skybox(dir: vec3<f32>) -> vec3<f32> {
     return hdr / (hdr + vec3<f32>(1.0));
 }
 
+// -- Debug heatmap -----------------------------------------------------------
+
+// Maps t ∈ [0, 1] to a black→red→yellow→white gradient.
+// t = 0 (few iterations) = black; t = 1 (10 000 iterations) = white.
+fn heatmap_color(t: f32) -> vec3<f32> {
+    return vec3<f32>(
+        clamp(t * 3.0,       0.0, 1.0),
+        clamp(t * 3.0 - 1.0, 0.0, 1.0),
+        clamp(t * 3.0 - 2.0, 0.0, 1.0),
+    );
+}
+
 // -- Main --------------------------------------------------------------------
 
 @compute @workgroup_size(16, 16, 1)
@@ -545,8 +557,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var obj_hit: ObjectHit;
     var passed_ergosphere = false;
     var ergosphere_alpha = 0.0;
+    var iter_count: u32 = 0u;
 
     for (var i = 0; i < 10000; i++) {
+        iter_count = u32(i) + 1u;
         if ray.r <= disk.horizon_r {
             hit_black_hole = true;
             break;
@@ -584,6 +598,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         prev_pos = new_pos;
         if ray.r > ESCAPE_R { break; }
+    }
+
+    if cam.debug_heatmap != 0u {
+        let t = f32(iter_count) / 10000.0;
+        textureStore(out_image, pix, vec4<f32>(heatmap_color(t), 1.0));
+        return;
     }
 
     if hit_black_hole {

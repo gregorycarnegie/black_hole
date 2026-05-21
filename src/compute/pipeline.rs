@@ -39,7 +39,7 @@ struct GpuCameraUniform {
     moving: u32,
     jitter_x: f32,
     jitter_y: f32,
-    _pad5: f32,
+    debug_heatmap: u32,
     _pad6: f32,
     _pad7: f32,
 }
@@ -255,7 +255,7 @@ pub fn prepare_bind_group(
         moving: camera_uniform.moving,
         jitter_x: camera_uniform.jitter_x,
         jitter_y: camera_uniform.jitter_y,
-        _pad5: 0.0,
+        debug_heatmap: camera_uniform.debug_heatmap,
         _pad6: 0.0,
         _pad7: 0.0,
     };
