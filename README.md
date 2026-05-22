@@ -12,7 +12,7 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 ## Features
 
 1. **GPU ray-tracing** — compute shader integrates null geodesics using RK4 in spin-aligned Kerr coordinates
-2. **Accretion disk** — rays that cross the equatorial plane render with Kerr ISCO, frame dragging, Doppler beaming, and gravitational redshift
+2. **Accretion disk** — four switchable geometry presets (thin NT, truncated thin + hot flow, slim/super-Eddington, warped Bardeen-Petterson) with Kerr ISCO, frame dragging, Doppler beaming, and gravitational redshift
 3. **Spacetime grid** — wireframe grid deformed by the Schwarzschild metric of each massive object
 4. **N-body gravity** — optional Newtonian gravity simulation between scene objects
 5. **HDR skyboxes** — equirectangular space backgrounds sampled along each ray's lensed escape direction
@@ -24,11 +24,15 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 | Left mouse drag | Orbit camera                                   |
 | Scroll wheel    | Zoom in/out                                    |
 | `[` / `]`       | Decrease / increase FOV                        |
-| G               | Toggle n-body gravity                          |
+| `-` / `=`       | Decrease / increase render scale (25 – 100 %)  |
 | Q / E           | Decrease / increase black hole spin a* (±0.05) |
 | Z / X           | Decrease / increase outer disk radius (±1 r_s) |
+| M               | Cycle disk geometry preset                     |
+| F               | Toggle spacetime grid                          |
+| G               | Toggle n-body gravity                          |
 | O               | Toggle debug bodies                            |
 | B               | Cycle HDR skybox                               |
+| H               | Toggle iteration-count heatmap                 |
 
 ## Building
 

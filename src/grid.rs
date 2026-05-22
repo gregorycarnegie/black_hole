@@ -7,7 +7,25 @@ pub struct GridPlugin;
 impl Plugin for GridPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GridCache>()
-            .add_systems(Update, draw_spacetime_grid);
+            .init_resource::<GridVisible>()
+            .add_systems(Update, (toggle_grid, draw_spacetime_grid).chain());
+    }
+}
+
+/// Press F to show/hide the spacetime grid.
+#[derive(Resource)]
+pub struct GridVisible(pub bool);
+
+impl Default for GridVisible {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+fn toggle_grid(keys: Res<ButtonInput<KeyCode>>, mut visible: ResMut<GridVisible>) {
+    if keys.just_pressed(KeyCode::KeyF) {
+        visible.0 = !visible.0;
+        info!("Grid: {}", if visible.0 { "visible" } else { "hidden" });
     }
 }
 
@@ -18,7 +36,10 @@ struct GridCache {
 
 /// Draws a 25×25 wireframe grid deformed by the Schwarzschild metric of each
 /// object. Vertices are cached and only recomputed when object positions change.
-fn draw_spacetime_grid(mut gizmos: Gizmos, objects: Res<SimObjects>, mut cache: ResMut<GridCache>) {
+fn draw_spacetime_grid(mut gizmos: Gizmos, objects: Res<SimObjects>, mut cache: ResMut<GridCache>, visible: Res<GridVisible>) {
+    if !visible.0 {
+        return;
+    }
     const GRID_SIZE: i32 = 25;
     const SPACING: f32 = 1e10;
 
