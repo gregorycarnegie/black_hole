@@ -18,7 +18,7 @@ struct Camera {
     jitter_x:      f32,
     jitter_y:      f32,
     debug_heatmap: u32,
-    _pad6:         f32,
+    max_iter:      u32,
     _pad7:         f32,
 }
 @group(0) @binding(1) var<uniform> cam: Camera;
@@ -544,41 +544,17 @@ fn shade_disk(ray: Ray, r_disk: f32, h_r: f32, a: f32) -> vec4<f32> {
 
 // -- Skybox ------------------------------------------------------------------
 
-// Equirectangular HDR sample with manual bilinear (texture is Rgba32Float
-// and we can't rely on float32-filterable). Expects a normalised direction.
+// Equirectangular HDR sample. Expects a normalised direction.
+// Uses a single nearest-neighbour textureLoad; TAA accumulation averages
+// sub-pixel detail across still frames, making bilinear unnecessary here.
 // Reinhard-tonemapped to [0, 1].
 fn sample_skybox(dir: vec3<f32>) -> vec3<f32> {
-    let dims_u = textureDimensions(skybox);
-    let w = i32(dims_u.x);
-    let h = i32(dims_u.y);
-    let dims = vec2<f32>(f32(w), f32(h));
-
-    let d = dir;
-    let u = atan2(d.z, d.x) * (1.0 / (2.0 * PI)) + 0.5;
-    let v = acos(clamp(d.y, -1.0, 1.0)) * (1.0 / PI);
-
-    let px = u * dims.x - 0.5;
-    let py = v * dims.y - 0.5;
-
-    let floor_px = floor(px);
-    let floor_py = floor(py);
-    let x0_raw = i32(floor_px);
-    let y0 = clamp(i32(floor_py), 0, h - 1);
-    let x1_raw = x0_raw + 1;
-    let y1 = clamp(y0 + 1, 0, h - 1);
-    let fx = px - floor_px;
-    let fy = py - floor_py;
-
-    let x0 = ((x0_raw % w) + w) % w;
-    let x1 = ((x1_raw % w) + w) % w;
-
-    let c00 = textureLoad(skybox, vec2<i32>(x0, y0), 0).rgb;
-    let c10 = textureLoad(skybox, vec2<i32>(x1, y0), 0).rgb;
-    let c01 = textureLoad(skybox, vec2<i32>(x0, y1), 0).rgb;
-    let c11 = textureLoad(skybox, vec2<i32>(x1, y1), 0).rgb;
-    let hdr = mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
-
-    // Reinhard tonemap so bright nebulae/stars don't clip.
+    let dims = vec2<i32>(textureDimensions(skybox));
+    let u = atan2(dir.z, dir.x) * (1.0 / (2.0 * PI)) + 0.5;
+    let v = acos(clamp(dir.y, -1.0, 1.0)) * (1.0 / PI);
+    let xi = ((i32(u * f32(dims.x)) % dims.x) + dims.x) % dims.x;
+    let yi = clamp(i32(v * f32(dims.y)), 0, dims.y - 1);
+    let hdr = textureLoad(skybox, vec2<i32>(xi, yi), 0).rgb;
     return hdr / (hdr + vec3<f32>(1.0));
 }
 
@@ -627,7 +603,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var ergosphere_alpha = 0.0;
     var iter_count: u32 = 0u;
 
-    for (var i = 0; i < 10000; i++) {
+    for (var i = 0; i < i32(cam.max_iter); i++) {
         iter_count = u32(i) + 1u;
         if ray.r <= disk.horizon_r {
             hit_black_hole = true;

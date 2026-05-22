@@ -10,7 +10,7 @@ impl Plugin for OrbitalCameraPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<OrbitalCamera>()
             .add_systems(Startup, setup_cameras)
-            .add_systems(Update, (update_orbital_camera, toggle_heatmap))
+            .add_systems(Update, (update_orbital_camera, toggle_heatmap, cycle_max_iter))
             .add_systems(Update, sync_camera_transform.after(update_orbital_camera));
     }
 }
@@ -37,6 +37,8 @@ pub struct OrbitalCamera {
     /// When true the geodesic shader outputs an iteration-count heatmap instead
     /// of the normal render. Toggle with H.
     pub debug_heatmap: bool,
+    /// Maximum geodesic integration steps per pixel. Press , / . to step through presets.
+    pub max_iter: u32,
 }
 
 impl Default for OrbitalCamera {
@@ -53,6 +55,7 @@ impl Default for OrbitalCamera {
             dragging: false,
             is_moving: false,
             debug_heatmap: false,
+            max_iter: 10_000,
         }
     }
 }
@@ -147,6 +150,30 @@ fn update_orbital_camera(
     if keys.just_pressed(KeyCode::BracketRight) {
         cam.fov_degrees = (cam.fov_degrees + 5.0).clamp(10.0, 170.0);
         cam.is_moving = true;
+    }
+}
+
+const ITER_PRESETS: &[u32] = &[1_000, 2_000, 4_000, 8_000, 10_000];
+
+/// Press , / . to step the geodesic iteration cap down / up through presets.
+fn cycle_max_iter(keys: Res<ButtonInput<KeyCode>>, mut cam: ResMut<OrbitalCamera>) {
+    let idx = ITER_PRESETS
+        .iter()
+        .position(|&x| x == cam.max_iter)
+        .unwrap_or(ITER_PRESETS.len() - 1);
+
+    let new_idx = if keys.just_pressed(KeyCode::Comma) {
+        idx.saturating_sub(1)
+    } else if keys.just_pressed(KeyCode::Period) {
+        (idx + 1).min(ITER_PRESETS.len() - 1)
+    } else {
+        return;
+    };
+
+    if new_idx != idx {
+        cam.max_iter = ITER_PRESETS[new_idx];
+        cam.is_moving = true;
+        info!("Max iterations: {}", cam.max_iter);
     }
 }
 

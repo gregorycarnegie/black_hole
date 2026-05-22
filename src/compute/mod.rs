@@ -81,7 +81,8 @@ pub struct CameraUniform {
     pub jitter_y: f32,
     /// 1 = output iteration-count heatmap; 0 = normal render.
     pub debug_heatmap: u32,
-    pub _pad6: f32,
+    /// Maximum geodesic steps per pixel.
+    pub max_iter: u32,
     pub _pad7: f32,
 }
 
@@ -364,7 +365,7 @@ fn sync_camera_uniform(
         jitter_x: jx,
         jitter_y: jy,
         debug_heatmap: cam.debug_heatmap as u32,
-        _pad6: 0.0,
+        max_iter: cam.max_iter,
         _pad7: 0.0,
     };
 }

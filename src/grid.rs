@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::simulation::{C, G_CONST, SimObjects};
+use crate::{camera::OrbitalCamera, simulation::{C, G_CONST, SimObjects}};
 
 pub struct GridPlugin;
 
@@ -32,26 +32,47 @@ fn toggle_grid(keys: Res<ButtonInput<KeyCode>>, mut visible: ResMut<GridVisible>
 #[derive(Resource, Default)]
 struct GridCache {
     verts: Vec<Vec3>,
+    /// GRID_SIZE used when verts were last computed. 0 forces initial build.
+    grid_size: i32,
 }
 
-/// Draws a 25×25 wireframe grid deformed by the Schwarzschild metric of each
-/// object. Vertices are cached and only recomputed when object positions change.
-fn draw_spacetime_grid(mut gizmos: Gizmos, objects: Res<SimObjects>, mut cache: ResMut<GridCache>, visible: Res<GridVisible>) {
+/// Returns (grid_size, spacing) for the current camera distance.
+/// Closer camera → finer grid; farther → coarser grid with wider spacing
+/// so the scene fills roughly the same visual area.
+fn grid_lod(radius: f64) -> (i32, f32) {
+    if radius < 1.5e11 {
+        (25, 1.0e10) // 626 verts, 1250 segments
+    } else if radius < 5.0e11 {
+        (13, 2.0e10) // 196 verts,  338 segments
+    } else {
+        (9,  4.0e10) //  100 verts,  162 segments
+    }
+}
+
+/// Draws a wireframe grid deformed by the Schwarzschild metric of each object.
+/// Vertices are cached and only recomputed when object positions or LOD change.
+fn draw_spacetime_grid(
+    mut gizmos: Gizmos,
+    objects: Res<SimObjects>,
+    cam: Res<OrbitalCamera>,
+    mut cache: ResMut<GridCache>,
+    visible: Res<GridVisible>,
+) {
     if !visible.0 {
         return;
     }
-    const GRID_SIZE: i32 = 25;
-    const SPACING: f32 = 1e10;
 
-    let count = (GRID_SIZE + 1) as usize;
+    let (grid_size, spacing) = grid_lod(cam.radius);
+    let count = (grid_size + 1) as usize;
 
-    if objects.is_changed() || cache.verts.is_empty() {
+    if objects.is_changed() || cache.verts.is_empty() || cache.grid_size != grid_size {
+        cache.grid_size = grid_size;
         cache.verts.resize(count * count, Vec3::ZERO);
 
-        for zi in 0..=GRID_SIZE {
-            for xi in 0..=GRID_SIZE {
-                let world_x = (xi - GRID_SIZE / 2) as f32 * SPACING;
-                let world_z = (zi - GRID_SIZE / 2) as f32 * SPACING;
+        for zi in 0..=grid_size {
+            for xi in 0..=grid_size {
+                let world_x = (xi - grid_size / 2) as f32 * spacing;
+                let world_z = (zi - grid_size / 2) as f32 * spacing;
                 let mut y = 0.0_f32;
 
                 for obj in &objects.0 {
@@ -59,7 +80,6 @@ fn draw_spacetime_grid(mut gizmos: Gizmos, objects: Res<SimObjects>, mut cache: 
                     let dx = world_x - obj.position.x;
                     let dz = world_z - obj.position.z;
                     let dist = (dx * dx + dz * dz).sqrt();
-
                     y += 2.0 * (r_s * (dist - r_s).max(0.0)).sqrt() - 3e10;
                 }
 
@@ -70,18 +90,16 @@ fn draw_spacetime_grid(mut gizmos: Gizmos, objects: Res<SimObjects>, mut cache: 
 
     let color = Color::srgba(0.3, 0.6, 1.0, 0.4);
 
-    // Horizontal lines (along X for each Z row)
-    for zi in 0..=GRID_SIZE {
-        for xi in 0..GRID_SIZE {
+    for zi in 0..=grid_size {
+        for xi in 0..grid_size {
             let a = cache.verts[zi as usize * count + xi as usize];
             let b = cache.verts[zi as usize * count + xi as usize + 1];
             gizmos.line(a, b, color);
         }
     }
 
-    // Vertical lines (along Z for each X column)
-    for zi in 0..GRID_SIZE {
-        for xi in 0..=GRID_SIZE {
+    for zi in 0..grid_size {
+        for xi in 0..=grid_size {
             let a = cache.verts[zi as usize * count + xi as usize];
             let b = cache.verts[(zi as usize + 1) * count + xi as usize];
             gizmos.line(a, b, color);

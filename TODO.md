@@ -33,16 +33,16 @@
 
 ## Performance
 - [x] Cache spacetime grid vertices; only recompute when object positions change
-- [ ] Consider adaptive LOD for grid density based on camera distance
+- [x] Consider adaptive LOD for grid density based on camera distance
 - [x] Accumulate bind groups recreated every frame: `AccumulateBindGroups { a_prev, b_prev }` is rebuilt and `insert_resource`d each frame; create once after textures are available, then only swap which group is dispatched (`src/compute/accumulate.rs:156-181`)
 - [x] Geodesic bind group recreated every frame even though buffers/textures are usually stable; create once and recreate only when output texture or skybox changes (`src/compute/pipeline.rs:274-286`)
 - [x] Unconditional uniform buffer writes: `objects_buf` and `disk_buf` are written every frame; first gate `sync_objects_uniform` / `sync_disk_config_uniform` on source changes, then write GPU buffers only when extracted values actually change (`src/compute/mod.rs:323-334`, `src/compute/pipeline.rs:260-271`)
 - [x] Add a render-scale setting/preset; compute cost scales directly with traced pixel count, so this is likely the highest-impact runtime performance knob — press `[` / `]` to cycle 25 % → 50 % → 75 % → 100 %
 - [x] Handle window resize for compute/accum/display textures and recreate affected bind groups only when texture handles change (`sync_compute_textures` in `src/compute/mod.rs`)
 - [x] Add profiling/debug views before shader-limit tuning: on-screen FPS counter (`main.rs`) + GPU iteration-count heatmap toggle with H key (`geodesic.wgsl`, `src/camera.rs`)
-- [ ] Geodesic loop runs up to 10,000 iterations; profile with the iteration heatmap before lowering or making it configurable, since this affects photon-ring / multiple-image fidelity (`geodesic.wgsl:540`)
+- [x] Geodesic loop runs up to 10,000 iterations; profile with the iteration heatmap before lowering or making it configurable, since this affects photon-ring / multiple-image fidelity (`geodesic.wgsl:540`)
 - [x] Micro-optimise Kerr helper paths: eliminate duplicate `metric_rho` calls in `orbital_kerr` and the redundant `kerr_lapse` / `spin_clamped` recomputation in `shade_disk` by returning an `OrbitalResult` struct (`geodesic.wgsl:437-446`)
-- [ ] Investigate filterable skybox sampling or a preprocessed skybox format; escaped rays currently do four `textureLoad`s for manual bilinear sampling (`geodesic.wgsl:476-509`)
+- [x] Investigate filterable skybox sampling or a preprocessed skybox format; escaped rays currently do four `textureLoad`s for manual bilinear sampling (`geodesic.wgsl:476-509`)
 
 ## Visual Fidelity
 - [x] Improve accretion disk: add thickness / 3D volume instead of infinitesimally thin equatorial plane
