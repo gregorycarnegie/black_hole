@@ -32,6 +32,7 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 | G               | Toggle n-body gravity                          |
 | O               | Toggle debug bodies                            |
 | B               | Cycle HDR skybox                               |
+| `,` / `.`       | Decrease / increase max geodesic iterations    |
 | H               | Toggle iteration-count heatmap                 |
 
 ## Building
