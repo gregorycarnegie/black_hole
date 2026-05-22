@@ -1,6 +1,9 @@
 use bevy::prelude::*;
 
-use crate::{camera::OrbitalCamera, simulation::{C, G_CONST, SimObjects}};
+use crate::{
+    camera::OrbitalCamera,
+    simulation::{C, G_CONST, SimObjects},
+};
 
 pub struct GridPlugin;
 
@@ -45,7 +48,7 @@ fn grid_lod(radius: f64) -> (i32, f32) {
     } else if radius < 5.0e11 {
         (13, 2.0e10) // 196 verts,  338 segments
     } else {
-        (9,  4.0e10) //  100 verts,  162 segments
+        (9, 4.0e10) //  100 verts,  162 segments
     }
 }
 

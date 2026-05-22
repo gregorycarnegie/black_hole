@@ -10,7 +10,10 @@ impl Plugin for OrbitalCameraPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<OrbitalCamera>()
             .add_systems(Startup, setup_cameras)
-            .add_systems(Update, (update_orbital_camera, toggle_heatmap, cycle_max_iter))
+            .add_systems(
+                Update,
+                (update_orbital_camera, toggle_heatmap, cycle_max_iter),
+            )
             .add_systems(Update, sync_camera_transform.after(update_orbital_camera));
     }
 }

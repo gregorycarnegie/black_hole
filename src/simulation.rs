@@ -248,7 +248,9 @@ fn update_disk_config(
     if changed {
         info!(
             "Disk: spin={:.2}, r_outer={:.0} r_s, model={}",
-            disk.spin, disk.r_outer_rs, disk.model.name()
+            disk.spin,
+            disk.r_outer_rs,
+            disk.model.name()
         );
         // Keep the black hole sphere radius in sync with the new horizon.
         if let Some(bh) = objects.0.last_mut() {

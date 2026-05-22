@@ -4,14 +4,14 @@
 @group(0) @binding(0) var out_image: texture_storage_2d<rgba8unorm, write>;
 
 struct Camera {
-    pos:          vec3<f32>,
-    _pad0:        f32,
-    right:        vec3<f32>,
-    _pad1:        f32,
-    up:           vec3<f32>,
-    _pad2:        f32,
-    forward:      vec3<f32>,
-    _pad3:        f32,
+    pos:           vec3<f32>,
+    _pad0:         f32,
+    right:         vec3<f32>,
+    _pad1:         f32,
+    up:            vec3<f32>,
+    _pad2:         f32,
+    forward:       vec3<f32>,
+    _pad3:         f32,
     tan_half_fov:  f32,
     aspect:        f32,
     moving:        u32,
@@ -88,10 +88,10 @@ fn kerr_static_limit(theta: f32, a2: f32) -> f32 {
 
 struct CovMetric {
     g_tt:         f32,
-    g_tphi:      f32,
-    g_rr:        f32,
+    g_tphi:       f32,
+    g_rr:         f32,
     g_thetatheta: f32,
-    g_phiphi:    f32,
+    g_phiphi:     f32,
 }
 
 fn cov_metric(r: f32, theta: f32, a: f32) -> CovMetric {
@@ -117,18 +117,18 @@ fn cov_metric(r: f32, theta: f32, a: f32) -> CovMetric {
 }
 
 struct ContraMetric {
-    g_tt:              f32,
+    g_tt:             f32,
     g_tphi:           f32,
     g_rr:             f32,
     g_thetatheta:     f32,
     g_phiphi:         f32,
     dg_tt_dr:         f32,
-    dg_tphi_dr:      f32,
+    dg_tphi_dr:       f32,
     dg_rr_dr:         f32,
     dg_thetatheta_dr: f32,
     dg_phiphi_dr:     f32,
     dg_tt_dt:         f32,
-    dg_tphi_dt:      f32,
+    dg_tphi_dt:       f32,
     dg_rr_dt:         f32,
     dg_thetatheta_dt: f32,
     dg_phiphi_dt:     f32,
@@ -214,10 +214,16 @@ fn contra_metric(r: f32, theta: f32, a: f32) -> ContraMetric {
 // -- Ray state ---------------------------------------------------------------
 
 struct Ray {
-    x: f32, y: f32, z: f32,
-    r: f32, theta: f32, phi: f32,
-    pr: f32, ptheta: f32,
-    e: f32, l: f32,
+    x:      f32,
+    y:      f32,
+    z:      f32,
+    r:      f32,
+    theta:  f32,
+    phi:    f32,
+    pr:     f32,
+    ptheta: f32,
+    e:      f32,
+    l:      f32,
 }
 
 fn init_ray(pos: vec3<f32>, dir: vec3<f32>, a: f32) -> Ray {

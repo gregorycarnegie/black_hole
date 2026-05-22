@@ -48,22 +48,22 @@ struct GpuCameraUniform {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuDiskUniform {
-    r1:        f32,   // inner emitting radius (metres)
-    r2:        f32,   // outer radius (metres)
-    h_thin:    f32,   // H/R for thin disk component
-    h_hot:     f32,   // H/R for hot / thick inner component
-    spin:      f32,
+    r1: f32,     // inner emitting radius (metres)
+    r2: f32,     // outer radius (metres)
+    h_thin: f32, // H/R for thin disk component
+    h_hot: f32,  // H/R for hot / thick inner component
+    spin: f32,
     horizon_r: f32,
-    isco_r:    f32,
-    r_trunc:   f32,   // truncation or puff radius (metres)
-    tilt_deg:  f32,   // outer disk tilt (degrees)
-    r_bp:      f32,   // Bardeen-Petterson alignment radius (metres)
-    twist_deg: f32,   // twist per ln(r/r_bp) (degrees)
-    model:     u32,   // 0=ThinNT 1=TruncHot 2=Slim 3=Warped
-    _pad0:     f32,
-    _pad1:     f32,
-    _pad2:     f32,
-    _pad3:     f32,
+    isco_r: f32,
+    r_trunc: f32,   // truncation or puff radius (metres)
+    tilt_deg: f32,  // outer disk tilt (degrees)
+    r_bp: f32,      // Bardeen-Petterson alignment radius (metres)
+    twist_deg: f32, // twist per ln(r/r_bp) (degrees)
+    model: u32,     // 0=ThinNT 1=TruncHot 2=Slim 3=Warped
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 /// Matches the Objects uniform in geodesic.wgsl.
@@ -167,25 +167,25 @@ pub fn init_geodesic_pipeline(
 
 /// Build a GPU disk uniform from runtime parameters.
 fn build_disk_uniform(cfg: &DiskConfigUniform) -> GpuDiskUniform {
-    let isco_r    = kerr_isco_radius(cfg.spin);
+    let isco_r = kerr_isco_radius(cfg.spin);
     let horizon_r = kerr_horizon_radius(cfg.spin);
     GpuDiskUniform {
-        r1:        isco_r,
-        r2:        SAGA_RS * cfg.r_outer_rs,
-        h_thin:    cfg.h_thin,
-        h_hot:     cfg.h_hot,
-        spin:      cfg.spin,
+        r1: isco_r,
+        r2: SAGA_RS * cfg.r_outer_rs,
+        h_thin: cfg.h_thin,
+        h_hot: cfg.h_hot,
+        spin: cfg.spin,
         horizon_r,
         isco_r,
-        r_trunc:   SAGA_RS * cfg.r_trunc_rs,
-        tilt_deg:  cfg.tilt_deg,
-        r_bp:      SAGA_RS * cfg.r_bp_rs,
+        r_trunc: SAGA_RS * cfg.r_trunc_rs,
+        tilt_deg: cfg.tilt_deg,
+        r_bp: SAGA_RS * cfg.r_bp_rs,
         twist_deg: cfg.twist_deg,
-        model:     cfg.model,
-        _pad0:     0.0,
-        _pad1:     0.0,
-        _pad2:     0.0,
-        _pad3:     0.0,
+        model: cfg.model,
+        _pad0: 0.0,
+        _pad1: 0.0,
+        _pad2: 0.0,
+        _pad3: 0.0,
     }
 }
 
@@ -233,11 +233,7 @@ pub struct RenderGpu<'w> {
     pipeline_cache: Res<'w, PipelineCache>,
 }
 
-pub fn prepare_bind_group(
-    mut commands: Commands,
-    sources: GeodesicSources,
-    gpu: RenderGpu,
-) {
+pub fn prepare_bind_group(mut commands: Commands, sources: GeodesicSources, gpu: RenderGpu) {
     let (
         Some(mut pipeline),
         Some(geodesic_image),

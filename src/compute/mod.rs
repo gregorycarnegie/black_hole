@@ -1,5 +1,6 @@
 use bevy::{
     asset::RenderAssetUsages,
+    ecs::system::SystemParam,
     prelude::*,
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
@@ -290,7 +291,11 @@ fn setup_compute_texture(
         DisplaySprite,
     ));
     commands.insert_resource(DisplayImage(disp));
-    commands.insert_resource(ComputeTexState { win_w, win_h, scale: scale.0 });
+    commands.insert_resource(ComputeTexState {
+        win_w,
+        win_h,
+        scale: scale.0,
+    });
 }
 
 // ── Per-frame uniform syncs ──────────────────────────────────────────────────
@@ -420,16 +425,21 @@ fn cycle_render_scale(keys: Res<ButtonInput<KeyCode>>, mut scale: ResMut<RenderS
     }
 }
 
+#[derive(SystemParam)]
+struct ComputeTexParams<'w> {
+    images: ResMut<'w, Assets<Image>>,
+    geo: ResMut<'w, GeodesicImage>,
+    accum_a: ResMut<'w, AccumA>,
+    accum_b: ResMut<'w, AccumB>,
+    display: ResMut<'w, DisplayImage>,
+}
+
 /// Recreates compute/accum/display textures whenever the physical window size
 /// or render scale changes. Also handles initial sizing at startup.
 fn sync_compute_textures(
     mut state: ResMut<ComputeTexState>,
     scale: Res<RenderScale>,
-    mut images: ResMut<Assets<Image>>,
-    mut geo: ResMut<GeodesicImage>,
-    mut accum_a: ResMut<AccumA>,
-    mut accum_b: ResMut<AccumB>,
-    mut display: ResMut<DisplayImage>,
+    mut tex: ComputeTexParams,
     mut sprites: Query<&mut Sprite, With<DisplaySprite>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cam: ResMut<OrbitalCamera>,
@@ -455,11 +465,11 @@ fn sync_compute_textures(
     let w = ((win_w as f32 * scale.0) as u32).max(1);
     let h = ((win_h as f32 * scale.0) as u32).max(1);
 
-    geo.0 = make_rgba8_tex(w, h, &mut images);
-    accum_a.0 = make_rgba32f_tex(w, h, &mut images);
-    accum_b.0 = make_rgba32f_tex(w, h, &mut images);
-    let disp = make_rgba8_tex(w, h, &mut images);
-    display.0 = disp.clone();
+    tex.geo.0 = make_rgba8_tex(w, h, &mut tex.images);
+    tex.accum_a.0 = make_rgba32f_tex(w, h, &mut tex.images);
+    tex.accum_b.0 = make_rgba32f_tex(w, h, &mut tex.images);
+    let disp = make_rgba8_tex(w, h, &mut tex.images);
+    tex.display.0 = disp.clone();
 
     if let Ok(mut sprite) = sprites.single_mut() {
         sprite.image = disp;

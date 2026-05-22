@@ -50,10 +50,7 @@ fn setup_fps_ui(mut commands: Commands) {
     ));
 }
 
-fn update_fps_text(
-    diagnostics: Res<DiagnosticsStore>,
-    mut query: Query<&mut Text, With<FpsText>>,
-) {
+fn update_fps_text(diagnostics: Res<DiagnosticsStore>, mut query: Query<&mut Text, With<FpsText>>) {
     let Ok(mut text) = query.single_mut() else {
         return;
     };
