@@ -112,6 +112,13 @@ impl Default for ObjectsUniform {
 pub struct DiskConfigUniform {
     pub spin: f32,
     pub r_outer_rs: f32,
+    pub model: u32,
+    pub h_thin: f32,
+    pub h_hot: f32,
+    pub r_trunc_rs: f32,
+    pub tilt_deg: f32,
+    pub r_bp_rs: f32,
+    pub twist_deg: f32,
 }
 
 impl Default for DiskConfigUniform {
@@ -119,6 +126,13 @@ impl Default for DiskConfigUniform {
         Self {
             spin: KERR_SPIN,
             r_outer_rs: 15.0,
+            model: 0,
+            h_thin: 0.03,
+            h_hot: 0.5,
+            r_trunc_rs: 10.0,
+            tilt_deg: 0.0,
+            r_bp_rs: 5.0,
+            twist_deg: 0.0,
         }
     }
 }
@@ -373,6 +387,13 @@ fn sync_disk_config_uniform(disk: Res<DiskConfig>, mut uniform: ResMut<DiskConfi
     }
     uniform.spin = disk.spin;
     uniform.r_outer_rs = disk.r_outer_rs;
+    uniform.model = disk.model.as_u32();
+    uniform.h_thin = disk.h_thin;
+    uniform.h_hot = disk.h_hot;
+    uniform.r_trunc_rs = disk.r_trunc_rs;
+    uniform.tilt_deg = disk.tilt_deg;
+    uniform.r_bp_rs = disk.r_bp_rs;
+    uniform.twist_deg = disk.twist_deg;
 }
 
 const SCALE_PRESETS: &[f32] = &[0.25, 0.5, 0.75, 1.0];

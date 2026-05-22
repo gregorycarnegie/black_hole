@@ -24,14 +24,22 @@ struct Camera {
 @group(0) @binding(1) var<uniform> cam: Camera;
 
 struct Disk {
-    r1:        f32,
-    r2:        f32,
-    num:       f32,
-    thickness: f32,
+    r1:        f32,   // inner emitting radius
+    r2:        f32,   // outer radius
+    h_thin:    f32,   // H/R for thin disk component
+    h_hot:     f32,   // H/R for hot / thick inner component
     spin:      f32,
     horizon_r: f32,
     isco_r:    f32,
+    r_trunc:   f32,   // truncation radius (TruncHot) or puff radius (Slim)
+    tilt_deg:  f32,   // outer disk tilt in degrees (Warped)
+    r_bp:      f32,   // Bardeen-Petterson alignment radius (Warped)
+    twist_deg: f32,   // azimuthal twist per ln(r/r_bp) in degrees (Warped)
+    model:     u32,   // 0=ThinNT  1=TruncHot  2=Slim  3=Warped
     _pad0:     f32,
+    _pad1:     f32,
+    _pad2:     f32,
+    _pad3:     f32,
 }
 @group(0) @binding(2) var<uniform> disk: Disk;
 
@@ -415,6 +423,57 @@ fn disk_edge_fade(r_disk: f32) -> f32 {
     return clamp(inner * outer, 0.0, 1.0);
 }
 
+// Model-dependent H/R at cylindrical radius r_xz.
+fn get_h_over_r(r_xz: f32) -> f32 {
+    if disk.model == 1u {
+        // TruncHot: tanh transition — h_hot inside r_trunc, h_thin outside.
+        let safe_r  = max(r_xz,        SAGA_RS * 1.0e-3);
+        let safe_rt = max(disk.r_trunc, SAGA_RS * 1.0e-3);
+        let t = clamp((log(safe_r) - log(safe_rt)) / 0.4, -10.0, 10.0);
+        let w = 0.5 * (1.0 + tanh(t));   // 0 deep inside, 1 far outside
+        return w * disk.h_thin + (1.0 - w) * disk.h_hot;
+    } else if disk.model == 2u {
+        // Slim / super-Eddington: disk puffs up inward at r_trunc (used as r_puff).
+        let r_puff = max(disk.r_trunc, SAGA_RS * 0.5);
+        let ratio  = r_xz / r_puff;
+        return disk.h_thin + (disk.h_hot - disk.h_thin) / (1.0 + ratio * ratio);
+    }
+    // ThinNT (0) or WarpedThin (3): constant H/R.
+    return disk.h_thin;
+}
+
+// Midplane Y displacement for a warped disk; zero for all other models.
+// β(R): tilt 0 inside r_bp (aligned), tilt_deg outside. γ(R): azimuthal twist.
+fn disk_midplane_y(r_xz: f32, phi: f32) -> f32 {
+    if disk.model != 3u { return 0.0; }
+    let r_bp_safe = max(disk.r_bp, SAGA_RS * 0.1);
+    let ln_norm   = clamp(log(max(r_xz, SAGA_RS * 0.01) / r_bp_safe) / 0.5, -10.0, 10.0);
+    let w     = 0.5 * (1.0 + tanh(ln_norm));   // 0 inside r_bp, 1 outside
+    let beta  = disk.tilt_deg  * (PI / 180.0) * w;
+    let gamma = disk.twist_deg * (PI / 180.0) * log(1.0 + r_xz / r_bp_safe);
+    return r_xz * sin(beta) * sin(phi - gamma);
+}
+
+// Sub-Keplerian factor: 1.0 for razor-thin, ~0.5 for thick hot flow.
+fn sub_keplerian_factor(h_r: f32) -> f32 {
+    return 1.0 - 0.5 * clamp(h_r * 2.0, 0.0, 1.0);
+}
+
+// Normalised emissivity temperature for optically-thin RIAF / hot flow.
+fn hot_emissivity_t(r: f32) -> f32 {
+    let r0 = max(disk.isco_r, disk.r1);
+    return pow(clamp(r0 / max(r, r0), 0.0, 1.0), 0.6);
+}
+
+// Blackbody colour for synchrotron-dominated hot flow (orange → pale gold).
+fn hot_blackbody_color(t: f32) -> vec3<f32> {
+    let s = clamp(t, 0.0, 1.0);
+    if s < 0.5 {
+        return mix(vec3<f32>(0.02, 0.01, 0.0), vec3<f32>(0.85, 0.30, 0.05), s * 2.0);
+    }
+    return mix(vec3<f32>(0.85, 0.30, 0.05), vec3<f32>(1.0, 0.80, 0.50), (s - 0.5) * 2.0);
+}
+
 fn ray_cart_dir(ray: Ray) -> vec3<f32> {
     let g = contra_metric(ray.r, ray.theta);
     let dr = g.g_rr * ray.pr;
@@ -440,30 +499,43 @@ struct OrbitalResult {
     orbit_sign: f32,
 }
 
-// Returns orbital beta, gravitational lapse, and orbit direction in one pass
-// so shade_disk can reuse lapse and orbit_sign without recomputing them.
-fn orbital_kerr(r_disk: f32) -> OrbitalResult {
+// Returns orbital beta, gravitational lapse, and orbit direction in one pass.
+// h_r: local H/R used to derive the sub-Keplerian factor for thick flows.
+fn orbital_kerr(r_disk: f32, h_r: f32) -> OrbitalResult {
     let a = spin_clamped();
     let orbit_sign = select(-1.0, 1.0, a >= 0.0);
     let rho_k = max(r_disk / BH_M, 1.0);
-    let omega_orbit = orbit_sign / (BH_M * max(rho_k * sqrt(rho_k) + orbit_sign * abs(a), 1.0e-4));
-    let omega_drag = frame_drag_omega(r_disk, 0.5 * PI);
-    let lapse = max(kerr_lapse(r_disk, 0.5 * PI), 1.0e-4);
+    let omega_kep   = orbit_sign / (BH_M * max(rho_k * sqrt(rho_k) + orbit_sign * abs(a), 1.0e-4));
+    let omega_orbit = omega_kep * sub_keplerian_factor(h_r);
+    let omega_drag  = frame_drag_omega(r_disk, 0.5 * PI);
+    let lapse       = max(kerr_lapse(r_disk, 0.5 * PI), 1.0e-4);
 
-    // metric_rho computed once and reused for both sigma and g_phiphi.
-    let rho_m = metric_rho(r_disk);
-    let sigma = kerr_sigma_hat(rho_m, 0.5 * PI);
+    let rho_m    = metric_rho(r_disk);
+    let sigma    = kerr_sigma_hat(rho_m, 0.5 * PI);
     let g_phiphi = (BH_M * BH_M) * kerr_big_a_hat(rho_m, 0.5 * PI) / sigma;
     let beta = clamp(abs((omega_orbit - omega_drag) * sqrt(max(g_phiphi, 0.0)) / lapse), 0.0, 0.95);
     return OrbitalResult(beta, lapse, orbit_sign);
 }
 
-fn shade_disk(ray: Ray) -> vec4<f32> {
-    let disk_pt = vec3<f32>(ray.x, 0.0, ray.z);
-    let r_disk = length(disk_pt);
+// r_disk: cylindrical radius already computed by caller.
+// h_r:    local H/R already computed by caller.
+fn shade_disk(ray: Ray, r_disk: f32, h_r: f32) -> vec4<f32> {
+    // Model-dependent emissivity colour.
+    var base: vec3<f32>;
+    if disk.model == 1u {
+        // TruncHot: blend NT thermal (outer) with hot-flow synchrotron (inner).
+        let safe_r  = max(r_disk,       SAGA_RS * 1.0e-3);
+        let safe_rt = max(disk.r_trunc, SAGA_RS * 1.0e-3);
+        let t = clamp((log(safe_r) - log(safe_rt)) / 0.4, -10.0, 10.0);
+        let w     = 0.5 * (1.0 + tanh(t));   // 1 in outer thin disk, 0 in inner hot flow
+        let c_nt  = blackbody_color(nt_temp(r_disk) / 0.488);
+        let c_hot = hot_blackbody_color(hot_emissivity_t(r_disk));
+        base = w * c_nt + (1.0 - w) * c_hot;
+    } else {
+        base = blackbody_color(nt_temp(r_disk) / 0.488);
+    }
 
-    let base = blackbody_color(nt_temp(r_disk) / 0.488);
-    let orb = orbital_kerr(r_disk);
+    let orb     = orbital_kerr(r_disk, h_r);
     let orbital = orb.orbit_sign * normalize(vec3<f32>(-ray.z, 0.0, ray.x));
 
     let to_cam = -ray_cart_dir(ray);
@@ -589,16 +661,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let r_xz = length(vec2<f32>(new_pos.x, new_pos.z));
         if r_xz >= disk.r1 && r_xz <= disk.r2 && disk_accum < 2.5 && disk_alpha < 0.995 {
-            let H = disk.thickness * r_xz;
-            let z_norm = new_pos.y / max(H, 1.0e-4 * SAGA_RS);
+            let phi   = atan2(new_pos.z, new_pos.x);
+            let h_r   = get_h_over_r(r_xz);
+            let H     = h_r * r_xz;
+            let y_mid = disk_midplane_y(r_xz, phi);   // 0 for all models except Warped
+            let z_norm = (new_pos.y - y_mid) / max(H, 1.0e-4 * SAGA_RS);
             if abs(z_norm) < 4.0 {
                 let density = exp(-0.5 * z_norm * z_norm);
-                // ds: coordinate path length this step; weight by fraction of H traversed.
-                // Normaliser 0.4 ≈ 1/√(2π) so a perpendicular crossing totals ~1.0.
+                // Normaliser 0.4 ≈ 1/√(2π) so a perpendicular crossing totals ~1.
                 let ds = length(new_pos - prev_pos);
                 let contrib = density * ds / max(H, 1.0e-4 * SAGA_RS) * 0.4;
                 if contrib > 1.0e-5 {
-                    let c = shade_disk(ray);
+                    let c = shade_disk(ray, r_xz, h_r);
                     let w = min(contrib, 2.5 - disk_accum);
                     disk_accum += w;
                     let sample_alpha = clamp(c.a * (1.0 - exp(-0.7 * w)), 0.0, 0.98);

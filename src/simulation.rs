@@ -12,6 +12,49 @@ pub const SAGA_MASS: f64 = 8.54e36;
 /// Default dimensionless Kerr spin parameter a* = J/M². Positive = prograde.
 pub const KERR_SPIN: f32 = 0.82;
 
+/// Accretion-disk geometry regime, selectable at runtime with M.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum DiskModel {
+    /// Geometrically thin Novikov-Thorne / Shakura-Sunyaev disk (soft state).
+    #[default]
+    ThinNt = 0,
+    /// Truncated thin outer disk + thick hot inner flow (hard state / ADAF).
+    TruncatedHotFlow = 1,
+    /// Slim / super-Eddington disk: puffed-up photosphere and funnel.
+    SlimFunnel = 2,
+    /// Warped / Bardeen-Petterson tilted thin disk.
+    WarpedThin = 3,
+}
+
+impl DiskModel {
+    pub fn as_u32(&self) -> u32 {
+        match self {
+            Self::ThinNt => 0,
+            Self::TruncatedHotFlow => 1,
+            Self::SlimFunnel => 2,
+            Self::WarpedThin => 3,
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            Self::ThinNt => Self::TruncatedHotFlow,
+            Self::TruncatedHotFlow => Self::SlimFunnel,
+            Self::SlimFunnel => Self::WarpedThin,
+            Self::WarpedThin => Self::ThinNt,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ThinNt => "Thin NT disk (soft state)",
+            Self::TruncatedHotFlow => "Truncated thin + hot flow (hard state)",
+            Self::SlimFunnel => "Slim / super-Eddington funnel",
+            Self::WarpedThin => "Warped / tilted thin disk (Bardeen-Petterson)",
+        }
+    }
+}
+
 /// Runtime-adjustable accretion disk and black hole parameters.
 #[derive(Resource, Clone, Debug)]
 pub struct DiskConfig {
@@ -19,14 +62,77 @@ pub struct DiskConfig {
     pub spin: f32,
     /// Outer disk radius in units of SAGA_RS.
     pub r_outer_rs: f32,
+    /// Geometry regime / preset.
+    pub model: DiskModel,
+    /// H/R for the thin disk component (all models).
+    pub h_thin: f32,
+    /// H/R for the hot / thick inner component (TruncHot, Slim).
+    pub h_hot: f32,
+    /// Truncation radius (TruncHot) or puff radius (Slim), in units of SAGA_RS.
+    pub r_trunc_rs: f32,
+    /// Outer disk tilt angle in degrees (Warped).
+    pub tilt_deg: f32,
+    /// Bardeen-Petterson alignment radius in units of SAGA_RS (Warped).
+    pub r_bp_rs: f32,
+    /// Azimuthal twist per ln(r/r_bp) in degrees (Warped).
+    pub twist_deg: f32,
+}
+
+impl DiskConfig {
+    /// Return a preset `DiskConfig` for the given model, preserving spin.
+    pub fn for_model(model: DiskModel, spin: f32) -> Self {
+        match model {
+            DiskModel::ThinNt => Self {
+                spin,
+                r_outer_rs: 15.0,
+                model: DiskModel::ThinNt,
+                h_thin: 0.03,
+                h_hot: 0.5,
+                r_trunc_rs: 10.0,
+                tilt_deg: 0.0,
+                r_bp_rs: 5.0,
+                twist_deg: 0.0,
+            },
+            DiskModel::TruncatedHotFlow => Self {
+                spin,
+                r_outer_rs: 20.0,
+                model: DiskModel::TruncatedHotFlow,
+                h_thin: 0.02,
+                h_hot: 0.5,
+                r_trunc_rs: 10.0,
+                tilt_deg: 0.0,
+                r_bp_rs: 5.0,
+                twist_deg: 0.0,
+            },
+            DiskModel::SlimFunnel => Self {
+                spin,
+                r_outer_rs: 12.0,
+                model: DiskModel::SlimFunnel,
+                h_thin: 0.05,
+                h_hot: 0.45,
+                r_trunc_rs: 3.0,
+                tilt_deg: 0.0,
+                r_bp_rs: 5.0,
+                twist_deg: 0.0,
+            },
+            DiskModel::WarpedThin => Self {
+                spin,
+                r_outer_rs: 15.0,
+                model: DiskModel::WarpedThin,
+                h_thin: 0.03,
+                h_hot: 0.5,
+                r_trunc_rs: 5.0,
+                tilt_deg: 30.0,
+                r_bp_rs: 3.0,
+                twist_deg: 15.0,
+            },
+        }
+    }
 }
 
 impl Default for DiskConfig {
     fn default() -> Self {
-        Self {
-            spin: KERR_SPIN,
-            r_outer_rs: 15.0,
-        }
+        Self::for_model(DiskModel::ThinNt, KERR_SPIN)
     }
 }
 
@@ -132,11 +238,17 @@ fn update_disk_config(
         disk.r_outer_rs = (disk.r_outer_rs + 1.0).min(30.0);
         changed = true;
     }
+    if keys.just_pressed(KeyCode::KeyM) {
+        let next = disk.model.next();
+        *disk = DiskConfig::for_model(next, disk.spin);
+        info!("Disk model: {}", disk.model.name());
+        changed = true;
+    }
 
     if changed {
         info!(
-            "Disk: spin={:.2}, r_outer={:.0} r_s",
-            disk.spin, disk.r_outer_rs
+            "Disk: spin={:.2}, r_outer={:.0} r_s, model={}",
+            disk.spin, disk.r_outer_rs, disk.model.name()
         );
         // Keep the black hole sphere radius in sync with the new horizon.
         if let Some(bh) = objects.0.last_mut() {
