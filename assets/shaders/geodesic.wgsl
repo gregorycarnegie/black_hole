@@ -77,8 +77,8 @@ fn spin_clamped() -> f32 {
 }
 
 fn metric_rho(r: f32) -> f32 {
-    let horizon_rho = max(disk.horizon_r / BH_M, 1.0);
-    return max(r / BH_M, horizon_rho + 1.0e-4);
+    let horizon_rho = max(disk.horizon_r * INV_BH_M, 1.0);
+    return max(r * INV_BH_M, horizon_rho + 1.0e-4);
 }
 
 fn kerr_static_limit(theta: f32, a2: f32) -> f32 {
@@ -136,6 +136,7 @@ struct ContraMetric {
 
 fn contra_metric(r: f32, theta: f32, a: f32) -> ContraMetric {
     let rho = metric_rho(r);
+    let rho2 = rho * rho;
     let a2 = a * a;
     let sin_t = sin(theta);
     let cos_t = cos(theta);
@@ -143,15 +144,15 @@ fn contra_metric(r: f32, theta: f32, a: f32) -> ContraMetric {
     let sin2_t = max(sin2_raw, SIN2_FLOOR);
     let d_sin2_dt = select(0.0, 2.0 * sin_t * cos_t, sin2_raw >= SIN2_FLOOR);
 
-    let sigma = rho * rho + a2 * cos_t * cos_t;
+    let sigma = rho2 + a2 * cos_t * cos_t;
     let d_sigma_drho = 2.0 * rho;
     let d_sigma_dt = -2.0 * a2 * sin_t * cos_t;
 
-    let delta_raw = rho * rho - 2.0 * rho + a2;
+    let delta_raw = rho2 - 2.0 * rho + a2;
     let delta = max(delta_raw, DELTA_FLOOR);
     let d_delta_drho = select(0.0, 2.0 * rho - 2.0, delta_raw >= DELTA_FLOOR);
 
-    let rr_aa = rho * rho + a2;
+    let rr_aa = rho2 + a2;
     let big_a = rr_aa * rr_aa - a2 * delta * sin2_t;
     let d_big_a_drho = 4.0 * rho * rr_aa - a2 * d_delta_drho * sin2_t;
     let d_big_a_dt = -a2 * delta * d_sin2_dt;
@@ -189,8 +190,8 @@ fn contra_metric(r: f32, theta: f32, a: f32) -> ContraMetric {
 
     let dp_drho = d_delta_drho;
     let dp_dt = -a2 * d_sin2_dt;
-    let pp_den = max(den * sin2_t, 1.0e-6);
-    let inv_pp_den = 1.0 / pp_den;
+    let pp_den = den * sin2_t;
+    let inv_pp_den = select(1.0e6, inv_den * inv_sin2, pp_den >= 1.0e-6);
     let inv_pp_den2 = inv_pp_den * inv_pp_den;
     let d_pp_den_drho = d_den_drho * sin2_t;
     let d_pp_den_dt = d_den_dt * sin2_t + den * d_sin2_dt;
