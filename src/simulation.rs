@@ -45,6 +45,24 @@ impl DiskModel {
         }
     }
 
+    pub fn prev(&self) -> Self {
+        match self {
+            Self::ThinNt => Self::WarpedThin,
+            Self::TruncatedHotFlow => Self::ThinNt,
+            Self::SlimFunnel => Self::TruncatedHotFlow,
+            Self::WarpedThin => Self::SlimFunnel,
+        }
+    }
+
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            Self::ThinNt => "Thin NT",
+            Self::TruncatedHotFlow => "Truncated",
+            Self::SlimFunnel => "Slim Funnel",
+            Self::WarpedThin => "Warped",
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             Self::ThinNt => "Thin NT disk (soft state)",
@@ -178,7 +196,7 @@ fn black_hole_object(spin: f32) -> SimObject {
     }
 }
 
-fn scene_objects(spin: f32, include_debug_bodies: bool) -> Vec<SimObject> {
+pub(crate) fn scene_objects(spin: f32, include_debug_bodies: bool) -> Vec<SimObject> {
     let mut objects = Vec::new();
 
     if include_debug_bodies {

@@ -147,7 +147,7 @@ struct StillFrameCounter(u32);
 /// Fraction of the window resolution used for compute textures (0.25–1.0).
 /// Press `[` / `]` to cycle through presets at runtime.
 #[derive(Resource)]
-struct RenderScale(f32);
+pub(crate) struct RenderScale(pub(crate) f32);
 
 impl Default for RenderScale {
     fn default() -> Self {
@@ -402,7 +402,7 @@ fn sync_disk_config_uniform(disk: Res<DiskConfig>, mut uniform: ResMut<DiskConfi
     uniform.twist_deg = disk.twist_deg;
 }
 
-const SCALE_PRESETS: &[f32] = &[0.25, 0.5, 0.75, 1.0];
+pub(crate) const SCALE_PRESETS: &[f32] = &[0.25, 0.5, 0.75, 1.0];
 
 /// Press `-` / `=` to step render scale down / up through 25 % → 50 % → 75 % → 100 %.
 fn cycle_render_scale(keys: Res<ButtonInput<KeyCode>>, mut scale: ResMut<RenderScale>) {
@@ -487,11 +487,13 @@ fn sync_compute_textures(
     );
 }
 
-const SKYBOXES: &[&str] = &[
+pub(crate) const SKYBOXES: &[&str] = &[
     "hdr/HDR_galactic_plane_1.hdr",
     "hdr/HDR_blue_nebulae_3.hdr",
     "hdr/HDR_white_local_star_and_nebulae.hdr",
 ];
+
+pub(crate) const SKYBOX_NAMES: &[&str] = &["Galactic Plane", "Blue Nebula", "Star Field"];
 
 fn load_skyboxes(mut commands: Commands, asset_server: Res<AssetServer>) {
     let handles: Vec<Handle<Image>> = SKYBOXES.iter().map(|p| asset_server.load(*p)).collect();

@@ -7,6 +7,7 @@ mod camera;
 mod compute;
 mod grid;
 mod simulation;
+mod ui;
 
 fn main() {
     App::new()
@@ -23,6 +24,7 @@ fn main() {
         .add_plugins(simulation::SimulationPlugin)
         .add_plugins(grid::GridPlugin)
         .add_plugins(compute::GeodesicComputePlugin)
+        .add_plugins(ui::UiPlugin)
         .add_systems(Startup, setup_fps_ui)
         .add_systems(Update, update_fps_text)
         .run();

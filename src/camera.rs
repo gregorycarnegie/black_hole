@@ -156,7 +156,7 @@ fn update_orbital_camera(
     }
 }
 
-const ITER_PRESETS: &[u32] = &[8_000, 10_000, 12_000, 14_000, 16_000, 18_000];
+pub(crate) const ITER_PRESETS: &[u32] = &[8_000, 10_000, 12_000, 14_000, 16_000, 18_000];
 
 /// Press , / . to step the geodesic iteration cap down / up through presets.
 fn cycle_max_iter(keys: Res<ButtonInput<KeyCode>>, mut cam: ResMut<OrbitalCamera>) {
