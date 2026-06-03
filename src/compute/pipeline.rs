@@ -76,6 +76,7 @@ struct GpuObjectsUniform {
     pos_radius: [[f32; 4]; 16],
     color: [[f32; 4]; 16],
     mass: [[f32; 4]; 16],
+    spin: [[f32; 4]; 16],
 }
 
 // ── Pipeline resource ────────────────────────────────────────────────────────
@@ -286,6 +287,7 @@ pub fn prepare_bind_group(mut commands: Commands, sources: GeodesicSources, gpu:
     gpu_objs.pos_radius = objects_uniform.pos_radius;
     gpu_objs.color = objects_uniform.color;
     gpu_objs.mass = objects_uniform.mass;
+    gpu_objs.spin = objects_uniform.spin;
     if pipeline.last_objects != Some(gpu_objs) {
         gpu.queue
             .write_buffer(&pipeline.objects_buf, 0, bytemuck::bytes_of(&gpu_objs));

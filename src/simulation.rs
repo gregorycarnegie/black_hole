@@ -20,8 +20,12 @@ pub const BINARY_SEPARATION_RS: f32 = 7.0;
 /// Inner radius used for the circumbinary disk cavity, in units of SAGA_RS.
 pub const BINARY_DISK_INNER_RS: f32 = 5.0;
 
+pub const BINARY_SPIN_STEP: f32 = 0.05;
+pub const BINARY_AXIS_STEP: f32 = 0.1;
+
 const BINARY_ORBIT_PERIOD_SECONDS: f32 = 18.0;
 const BLACK_HOLE_SHADOW_RADIUS_MULTIPLIER: f32 = 2.6;
+const MAX_SPIN_MAGNITUDE: f32 = 0.999;
 
 /// Accretion-disk geometry regime, selectable at runtime with M.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -196,6 +200,8 @@ pub struct SimObject {
     pub color: Vec4,
     pub mass: f32,
     pub velocity: Vec3,
+    /// Dimensionless spin vector a*. Direction is the spin axis; length is clamped to < 1.
+    pub spin: Vec3,
 }
 
 /// All simulated objects in the scene, including the black hole itself.
@@ -204,25 +210,51 @@ pub struct SimObjects(pub Vec<SimObject>);
 
 impl Default for SimObjects {
     fn default() -> Self {
-        Self(scene_objects(KERR_SPIN, false, true, 0.0))
+        Self(scene_objects(
+            KERR_SPIN,
+            false,
+            true,
+            0.0,
+            default_binary_spins(),
+        ))
     }
 }
 
-fn black_hole_shadow_radius(spin: f32, mass_fraction: f32) -> f32 {
-    kerr_horizon_radius(spin) * mass_fraction * BLACK_HOLE_SHADOW_RADIUS_MULTIPLIER
+fn black_hole_shadow_radius(spin_magnitude: f32, mass_fraction: f32) -> f32 {
+    kerr_horizon_radius(spin_magnitude) * mass_fraction * BLACK_HOLE_SHADOW_RADIUS_MULTIPLIER
 }
 
-fn black_hole_object(spin: f32, mass_fraction: f32, position: Vec3, velocity: Vec3) -> SimObject {
+fn clamped_spin_vector(spin: Vec3) -> Vec3 {
+    let length = spin.length();
+    if length > MAX_SPIN_MAGNITUDE {
+        spin / length * MAX_SPIN_MAGNITUDE
+    } else {
+        spin
+    }
+}
+
+fn black_hole_object(
+    spin_vector: Vec3,
+    mass_fraction: f32,
+    position: Vec3,
+    velocity: Vec3,
+) -> SimObject {
+    let spin = clamped_spin_vector(spin_vector);
     SimObject {
         position,
-        radius: black_hole_shadow_radius(spin, mass_fraction),
+        radius: black_hole_shadow_radius(spin.length(), mass_fraction),
         color: Vec4::new(0., 0., 0., 1.),
         mass: SAGA_MASS as f32 * mass_fraction,
         velocity,
+        spin,
     }
 }
 
-fn binary_black_holes(spin: f32, phase: f32) -> [SimObject; 2] {
+fn single_black_hole(spin: f32) -> SimObject {
+    black_hole_object(Vec3::Y * spin, 1.0, Vec3::ZERO, Vec3::ZERO)
+}
+
+fn binary_black_holes(spins: [BinarySpin; 2], phase: f32) -> [SimObject; 2] {
     let orbital_radius = 0.5 * BINARY_SEPARATION_RS * SAGA_RS;
     let angular_velocity = TAU / BINARY_ORBIT_PERIOD_SECONDS;
     let (sin_phase, cos_phase) = phase.sin_cos();
@@ -234,8 +266,8 @@ fn binary_black_holes(spin: f32, phase: f32) -> [SimObject; 2] {
     );
 
     [
-        black_hole_object(spin, 0.5, position, velocity),
-        black_hole_object(spin, 0.5, -position, -velocity),
+        black_hole_object(spins[0].vector(), 0.5, position, velocity),
+        black_hole_object(spins[1].vector(), 0.5, -position, -velocity),
     ]
 }
 
@@ -244,6 +276,7 @@ pub(crate) fn scene_objects(
     include_debug_bodies: bool,
     binary_enabled: bool,
     binary_phase: f32,
+    binary_spins: [BinarySpin; 2],
 ) -> Vec<SimObject> {
     let mut objects = Vec::new();
 
@@ -255,6 +288,7 @@ pub(crate) fn scene_objects(
                 color: Vec4::new(1., 1., 0., 1.),
                 mass: 1.98892e30,
                 velocity: Vec3::ZERO,
+                spin: Vec3::ZERO,
             },
             SimObject {
                 position: Vec3::new(0.0, 0.0, 4e11),
@@ -262,14 +296,15 @@ pub(crate) fn scene_objects(
                 color: Vec4::new(1., 0., 0., 1.),
                 mass: 1.98892e30,
                 velocity: Vec3::ZERO,
+                spin: Vec3::ZERO,
             },
         ]);
     }
 
     if binary_enabled {
-        objects.extend(binary_black_holes(spin, binary_phase));
+        objects.extend(binary_black_holes(binary_spins, binary_phase));
     } else {
-        objects.push(black_hole_object(spin, 1.0, Vec3::ZERO, Vec3::ZERO));
+        objects.push(single_black_hole(spin));
     }
     objects
 }
@@ -290,20 +325,39 @@ fn update_disk_config(
     mut cam: ResMut<OrbitalCamera>,
     mut objects: ResMut<SimObjects>,
     debug: Res<DebugBodiesEnabled>,
-    binary: Res<BinaryBlackHoles>,
+    mut binary: ResMut<BinaryBlackHoles>,
 ) {
     let mut changed = false;
     let mut rebuild_scene = false;
+    let mut selection_changed = false;
 
     if keys.just_pressed(KeyCode::KeyQ) {
-        disk.spin = (disk.spin - 0.05).clamp(-0.999, 0.999);
+        if binary.enabled {
+            binary.adjust_selected_magnitude(-BINARY_SPIN_STEP);
+        } else {
+            disk.spin = (disk.spin - 0.05).clamp(-MAX_SPIN_MAGNITUDE, MAX_SPIN_MAGNITUDE);
+        }
         changed = true;
         rebuild_scene = true;
     }
     if keys.just_pressed(KeyCode::KeyE) {
-        disk.spin = (disk.spin + 0.05).clamp(-0.999, 0.999);
+        if binary.enabled {
+            binary.adjust_selected_magnitude(BINARY_SPIN_STEP);
+        } else {
+            disk.spin = (disk.spin + 0.05).clamp(-MAX_SPIN_MAGNITUDE, MAX_SPIN_MAGNITUDE);
+        }
         changed = true;
         rebuild_scene = true;
+    }
+    if binary.enabled {
+        if keys.just_pressed(KeyCode::Digit1) {
+            binary.selected = 0;
+            selection_changed = true;
+        }
+        if keys.just_pressed(KeyCode::Digit2) {
+            binary.selected = 1;
+            selection_changed = true;
+        }
     }
     if keys.just_pressed(KeyCode::KeyZ) {
         disk.r_outer_rs = (disk.r_outer_rs - 1.0).max(4.0);
@@ -321,16 +375,39 @@ fn update_disk_config(
     }
 
     if changed {
-        info!(
-            "Disk: spin={:.2}, r_outer={:.0} r_s, model={}",
-            disk.spin,
-            disk.r_outer_rs,
-            disk.model.name()
-        );
+        if binary.enabled && rebuild_scene {
+            let spin = binary.selected_spin();
+            info!(
+                "Binary hole {} spin: |a*|={:.2}, axis=({:+.2}, {:+.2}, {:+.2})",
+                binary.selected_label(),
+                spin.magnitude,
+                spin.axis.x,
+                spin.axis.y,
+                spin.axis.z
+            );
+        } else {
+            info!(
+                "Disk: spin={:.2}, r_outer={:.0} r_s, model={}",
+                disk.spin,
+                disk.r_outer_rs,
+                disk.model.name()
+            );
+        }
         if rebuild_scene {
-            objects.0 = scene_objects(disk.spin, debug.0, binary.enabled, binary.phase);
+            objects.0 = scene_objects(
+                disk.spin,
+                debug.0,
+                binary.enabled,
+                binary.phase,
+                binary.spins,
+            );
         }
         // Trigger TAA reset so the accumulation buffer clears immediately.
+        cam.is_moving = true;
+    }
+
+    if selection_changed {
+        info!("Binary spin target: hole {}", binary.selected_label());
         cam.is_moving = true;
     }
 }
@@ -345,6 +422,76 @@ pub struct DebugBodiesEnabled(pub bool);
 pub struct BinaryBlackHoles {
     pub enabled: bool,
     pub phase: f32,
+    pub selected: usize,
+    pub spins: [BinarySpin; 2],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BinarySpin {
+    pub magnitude: f32,
+    pub axis: Vec3,
+}
+
+impl BinarySpin {
+    pub fn new(magnitude: f32, axis: Vec3) -> Self {
+        let axis = if axis.length_squared() > 1.0e-6 {
+            axis.normalize()
+        } else {
+            Vec3::Y
+        };
+        Self {
+            magnitude: magnitude.clamp(0.0, MAX_SPIN_MAGNITUDE),
+            axis,
+        }
+    }
+
+    pub fn vector(&self) -> Vec3 {
+        self.axis * self.magnitude
+    }
+}
+
+pub fn default_binary_spins() -> [BinarySpin; 2] {
+    [
+        BinarySpin::new(KERR_SPIN, Vec3::Y),
+        BinarySpin::new(KERR_SPIN, Vec3::Y),
+    ]
+}
+
+impl BinaryBlackHoles {
+    pub fn selected_label(&self) -> &'static str {
+        if self.selected == 0 { "A" } else { "B" }
+    }
+
+    pub fn selected_spin(&self) -> BinarySpin {
+        self.spins[self.selected.min(1)]
+    }
+
+    pub fn select_prev(&mut self) {
+        self.selected = (self.selected + 1) % 2;
+    }
+
+    pub fn select_next(&mut self) {
+        self.selected = (self.selected + 1) % 2;
+    }
+
+    pub fn adjust_selected_magnitude(&mut self, delta: f32) {
+        let selected = self.selected.min(1);
+        let spin = self.spins[selected];
+        self.spins[selected] = BinarySpin::new(spin.magnitude + delta, spin.axis);
+    }
+
+    pub fn adjust_selected_axis_component(&mut self, component: usize, delta: f32) {
+        let selected = self.selected.min(1);
+        let spin = self.spins[selected];
+        let mut axis = spin.axis;
+        match component {
+            0 => axis.x = (axis.x + delta).clamp(-1.0, 1.0),
+            1 => axis.y = (axis.y + delta).clamp(-1.0, 1.0),
+            2 => axis.z = (axis.z + delta).clamp(-1.0, 1.0),
+            _ => return,
+        }
+        self.spins[selected] = BinarySpin::new(spin.magnitude, axis);
+    }
 }
 
 impl Default for BinaryBlackHoles {
@@ -352,6 +499,8 @@ impl Default for BinaryBlackHoles {
         Self {
             enabled: true,
             phase: 0.0,
+            selected: 0,
+            spins: default_binary_spins(),
         }
     }
 }
@@ -366,7 +515,13 @@ fn toggle_binary_black_holes(
 ) {
     if keys.just_pressed(KeyCode::KeyN) {
         binary.enabled = !binary.enabled;
-        objects.0 = scene_objects(disk.spin, debug.0, binary.enabled, binary.phase);
+        objects.0 = scene_objects(
+            disk.spin,
+            debug.0,
+            binary.enabled,
+            binary.phase,
+            binary.spins,
+        );
         cam.is_moving = true;
         info!(
             "Binary black holes: {}",
@@ -392,7 +547,13 @@ fn toggle_debug_bodies(
 ) {
     if keys.just_pressed(KeyCode::KeyO) {
         enabled.0 = !enabled.0;
-        objects.0 = scene_objects(disk.spin, enabled.0, binary.enabled, binary.phase);
+        objects.0 = scene_objects(
+            disk.spin,
+            enabled.0,
+            binary.enabled,
+            binary.phase,
+            binary.spins,
+        );
         cam.is_moving = true;
         info!("Debug bodies: {}", if enabled.0 { "ON" } else { "OFF" });
     }
@@ -446,6 +607,6 @@ fn animate_binary_black_holes(
 
     binary.phase =
         (binary.phase + time.delta_secs() * TAU / BINARY_ORBIT_PERIOD_SECONDS).rem_euclid(TAU);
-    objects.0 = scene_objects(disk.spin, debug.0, true, binary.phase);
+    objects.0 = scene_objects(disk.spin, debug.0, true, binary.phase, binary.spins);
     cam.is_moving = true;
 }

@@ -52,6 +52,8 @@ struct Objects {
     color:       array<vec4<f32>, 16>,
     // std140 pads f32 array elements to 16 bytes; only .x is used
     mass:        array<vec4<f32>, 16>,
+    // Per-object dimensionless spin vector a*.
+    spin:        array<vec4<f32>, 16>,
 }
 @group(0) @binding(3) var<uniform> objects: Objects;
 
@@ -72,6 +74,7 @@ const DELTA_FLOOR:    f32 = 1.0e-5;
 const SAGA_MASS:      f32 = 8.54e36;
 const BINARY_TRACE_STEPS: u32 = 768u;
 const BINARY_BEND_MULTIPLIER: f32 = 2.0;
+const BINARY_FRAME_DRAG_MULTIPLIER: f32 = 4.0;
 
 // -- Kerr metric helpers -----------------------------------------------------
 
@@ -578,6 +581,16 @@ fn object_schwarzschild_radius(i: i32) -> f32 {
     return SAGA_RS * mass_fraction;
 }
 
+fn object_mass_length(i: i32) -> f32 {
+    return 0.5 * object_schwarzschild_radius(i);
+}
+
+fn object_spin_angular_momentum(i: i32) -> vec3<f32> {
+    let spin_vec = clamp(objects.spin[i].xyz, vec3<f32>(-0.999), vec3<f32>(0.999));
+    let m = object_mass_length(i);
+    return spin_vec * m * m;
+}
+
 fn nearest_object_clearance(pos: vec3<f32>) -> f32 {
     var nearest = ESCAPE_R;
     for (var i = 0; i < objects.num_objects; i++) {
@@ -593,11 +606,17 @@ fn binary_deflection(pos: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     for (var i = 0; i < objects.num_objects; i++) {
         let center = objects.pos_radius[i].xyz;
         let radius = max(objects.pos_radius[i].w, SAGA_RS * 0.05);
-        let to_center = center - pos;
-        let r2 = max(dot(to_center, to_center), radius * radius);
+        let from_center = pos - center;
+        let to_center = -from_center;
+        let r2 = max(dot(from_center, from_center), radius * radius);
         let r = sqrt(r2);
         let transverse = to_center - dot(to_center, dir) * dir;
         bend += BINARY_BEND_MULTIPLIER * object_schwarzschild_radius(i) * transverse / max(r2 * r, 1.0);
+
+        let r_hat = from_center / max(r, 1.0);
+        let j = object_spin_angular_momentum(i);
+        let gravito_magnetic = (3.0 * r_hat * dot(j, r_hat) - j) / max(r2 * r, 1.0);
+        bend += BINARY_FRAME_DRAG_MULTIPLIER * cross(dir, gravito_magnetic);
     }
     return bend;
 }

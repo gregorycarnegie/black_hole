@@ -1,11 +1,12 @@
-use bevy::prelude::*;
+use bevy::{ecs::system::SystemParam, prelude::*};
 
 use crate::{
     camera::{ITER_PRESETS, OrbitalCamera},
     compute::{RenderScale, SCALE_PRESETS, SKYBOX_NAMES, SkyboxImage, SkyboxSet},
     grid::GridVisible,
     simulation::{
-        BinaryBlackHoles, DebugBodiesEnabled, DiskConfig, GravityEnabled, SimObjects, scene_objects,
+        BINARY_AXIS_STEP, BINARY_SPIN_STEP, BinaryBlackHoles, DebugBodiesEnabled, DiskConfig,
+        GravityEnabled, SimObjects, scene_objects,
     },
 };
 
@@ -43,6 +44,14 @@ enum UiAction {
     SkyboxNext,
     DiskModelPrev,
     DiskModelNext,
+    BinaryHolePrev,
+    BinaryHoleNext,
+    BinaryAxisXDown,
+    BinaryAxisXUp,
+    BinaryAxisYDown,
+    BinaryAxisYUp,
+    BinaryAxisZDown,
+    BinaryAxisZUp,
     ToggleGrid,
     ToggleGravity,
     ToggleHeatmap,
@@ -60,6 +69,10 @@ enum ValueDisplay {
     RenderScale,
     Skybox,
     DiskModel,
+    BinaryHole,
+    BinaryAxisX,
+    BinaryAxisY,
+    BinaryAxisZ,
 }
 
 /// Marks a toggle button so its background colour tracks on/off state.
@@ -85,6 +98,30 @@ const TOGGLE_ON_HOVER: Color = Color::srgb(0.14, 0.58, 0.30);
 const TOGGLE_OFF: Color = Color::srgb(0.26, 0.10, 0.10);
 const TOGGLE_OFF_HOVER: Color = Color::srgb(0.38, 0.15, 0.15);
 const SEP_COLOR: Color = Color::srgba(0.35, 0.36, 0.48, 0.55);
+
+type UiButtonInteractionQuery<'w, 's> =
+    Query<'w, 's, (&'static Interaction, &'static UiAction), (Changed<Interaction>, With<Button>)>;
+
+type StepButtonColorQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static Interaction, &'static mut BackgroundColor),
+    (Changed<Interaction>, With<UiAction>, Without<ToggleLabel>),
+>;
+
+#[derive(SystemParam)]
+struct ButtonPressParams<'w> {
+    cam: ResMut<'w, OrbitalCamera>,
+    disk: ResMut<'w, DiskConfig>,
+    objects: ResMut<'w, SimObjects>,
+    grid: ResMut<'w, GridVisible>,
+    gravity: ResMut<'w, GravityEnabled>,
+    debug: ResMut<'w, DebugBodiesEnabled>,
+    binary: ResMut<'w, BinaryBlackHoles>,
+    scale: ResMut<'w, RenderScale>,
+    skybox_set: ResMut<'w, SkyboxSet>,
+    skybox_active: ResMut<'w, SkyboxImage>,
+}
 
 // ── Panel setup ──────────────────────────────────────────────────────────────
 
@@ -166,6 +203,37 @@ fn setup_panel(mut commands: Commands) {
                 UiAction::DiskModelPrev,
                 UiAction::DiskModelNext,
                 ValueDisplay::DiskModel,
+            );
+
+            spawn_sep(root);
+
+            spawn_cycle_row(
+                root,
+                "BH",
+                UiAction::BinaryHolePrev,
+                UiAction::BinaryHoleNext,
+                ValueDisplay::BinaryHole,
+            );
+            spawn_step_row(
+                root,
+                "Axis X",
+                UiAction::BinaryAxisXDown,
+                UiAction::BinaryAxisXUp,
+                ValueDisplay::BinaryAxisX,
+            );
+            spawn_step_row(
+                root,
+                "Axis Y",
+                UiAction::BinaryAxisYDown,
+                UiAction::BinaryAxisYUp,
+                ValueDisplay::BinaryAxisY,
+            );
+            spawn_step_row(
+                root,
+                "Axis Z",
+                UiAction::BinaryAxisZDown,
+                UiAction::BinaryAxisZUp,
+                ValueDisplay::BinaryAxisZ,
             );
 
             spawn_sep(root);
@@ -362,119 +430,217 @@ fn spawn_toggle_row(parent: &mut ChildSpawnerCommands, toggles: &[(&str, UiActio
 
 // ── Button press handler ─────────────────────────────────────────────────────
 
-fn handle_button_press(
-    query: Query<(&Interaction, &UiAction), (Changed<Interaction>, With<Button>)>,
-    mut cam: ResMut<OrbitalCamera>,
-    mut disk: ResMut<DiskConfig>,
-    mut objects: ResMut<SimObjects>,
-    mut grid: ResMut<GridVisible>,
-    mut gravity: ResMut<GravityEnabled>,
-    mut debug: ResMut<DebugBodiesEnabled>,
-    mut binary: ResMut<BinaryBlackHoles>,
-    mut scale: ResMut<RenderScale>,
-    mut skybox_set: ResMut<SkyboxSet>,
-    mut skybox_active: ResMut<SkyboxImage>,
-) {
+fn handle_button_press(query: UiButtonInteractionQuery<'_, '_>, mut params: ButtonPressParams) {
     for (interaction, action) in &query {
         if *interaction != Interaction::Pressed {
             continue;
         }
         match action {
             UiAction::SpinDown => {
-                disk.spin = (disk.spin - 0.05).clamp(-0.999, 0.999);
-                rebuild_scene_objects(&disk, &debug, &binary, &mut objects);
-                cam.is_moving = true;
+                if params.binary.enabled {
+                    params.binary.adjust_selected_magnitude(-BINARY_SPIN_STEP);
+                } else {
+                    params.disk.spin = (params.disk.spin - 0.05).clamp(-0.999, 0.999);
+                }
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
             }
             UiAction::SpinUp => {
-                disk.spin = (disk.spin + 0.05).clamp(-0.999, 0.999);
-                rebuild_scene_objects(&disk, &debug, &binary, &mut objects);
-                cam.is_moving = true;
+                if params.binary.enabled {
+                    params.binary.adjust_selected_magnitude(BINARY_SPIN_STEP);
+                } else {
+                    params.disk.spin = (params.disk.spin + 0.05).clamp(-0.999, 0.999);
+                }
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
             }
             UiAction::DiskRadiusDown => {
-                disk.r_outer_rs = (disk.r_outer_rs - 1.0).max(4.0);
-                cam.is_moving = true;
+                params.disk.r_outer_rs = (params.disk.r_outer_rs - 1.0).max(4.0);
+                params.cam.is_moving = true;
             }
             UiAction::DiskRadiusUp => {
-                disk.r_outer_rs = (disk.r_outer_rs + 1.0).min(30.0);
-                cam.is_moving = true;
+                params.disk.r_outer_rs = (params.disk.r_outer_rs + 1.0).min(30.0);
+                params.cam.is_moving = true;
             }
             UiAction::MaxIterDown => {
-                let idx = iter_idx(cam.max_iter);
+                let idx = iter_idx(params.cam.max_iter);
                 if idx > 0 {
-                    cam.max_iter = ITER_PRESETS[idx - 1];
-                    cam.is_moving = true;
+                    params.cam.max_iter = ITER_PRESETS[idx - 1];
+                    params.cam.is_moving = true;
                 }
             }
             UiAction::MaxIterUp => {
-                let idx = iter_idx(cam.max_iter);
+                let idx = iter_idx(params.cam.max_iter);
                 if idx + 1 < ITER_PRESETS.len() {
-                    cam.max_iter = ITER_PRESETS[idx + 1];
-                    cam.is_moving = true;
+                    params.cam.max_iter = ITER_PRESETS[idx + 1];
+                    params.cam.is_moving = true;
                 }
             }
             UiAction::FovDown => {
-                cam.fov_degrees = (cam.fov_degrees - 5.0).clamp(10.0, 170.0);
-                cam.is_moving = true;
+                params.cam.fov_degrees = (params.cam.fov_degrees - 5.0).clamp(10.0, 170.0);
+                params.cam.is_moving = true;
             }
             UiAction::FovUp => {
-                cam.fov_degrees = (cam.fov_degrees + 5.0).clamp(10.0, 170.0);
-                cam.is_moving = true;
+                params.cam.fov_degrees = (params.cam.fov_degrees + 5.0).clamp(10.0, 170.0);
+                params.cam.is_moving = true;
             }
             UiAction::RenderScaleDown => {
-                let idx = scale_idx(scale.0);
+                let idx = scale_idx(params.scale.0);
                 if idx > 0 {
-                    scale.0 = SCALE_PRESETS[idx - 1];
+                    params.scale.0 = SCALE_PRESETS[idx - 1];
                 }
             }
             UiAction::RenderScaleUp => {
-                let idx = scale_idx(scale.0);
+                let idx = scale_idx(params.scale.0);
                 if idx + 1 < SCALE_PRESETS.len() {
-                    scale.0 = SCALE_PRESETS[idx + 1];
+                    params.scale.0 = SCALE_PRESETS[idx + 1];
                 }
             }
             UiAction::SkyboxPrev => {
-                let n = skybox_set.handles.len();
-                skybox_set.current = (skybox_set.current + n - 1) % n;
-                skybox_active.0 = skybox_set.handles[skybox_set.current].clone();
-                cam.is_moving = true;
+                let n = params.skybox_set.handles.len();
+                params.skybox_set.current = (params.skybox_set.current + n - 1) % n;
+                params.skybox_active.0 =
+                    params.skybox_set.handles[params.skybox_set.current].clone();
+                params.cam.is_moving = true;
             }
             UiAction::SkyboxNext => {
-                let n = skybox_set.handles.len();
-                skybox_set.current = (skybox_set.current + 1) % n;
-                skybox_active.0 = skybox_set.handles[skybox_set.current].clone();
-                cam.is_moving = true;
+                let n = params.skybox_set.handles.len();
+                params.skybox_set.current = (params.skybox_set.current + 1) % n;
+                params.skybox_active.0 =
+                    params.skybox_set.handles[params.skybox_set.current].clone();
+                params.cam.is_moving = true;
             }
             UiAction::DiskModelPrev => {
-                let prev = disk.model.prev();
-                let spin = disk.spin;
-                *disk = DiskConfig::for_model(prev, spin);
-                cam.is_moving = true;
+                let prev = params.disk.model.prev();
+                let spin = params.disk.spin;
+                *params.disk = DiskConfig::for_model(prev, spin);
+                params.cam.is_moving = true;
             }
             UiAction::DiskModelNext => {
-                let next = disk.model.next();
-                let spin = disk.spin;
-                *disk = DiskConfig::for_model(next, spin);
-                cam.is_moving = true;
+                let next = params.disk.model.next();
+                let spin = params.disk.spin;
+                *params.disk = DiskConfig::for_model(next, spin);
+                params.cam.is_moving = true;
+            }
+            UiAction::BinaryHolePrev => {
+                params.binary.select_prev();
+                params.cam.is_moving = true;
+            }
+            UiAction::BinaryHoleNext => {
+                params.binary.select_next();
+                params.cam.is_moving = true;
+            }
+            UiAction::BinaryAxisXDown => {
+                params
+                    .binary
+                    .adjust_selected_axis_component(0, -BINARY_AXIS_STEP);
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
+            }
+            UiAction::BinaryAxisXUp => {
+                params
+                    .binary
+                    .adjust_selected_axis_component(0, BINARY_AXIS_STEP);
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
+            }
+            UiAction::BinaryAxisYDown => {
+                params
+                    .binary
+                    .adjust_selected_axis_component(1, -BINARY_AXIS_STEP);
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
+            }
+            UiAction::BinaryAxisYUp => {
+                params
+                    .binary
+                    .adjust_selected_axis_component(1, BINARY_AXIS_STEP);
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
+            }
+            UiAction::BinaryAxisZDown => {
+                params
+                    .binary
+                    .adjust_selected_axis_component(2, -BINARY_AXIS_STEP);
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
+            }
+            UiAction::BinaryAxisZUp => {
+                params
+                    .binary
+                    .adjust_selected_axis_component(2, BINARY_AXIS_STEP);
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
             }
             UiAction::ToggleGrid => {
-                grid.0 = !grid.0;
+                params.grid.0 = !params.grid.0;
             }
             UiAction::ToggleGravity => {
-                gravity.0 = !gravity.0;
+                params.gravity.0 = !params.gravity.0;
             }
             UiAction::ToggleHeatmap => {
-                cam.debug_heatmap = !cam.debug_heatmap;
-                cam.is_moving = true;
+                params.cam.debug_heatmap = !params.cam.debug_heatmap;
+                params.cam.is_moving = true;
             }
             UiAction::ToggleBinary => {
-                binary.enabled = !binary.enabled;
-                rebuild_scene_objects(&disk, &debug, &binary, &mut objects);
-                cam.is_moving = true;
+                params.binary.enabled = !params.binary.enabled;
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
             }
             UiAction::ToggleDebugBodies => {
-                debug.0 = !debug.0;
-                rebuild_scene_objects(&disk, &debug, &binary, &mut objects);
-                cam.is_moving = true;
+                params.debug.0 = !params.debug.0;
+                rebuild_scene_objects(
+                    &params.disk,
+                    &params.debug,
+                    &params.binary,
+                    &mut params.objects,
+                );
+                params.cam.is_moving = true;
             }
         }
     }
@@ -486,7 +652,13 @@ fn rebuild_scene_objects(
     binary: &BinaryBlackHoles,
     objects: &mut SimObjects,
 ) {
-    objects.0 = scene_objects(disk.spin, debug.0, binary.enabled, binary.phase);
+    objects.0 = scene_objects(
+        disk.spin,
+        debug.0,
+        binary.enabled,
+        binary.phase,
+        binary.spins,
+    );
 }
 
 fn iter_idx(max_iter: u32) -> usize {
@@ -508,19 +680,30 @@ fn scale_idx(scale: f32) -> usize {
 fn update_value_displays(
     cam: Res<OrbitalCamera>,
     disk: Res<DiskConfig>,
+    binary: Res<BinaryBlackHoles>,
     scale: Res<RenderScale>,
     skybox_set: Res<SkyboxSet>,
     mut query: Query<(&mut Text, &ValueDisplay)>,
 ) {
     for (mut text, display) in &mut query {
         **text = match display {
-            ValueDisplay::Spin => format!("{:+.2}", disk.spin),
+            ValueDisplay::Spin => {
+                if binary.enabled {
+                    format!("{:.2}", binary.selected_spin().magnitude)
+                } else {
+                    format!("{:+.2}", disk.spin)
+                }
+            }
             ValueDisplay::DiskRadius => format!("{:.0} r_s", disk.r_outer_rs),
             ValueDisplay::MaxIter => format!("{}", cam.max_iter),
             ValueDisplay::Fov => format!("{:.0} deg", cam.fov_degrees),
             ValueDisplay::RenderScale => format!("{:.0}%", scale.0 * 100.0),
             ValueDisplay::Skybox => SKYBOX_NAMES[skybox_set.current].to_string(),
             ValueDisplay::DiskModel => disk.model.short_name().to_string(),
+            ValueDisplay::BinaryHole => binary.selected_label().to_string(),
+            ValueDisplay::BinaryAxisX => format!("{:+.2}", binary.selected_spin().axis.x),
+            ValueDisplay::BinaryAxisY => format!("{:+.2}", binary.selected_spin().axis.y),
+            ValueDisplay::BinaryAxisZ => format!("{:+.2}", binary.selected_spin().axis.z),
         };
     }
 }
@@ -559,12 +742,7 @@ fn update_toggle_buttons(
 
 // ── Arrow button hover colours ───────────────────────────────────────────────
 
-fn step_button_colors(
-    mut query: Query<
-        (&Interaction, &mut BackgroundColor),
-        (Changed<Interaction>, With<UiAction>, Without<ToggleLabel>),
-    >,
-) {
+fn step_button_colors(mut query: StepButtonColorQuery<'_, '_>) {
     for (interaction, mut bg) in &mut query {
         *bg = BackgroundColor(match interaction {
             Interaction::Hovered => BTN_HOVER,

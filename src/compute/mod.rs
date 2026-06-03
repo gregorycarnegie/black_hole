@@ -95,6 +95,7 @@ pub struct ObjectsUniform {
     pub pos_radius: [[f32; 4]; 16],
     pub color: [[f32; 4]; 16],
     pub mass: [[f32; 4]; 16],
+    pub spin: [[f32; 4]; 16],
 }
 
 impl Default for ObjectsUniform {
@@ -105,6 +106,7 @@ impl Default for ObjectsUniform {
             pos_radius: [[0.0; 4]; 16],
             color: [[0.0; 4]; 16],
             mass: [[0.0; 4]; 16],
+            spin: [[0.0; 4]; 16],
         }
     }
 }
@@ -388,6 +390,7 @@ fn sync_objects_uniform(objects: Res<SimObjects>, mut uniform: ResMut<ObjectsUni
         uniform.pos_radius[i] = [obj.position.x, obj.position.y, obj.position.z, obj.radius];
         uniform.color[i] = obj.color.to_array();
         uniform.mass[i] = [obj.mass, 0.0, 0.0, 0.0];
+        uniform.spin[i] = [obj.spin.x, obj.spin.y, obj.spin.z, 0.0];
     }
 }
 
@@ -496,16 +499,61 @@ fn sync_compute_textures(
     );
 }
 
-pub(crate) const SKYBOXES: &[&str] = &[
+pub(crate) const HDR_SKYBOXES: &[&str] = &[
     "hdr/HDR_galactic_plane_1.hdr",
     "hdr/HDR_blue_nebulae_3.hdr",
     "hdr/HDR_white_local_star_and_nebulae.hdr",
 ];
 
-pub(crate) const SKYBOX_NAMES: &[&str] = &["Galactic Plane", "Blue Nebula", "Star Field"];
+pub(crate) const SKYBOX_NAMES: &[&str] = &[
+    "Checker Grid",
+    "Galactic Plane",
+    "Blue Nebula",
+    "Star Field",
+];
 
-fn load_skyboxes(mut commands: Commands, asset_server: Res<AssetServer>) {
-    let handles: Vec<Handle<Image>> = SKYBOXES.iter().map(|p| asset_server.load(*p)).collect();
+fn make_checker_skybox(images: &mut Assets<Image>) -> Handle<Image> {
+    const WIDTH: u32 = 1024;
+    const HEIGHT: u32 = 512;
+    const CHECK_SIZE: u32 = 32;
+
+    let mut data = Vec::with_capacity((WIDTH * HEIGHT * 16) as usize);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let checker = ((x / CHECK_SIZE) + (y / CHECK_SIZE)).is_multiple_of(2);
+            let color = if checker {
+                [8.0_f32, 8.0, 8.0, 1.0]
+            } else {
+                [0.02_f32, 0.02, 0.02, 1.0]
+            };
+            for channel in color {
+                data.extend_from_slice(&channel.to_ne_bytes());
+            }
+        }
+    }
+
+    let mut img = Image::new(
+        Extent3d {
+            width: WIDTH,
+            height: HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba32Float,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    img.texture_descriptor.usage = TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING;
+    images.add(img)
+}
+
+fn load_skyboxes(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let mut handles = vec![make_checker_skybox(&mut images)];
+    handles.extend(HDR_SKYBOXES.iter().map(|p| asset_server.load(*p)));
     commands.insert_resource(SkyboxImage(handles[0].clone()));
     commands.insert_resource(SkyboxSet {
         handles,
@@ -524,6 +572,6 @@ fn cycle_skybox(
         set.current = (set.current + 1) % set.handles.len();
         active.0 = set.handles[set.current].clone();
         cam.is_moving = true; // reset TAA history
-        info!("Skybox: {} ({})", set.current, SKYBOXES[set.current]);
+        info!("Skybox: {} ({})", set.current, SKYBOX_NAMES[set.current]);
     }
 }
