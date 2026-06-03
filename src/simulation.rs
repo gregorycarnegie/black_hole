@@ -1,8 +1,11 @@
 use std::f32::consts::TAU;
 
-use bevy::prelude::*;
+use bevy::{ecs::system::SystemParam, prelude::*};
 
-use crate::camera::OrbitalCamera;
+use crate::{
+    camera::OrbitalCamera,
+    controller::{active_gamepad, axis, stick},
+};
 
 // Re-export so compute::pipeline can keep its existing `use crate::simulation::…` imports.
 pub use black_hole::physics::{SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
@@ -26,6 +29,7 @@ pub const BINARY_AXIS_STEP: f32 = 0.1;
 const BINARY_ORBIT_PERIOD_SECONDS: f32 = 18.0;
 const BLACK_HOLE_SHADOW_RADIUS_MULTIPLIER: f32 = 2.6;
 const MAX_SPIN_MAGNITUDE: f32 = 0.999;
+const GAMEPAD_AXIS_EDIT_SPEED: f32 = 0.8;
 
 /// Accretion-disk geometry regime, selectable at runtime with M.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -319,96 +323,137 @@ pub(crate) fn scene_objects(
 /// | X   | Increase outer disk radius by 1 r_s |
 /// | O   | Toggle debug orbiting bodies        |
 /// | N   | Toggle binary black holes           |
-fn update_disk_config(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut disk: ResMut<DiskConfig>,
-    mut cam: ResMut<OrbitalCamera>,
-    mut objects: ResMut<SimObjects>,
-    debug: Res<DebugBodiesEnabled>,
-    mut binary: ResMut<BinaryBlackHoles>,
-) {
+#[derive(SystemParam)]
+struct DiskInputParams<'w, 's> {
+    keys: Res<'w, ButtonInput<KeyCode>>,
+    time: Res<'w, Time>,
+    gamepads: Query<'w, 's, &'static Gamepad>,
+    disk: ResMut<'w, DiskConfig>,
+    cam: ResMut<'w, OrbitalCamera>,
+    objects: ResMut<'w, SimObjects>,
+    debug: Res<'w, DebugBodiesEnabled>,
+    binary: ResMut<'w, BinaryBlackHoles>,
+}
+
+fn update_disk_config(mut input: DiskInputParams) {
     let mut changed = false;
     let mut rebuild_scene = false;
     let mut selection_changed = false;
+    let mut binary_spin_changed = false;
+    let mut binary_axis_changed = false;
 
-    if keys.just_pressed(KeyCode::KeyQ) {
-        if binary.enabled {
-            binary.adjust_selected_magnitude(-BINARY_SPIN_STEP);
+    let active_gamepad = active_gamepad(&input.gamepads);
+    let gamepad_spin_down =
+        active_gamepad.is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::DPadDown));
+    let gamepad_spin_up =
+        active_gamepad.is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::DPadUp));
+
+    if input.keys.just_pressed(KeyCode::KeyQ) || gamepad_spin_down {
+        if input.binary.enabled {
+            input.binary.adjust_selected_magnitude(-BINARY_SPIN_STEP);
+            binary_spin_changed = true;
         } else {
-            disk.spin = (disk.spin - 0.05).clamp(-MAX_SPIN_MAGNITUDE, MAX_SPIN_MAGNITUDE);
+            input.disk.spin =
+                (input.disk.spin - 0.05).clamp(-MAX_SPIN_MAGNITUDE, MAX_SPIN_MAGNITUDE);
         }
         changed = true;
         rebuild_scene = true;
     }
-    if keys.just_pressed(KeyCode::KeyE) {
-        if binary.enabled {
-            binary.adjust_selected_magnitude(BINARY_SPIN_STEP);
+    if input.keys.just_pressed(KeyCode::KeyE) || gamepad_spin_up {
+        if input.binary.enabled {
+            input.binary.adjust_selected_magnitude(BINARY_SPIN_STEP);
+            binary_spin_changed = true;
         } else {
-            disk.spin = (disk.spin + 0.05).clamp(-MAX_SPIN_MAGNITUDE, MAX_SPIN_MAGNITUDE);
+            input.disk.spin =
+                (input.disk.spin + 0.05).clamp(-MAX_SPIN_MAGNITUDE, MAX_SPIN_MAGNITUDE);
         }
         changed = true;
         rebuild_scene = true;
     }
-    if binary.enabled {
-        if keys.just_pressed(KeyCode::Digit1) {
-            binary.selected = 0;
+    if input.binary.enabled {
+        let gamepad_select_a =
+            active_gamepad.is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::DPadLeft));
+        let gamepad_select_b =
+            active_gamepad.is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::DPadRight));
+        if input.keys.just_pressed(KeyCode::Digit1) || gamepad_select_a {
+            input.binary.selected = 0;
             selection_changed = true;
         }
-        if keys.just_pressed(KeyCode::Digit2) {
-            binary.selected = 1;
+        if input.keys.just_pressed(KeyCode::Digit2) || gamepad_select_b {
+            input.binary.selected = 1;
             selection_changed = true;
         }
+
+        if let Some(gamepad) = active_gamepad {
+            let axis_xy = stick(gamepad.right_stick());
+            let z_axis = axis(
+                gamepad.get(GamepadButton::RightTrigger).unwrap_or(0.0)
+                    - gamepad.get(GamepadButton::LeftTrigger).unwrap_or(0.0),
+            );
+            let axis_delta = Vec3::new(axis_xy.x, axis_xy.y, z_axis)
+                * GAMEPAD_AXIS_EDIT_SPEED
+                * input.time.delta_secs();
+            if axis_delta != Vec3::ZERO {
+                input.binary.adjust_selected_axis_component(0, axis_delta.x);
+                input.binary.adjust_selected_axis_component(1, axis_delta.y);
+                input.binary.adjust_selected_axis_component(2, axis_delta.z);
+                changed = true;
+                rebuild_scene = true;
+                binary_axis_changed = true;
+            }
+        }
     }
-    if keys.just_pressed(KeyCode::KeyZ) {
-        disk.r_outer_rs = (disk.r_outer_rs - 1.0).max(4.0);
+    if input.keys.just_pressed(KeyCode::KeyZ) {
+        input.disk.r_outer_rs = (input.disk.r_outer_rs - 1.0).max(4.0);
         changed = true;
     }
-    if keys.just_pressed(KeyCode::KeyX) {
-        disk.r_outer_rs = (disk.r_outer_rs + 1.0).min(30.0);
+    if input.keys.just_pressed(KeyCode::KeyX) {
+        input.disk.r_outer_rs = (input.disk.r_outer_rs + 1.0).min(30.0);
         changed = true;
     }
-    if keys.just_pressed(KeyCode::KeyM) {
-        let next = disk.model.next();
-        *disk = DiskConfig::for_model(next, disk.spin);
-        info!("Disk model: {}", disk.model.name());
+    if input.keys.just_pressed(KeyCode::KeyM) {
+        let next = input.disk.model.next();
+        let spin = input.disk.spin;
+        *input.disk = DiskConfig::for_model(next, spin);
+        info!("Disk model: {}", input.disk.model.name());
         changed = true;
     }
 
     if changed {
-        if binary.enabled && rebuild_scene {
-            let spin = binary.selected_spin();
+        if input.binary.enabled && binary_spin_changed {
+            let spin = input.binary.selected_spin();
             info!(
                 "Binary hole {} spin: |a*|={:.2}, axis=({:+.2}, {:+.2}, {:+.2})",
-                binary.selected_label(),
+                input.binary.selected_label(),
                 spin.magnitude,
                 spin.axis.x,
                 spin.axis.y,
                 spin.axis.z
             );
-        } else {
+        } else if !input.binary.enabled || !binary_axis_changed {
             info!(
                 "Disk: spin={:.2}, r_outer={:.0} r_s, model={}",
-                disk.spin,
-                disk.r_outer_rs,
-                disk.model.name()
+                input.disk.spin,
+                input.disk.r_outer_rs,
+                input.disk.model.name()
             );
         }
         if rebuild_scene {
-            objects.0 = scene_objects(
-                disk.spin,
-                debug.0,
-                binary.enabled,
-                binary.phase,
-                binary.spins,
+            input.objects.0 = scene_objects(
+                input.disk.spin,
+                input.debug.0,
+                input.binary.enabled,
+                input.binary.phase,
+                input.binary.spins,
             );
         }
         // Trigger TAA reset so the accumulation buffer clears immediately.
-        cam.is_moving = true;
+        input.cam.is_moving = true;
     }
 
     if selection_changed {
-        info!("Binary spin target: hole {}", binary.selected_label());
-        cam.is_moving = true;
+        info!("Binary spin target: hole {}", input.binary.selected_label());
+        input.cam.is_moving = true;
     }
 }
 
@@ -507,13 +552,16 @@ impl Default for BinaryBlackHoles {
 
 fn toggle_binary_black_holes(
     keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
     mut binary: ResMut<BinaryBlackHoles>,
     debug: Res<DebugBodiesEnabled>,
     disk: Res<DiskConfig>,
     mut objects: ResMut<SimObjects>,
     mut cam: ResMut<OrbitalCamera>,
 ) {
-    if keys.just_pressed(KeyCode::KeyN) {
+    let gamepad_pressed_b =
+        active_gamepad(&gamepads).is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::East));
+    if keys.just_pressed(KeyCode::KeyN) || gamepad_pressed_b {
         binary.enabled = !binary.enabled;
         objects.0 = scene_objects(
             disk.spin,
@@ -530,8 +578,14 @@ fn toggle_binary_black_holes(
     }
 }
 
-fn toggle_gravity(keys: Res<ButtonInput<KeyCode>>, mut gravity: ResMut<GravityEnabled>) {
-    if keys.just_pressed(KeyCode::KeyG) {
+fn toggle_gravity(
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut gravity: ResMut<GravityEnabled>,
+) {
+    let gamepad_pressed_select = active_gamepad(&gamepads)
+        .is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::Select));
+    if keys.just_pressed(KeyCode::KeyG) || gamepad_pressed_select {
         gravity.0 = !gravity.0;
         info!("Gravity: {}", if gravity.0 { "ON" } else { "OFF" });
     }
@@ -539,13 +593,16 @@ fn toggle_gravity(keys: Res<ButtonInput<KeyCode>>, mut gravity: ResMut<GravityEn
 
 fn toggle_debug_bodies(
     keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
     mut enabled: ResMut<DebugBodiesEnabled>,
     disk: Res<DiskConfig>,
     binary: Res<BinaryBlackHoles>,
     mut objects: ResMut<SimObjects>,
     mut cam: ResMut<OrbitalCamera>,
 ) {
-    if keys.just_pressed(KeyCode::KeyO) {
+    let gamepad_pressed_start =
+        active_gamepad(&gamepads).is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::Start));
+    if keys.just_pressed(KeyCode::KeyO) || gamepad_pressed_start {
         enabled.0 = !enabled.0;
         objects.0 = scene_objects(
             disk.spin,

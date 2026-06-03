@@ -19,6 +19,7 @@ use accumulate::{AccumulateNode, init_accumulate_pipeline, prepare_accumulate_bi
 
 use crate::{
     camera::OrbitalCamera,
+    controller::active_gamepad,
     simulation::{BinaryBlackHoles, DiskConfig, KERR_SPIN, SimObjects},
 };
 
@@ -564,11 +565,14 @@ fn load_skyboxes(
 /// Press B to cycle through the loaded HDR skyboxes.
 fn cycle_skybox(
     keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
     mut set: ResMut<SkyboxSet>,
     mut active: ResMut<SkyboxImage>,
     mut cam: ResMut<OrbitalCamera>,
 ) {
-    if keys.just_pressed(KeyCode::KeyB) {
+    let gamepad_pressed_a =
+        active_gamepad(&gamepads).is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::South));
+    if keys.just_pressed(KeyCode::KeyB) || gamepad_pressed_a {
         set.current = (set.current + 1) % set.handles.len();
         active.0 = set.handles[set.current].clone();
         cam.is_moving = true; // reset TAA history

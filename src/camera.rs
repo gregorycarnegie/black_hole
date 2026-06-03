@@ -4,7 +4,12 @@ use bevy::{
 };
 use std::f64::consts::PI;
 
+use crate::controller::{active_gamepad, axis, stick};
+
 pub struct OrbitalCameraPlugin;
+
+const GAMEPAD_ORBIT_SPEED: f64 = 1.8;
+const GAMEPAD_ZOOM_SPEED_MULTIPLIER: f64 = 8.0;
 
 impl Plugin for OrbitalCameraPlugin {
     fn build(&self, app: &mut App) {
@@ -128,6 +133,8 @@ fn update_orbital_camera(
     mouse_motion: Res<AccumulatedMouseMotion>,
     scroll: Res<AccumulatedMouseScroll>,
     keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    gamepads: Query<&Gamepad>,
 ) {
     cam.dragging = mouse_button.pressed(MouseButton::Left);
     cam.is_moving = false;
@@ -144,6 +151,28 @@ fn update_orbital_camera(
         cam.radius -= scroll.delta.y as f64 * cam.zoom_speed;
         cam.radius = cam.radius.clamp(cam.min_radius, cam.max_radius);
         cam.is_moving = true;
+    }
+
+    if let Some(gamepad) = active_gamepad(&gamepads) {
+        let left_stick = stick(gamepad.left_stick());
+        if left_stick != Vec2::ZERO {
+            let dt = time.delta_secs_f64();
+            cam.azimuth += left_stick.x as f64 * GAMEPAD_ORBIT_SPEED * dt;
+            cam.elevation -= left_stick.y as f64 * GAMEPAD_ORBIT_SPEED * dt;
+            cam.elevation = cam.elevation.clamp(0.01, PI - 0.01);
+            cam.is_moving = true;
+        }
+
+        let zoom_input = axis(gamepad.get(GamepadButton::RightTrigger2).unwrap_or(0.0))
+            - axis(gamepad.get(GamepadButton::LeftTrigger2).unwrap_or(0.0));
+        if zoom_input != 0.0 {
+            cam.radius -= zoom_input as f64
+                * cam.zoom_speed
+                * GAMEPAD_ZOOM_SPEED_MULTIPLIER
+                * time.delta_secs_f64();
+            cam.radius = cam.radius.clamp(cam.min_radius, cam.max_radius);
+            cam.is_moving = true;
+        }
     }
 
     if keys.just_pressed(KeyCode::BracketLeft) {
@@ -181,8 +210,14 @@ fn cycle_max_iter(keys: Res<ButtonInput<KeyCode>>, mut cam: ResMut<OrbitalCamera
 }
 
 /// Press H to toggle the GPU iteration-count heatmap. Resets TAA history.
-fn toggle_heatmap(keys: Res<ButtonInput<KeyCode>>, mut cam: ResMut<OrbitalCamera>) {
-    if keys.just_pressed(KeyCode::KeyH) {
+fn toggle_heatmap(
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut cam: ResMut<OrbitalCamera>,
+) {
+    let gamepad_pressed_y =
+        active_gamepad(&gamepads).is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::North));
+    if keys.just_pressed(KeyCode::KeyH) || gamepad_pressed_y {
         cam.debug_heatmap = !cam.debug_heatmap;
         cam.is_moving = true;
         info!("Heatmap: {}", if cam.debug_heatmap { "ON" } else { "OFF" });

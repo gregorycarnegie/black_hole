@@ -20,6 +20,8 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 
 ## Controls
 
+### Keyboard / Mouse
+
 | Input           | Action                                         |
 |-----------------|------------------------------------------------|
 | Left mouse drag | Orbit camera                                   |
@@ -37,6 +39,23 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 | B               | Cycle HDR skybox                               |
 | `,` / `.`       | Decrease / increase max geodesic iterations    |
 | H               | Toggle iteration-count heatmap                 |
+
+### Xbox Controller
+
+| Input            | Action                                      |
+|------------------|---------------------------------------------|
+| Left stick       | Orbit camera                                |
+| RT / LT          | Zoom in / out                               |
+| A                | Cycle skybox                                |
+| B                | Toggle binary black holes                   |
+| X                | Toggle spacetime grid                       |
+| Y                | Toggle iteration-count heatmap              |
+| Select           | Toggle n-body gravity                       |
+| Start            | Toggle debug bodies                         |
+| D-pad left/right | Select binary black hole A / B              |
+| D-pad up/down    | Increase / decrease selected-hole spin a*   |
+| Right stick      | Adjust selected-hole spin-axis X / Y        |
+| RB / LB          | Increase / decrease selected-hole spin-axis Z |
 
 ## Building
 

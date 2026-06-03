@@ -5,6 +5,7 @@ use bevy::{
 
 mod camera;
 mod compute;
+mod controller;
 mod grid;
 mod simulation;
 mod ui;

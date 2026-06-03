@@ -2,6 +2,7 @@ use bevy::prelude::*;
 
 use crate::{
     camera::OrbitalCamera,
+    controller::active_gamepad,
     simulation::{C, G_CONST, SimObjects},
 };
 
@@ -25,8 +26,14 @@ impl Default for GridVisible {
     }
 }
 
-fn toggle_grid(keys: Res<ButtonInput<KeyCode>>, mut visible: ResMut<GridVisible>) {
-    if keys.just_pressed(KeyCode::KeyF) {
+fn toggle_grid(
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut visible: ResMut<GridVisible>,
+) {
+    let gamepad_pressed_x =
+        active_gamepad(&gamepads).is_some_and(|gamepad| gamepad.just_pressed(GamepadButton::West));
+    if keys.just_pressed(KeyCode::KeyF) || gamepad_pressed_x {
         visible.0 = !visible.0;
         info!("Grid: {}", if visible.0 { "visible" } else { "hidden" });
     }
