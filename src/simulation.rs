@@ -1,3 +1,5 @@
+use std::f32::consts::TAU;
+
 use bevy::prelude::*;
 
 use crate::camera::OrbitalCamera;
@@ -11,6 +13,15 @@ pub const SAGA_MASS: f64 = 8.54e36;
 
 /// Default dimensionless Kerr spin parameter a* = J/M². Positive = prograde.
 pub const KERR_SPIN: f32 = 0.82;
+
+/// Center-to-center separation of the binary black holes, in units of SAGA_RS.
+pub const BINARY_SEPARATION_RS: f32 = 7.0;
+
+/// Inner radius used for the circumbinary disk cavity, in units of SAGA_RS.
+pub const BINARY_DISK_INNER_RS: f32 = 5.0;
+
+const BINARY_ORBIT_PERIOD_SECONDS: f32 = 18.0;
+const BLACK_HOLE_SHADOW_RADIUS_MULTIPLIER: f32 = 2.6;
 
 /// Accretion-disk geometry regime, selectable at runtime with M.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -161,9 +172,20 @@ impl Plugin for SimulationPlugin {
         app.init_resource::<SimObjects>()
             .init_resource::<GravityEnabled>()
             .init_resource::<DebugBodiesEnabled>()
+            .init_resource::<BinaryBlackHoles>()
             .init_resource::<DiskConfig>()
-            .add_systems(Update, (toggle_gravity, gravity_system).chain())
-            .add_systems(Update, (toggle_debug_bodies, update_disk_config).chain());
+            .add_systems(
+                Update,
+                (
+                    toggle_binary_black_holes,
+                    toggle_gravity,
+                    toggle_debug_bodies,
+                    update_disk_config,
+                    gravity_system,
+                    animate_binary_black_holes,
+                )
+                    .chain(),
+            );
     }
 }
 
@@ -182,21 +204,47 @@ pub struct SimObjects(pub Vec<SimObject>);
 
 impl Default for SimObjects {
     fn default() -> Self {
-        Self(scene_objects(KERR_SPIN, false))
+        Self(scene_objects(KERR_SPIN, false, true, 0.0))
     }
 }
 
-fn black_hole_object(spin: f32) -> SimObject {
+fn black_hole_shadow_radius(spin: f32, mass_fraction: f32) -> f32 {
+    kerr_horizon_radius(spin) * mass_fraction * BLACK_HOLE_SHADOW_RADIUS_MULTIPLIER
+}
+
+fn black_hole_object(spin: f32, mass_fraction: f32, position: Vec3, velocity: Vec3) -> SimObject {
     SimObject {
-        position: Vec3::ZERO,
-        radius: kerr_horizon_radius(spin),
+        position,
+        radius: black_hole_shadow_radius(spin, mass_fraction),
         color: Vec4::new(0., 0., 0., 1.),
-        mass: SAGA_MASS as f32,
-        velocity: Vec3::ZERO,
+        mass: SAGA_MASS as f32 * mass_fraction,
+        velocity,
     }
 }
 
-pub(crate) fn scene_objects(spin: f32, include_debug_bodies: bool) -> Vec<SimObject> {
+fn binary_black_holes(spin: f32, phase: f32) -> [SimObject; 2] {
+    let orbital_radius = 0.5 * BINARY_SEPARATION_RS * SAGA_RS;
+    let angular_velocity = TAU / BINARY_ORBIT_PERIOD_SECONDS;
+    let (sin_phase, cos_phase) = phase.sin_cos();
+    let position = Vec3::new(cos_phase * orbital_radius, 0.0, sin_phase * orbital_radius);
+    let velocity = Vec3::new(
+        -sin_phase * orbital_radius * angular_velocity,
+        0.0,
+        cos_phase * orbital_radius * angular_velocity,
+    );
+
+    [
+        black_hole_object(spin, 0.5, position, velocity),
+        black_hole_object(spin, 0.5, -position, -velocity),
+    ]
+}
+
+pub(crate) fn scene_objects(
+    spin: f32,
+    include_debug_bodies: bool,
+    binary_enabled: bool,
+    binary_phase: f32,
+) -> Vec<SimObject> {
     let mut objects = Vec::new();
 
     if include_debug_bodies {
@@ -218,8 +266,11 @@ pub(crate) fn scene_objects(spin: f32, include_debug_bodies: bool) -> Vec<SimObj
         ]);
     }
 
-    // Keep the black hole last so systems can update its radius cheaply.
-    objects.push(black_hole_object(spin));
+    if binary_enabled {
+        objects.extend(binary_black_holes(spin, binary_phase));
+    } else {
+        objects.push(black_hole_object(spin, 1.0, Vec3::ZERO, Vec3::ZERO));
+    }
     objects
 }
 
@@ -232,21 +283,27 @@ pub(crate) fn scene_objects(spin: f32, include_debug_bodies: bool) -> Vec<SimObj
 /// | Z   | Decrease outer disk radius by 1 r_s |
 /// | X   | Increase outer disk radius by 1 r_s |
 /// | O   | Toggle debug orbiting bodies        |
+/// | N   | Toggle binary black holes           |
 fn update_disk_config(
     keys: Res<ButtonInput<KeyCode>>,
     mut disk: ResMut<DiskConfig>,
     mut cam: ResMut<OrbitalCamera>,
     mut objects: ResMut<SimObjects>,
+    debug: Res<DebugBodiesEnabled>,
+    binary: Res<BinaryBlackHoles>,
 ) {
     let mut changed = false;
+    let mut rebuild_scene = false;
 
     if keys.just_pressed(KeyCode::KeyQ) {
         disk.spin = (disk.spin - 0.05).clamp(-0.999, 0.999);
         changed = true;
+        rebuild_scene = true;
     }
     if keys.just_pressed(KeyCode::KeyE) {
         disk.spin = (disk.spin + 0.05).clamp(-0.999, 0.999);
         changed = true;
+        rebuild_scene = true;
     }
     if keys.just_pressed(KeyCode::KeyZ) {
         disk.r_outer_rs = (disk.r_outer_rs - 1.0).max(4.0);
@@ -270,9 +327,8 @@ fn update_disk_config(
             disk.r_outer_rs,
             disk.model.name()
         );
-        // Keep the black hole sphere radius in sync with the new horizon.
-        if let Some(bh) = objects.0.last_mut() {
-            bh.radius = kerr_horizon_radius(disk.spin);
+        if rebuild_scene {
+            objects.0 = scene_objects(disk.spin, debug.0, binary.enabled, binary.phase);
         }
         // Trigger TAA reset so the accumulation buffer clears immediately.
         cam.is_moving = true;
@@ -285,6 +341,40 @@ pub struct GravityEnabled(pub bool);
 #[derive(Resource, Default)]
 pub struct DebugBodiesEnabled(pub bool);
 
+#[derive(Resource, Clone, Debug)]
+pub struct BinaryBlackHoles {
+    pub enabled: bool,
+    pub phase: f32,
+}
+
+impl Default for BinaryBlackHoles {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            phase: 0.0,
+        }
+    }
+}
+
+fn toggle_binary_black_holes(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut binary: ResMut<BinaryBlackHoles>,
+    debug: Res<DebugBodiesEnabled>,
+    disk: Res<DiskConfig>,
+    mut objects: ResMut<SimObjects>,
+    mut cam: ResMut<OrbitalCamera>,
+) {
+    if keys.just_pressed(KeyCode::KeyN) {
+        binary.enabled = !binary.enabled;
+        objects.0 = scene_objects(disk.spin, debug.0, binary.enabled, binary.phase);
+        cam.is_moving = true;
+        info!(
+            "Binary black holes: {}",
+            if binary.enabled { "ON" } else { "OFF" }
+        );
+    }
+}
+
 fn toggle_gravity(keys: Res<ButtonInput<KeyCode>>, mut gravity: ResMut<GravityEnabled>) {
     if keys.just_pressed(KeyCode::KeyG) {
         gravity.0 = !gravity.0;
@@ -296,19 +386,24 @@ fn toggle_debug_bodies(
     keys: Res<ButtonInput<KeyCode>>,
     mut enabled: ResMut<DebugBodiesEnabled>,
     disk: Res<DiskConfig>,
+    binary: Res<BinaryBlackHoles>,
     mut objects: ResMut<SimObjects>,
     mut cam: ResMut<OrbitalCamera>,
 ) {
     if keys.just_pressed(KeyCode::KeyO) {
         enabled.0 = !enabled.0;
-        objects.0 = scene_objects(disk.spin, enabled.0);
+        objects.0 = scene_objects(disk.spin, enabled.0, binary.enabled, binary.phase);
         cam.is_moving = true;
         info!("Debug bodies: {}", if enabled.0 { "ON" } else { "OFF" });
     }
 }
 
-fn gravity_system(mut objects: ResMut<SimObjects>, gravity: Res<GravityEnabled>) {
-    if !gravity.0 {
+fn gravity_system(
+    mut objects: ResMut<SimObjects>,
+    gravity: Res<GravityEnabled>,
+    binary: Res<BinaryBlackHoles>,
+) {
+    if !gravity.0 || binary.enabled {
         return;
     }
 
@@ -335,4 +430,22 @@ fn gravity_system(mut objects: ResMut<SimObjects>, gravity: Res<GravityEnabled>)
         obj.velocity += accelerations[i];
         obj.position += obj.velocity;
     }
+}
+
+fn animate_binary_black_holes(
+    time: Res<Time>,
+    mut binary: ResMut<BinaryBlackHoles>,
+    debug: Res<DebugBodiesEnabled>,
+    disk: Res<DiskConfig>,
+    mut objects: ResMut<SimObjects>,
+    mut cam: ResMut<OrbitalCamera>,
+) {
+    if !binary.enabled {
+        return;
+    }
+
+    binary.phase =
+        (binary.phase + time.delta_secs() * TAU / BINARY_ORBIT_PERIOD_SECONDS).rem_euclid(TAU);
+    objects.0 = scene_objects(disk.spin, debug.0, true, binary.phase);
+    cam.is_moving = true;
 }

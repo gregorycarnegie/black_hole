@@ -18,7 +18,7 @@ use bevy::{
 use bytemuck::Zeroable;
 
 use super::{CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform, SkyboxImage};
-use crate::simulation::{SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
+use crate::simulation::{BINARY_DISK_INNER_RS, SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
 
@@ -60,10 +60,10 @@ struct GpuDiskUniform {
     r_bp: f32,      // Bardeen-Petterson alignment radius (metres)
     twist_deg: f32, // twist per ln(r/r_bp) (degrees)
     model: u32,     // 0=ThinNT 1=TruncHot 2=Slim 3=Warped
+    binary_enabled: u32,
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
-    _pad3: f32,
 }
 
 /// Matches the Objects uniform in geodesic.wgsl.
@@ -169,8 +169,13 @@ pub fn init_geodesic_pipeline(
 fn build_disk_uniform(cfg: &DiskConfigUniform) -> GpuDiskUniform {
     let isco_r = kerr_isco_radius(cfg.spin);
     let horizon_r = kerr_horizon_radius(cfg.spin);
+    let inner_r = if cfg.binary_enabled {
+        (SAGA_RS * BINARY_DISK_INNER_RS).max(isco_r)
+    } else {
+        isco_r
+    };
     GpuDiskUniform {
-        r1: isco_r,
+        r1: inner_r,
         r2: SAGA_RS * cfg.r_outer_rs,
         h_thin: cfg.h_thin,
         h_hot: cfg.h_hot,
@@ -182,10 +187,10 @@ fn build_disk_uniform(cfg: &DiskConfigUniform) -> GpuDiskUniform {
         r_bp: SAGA_RS * cfg.r_bp_rs,
         twist_deg: cfg.twist_deg,
         model: cfg.model,
+        binary_enabled: cfg.binary_enabled as u32,
         _pad0: 0.0,
         _pad1: 0.0,
         _pad2: 0.0,
-        _pad3: 0.0,
     }
 }
 

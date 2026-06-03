@@ -36,10 +36,10 @@ struct Disk {
     r_bp:      f32,   // Bardeen-Petterson alignment radius (Warped)
     twist_deg: f32,   // azimuthal twist per ln(r/r_bp) in degrees (Warped)
     model:     u32,   // 0=ThinNT  1=TruncHot  2=Slim  3=Warped
+    binary_enabled: u32,
     _pad0:     f32,
     _pad1:     f32,
     _pad2:     f32,
-    _pad3:     f32,
 }
 @group(0) @binding(2) var<uniform> disk: Disk;
 
@@ -69,6 +69,9 @@ const D_LAMBDA_MAX:   f32 = 1.0e10;
 const ESCAPE_R:       f32 = 1.0e13;
 const SIN2_FLOOR:     f32 = 1.0e-6;
 const DELTA_FLOOR:    f32 = 1.0e-5;
+const SAGA_MASS:      f32 = 8.54e36;
+const BINARY_TRACE_STEPS: u32 = 768u;
+const BINARY_BEND_MULTIPLIER: f32 = 2.0;
 
 // -- Kerr metric helpers -----------------------------------------------------
 
@@ -360,13 +363,17 @@ fn step_ray(ray: Ray, dL: f32, a: f32) -> Ray {
 
 struct ObjectHit { hit: bool, color: vec4<f32>, center: vec3<f32>, radius: f32 }
 
-fn intersect_objects(pos: vec3<f32>) -> ObjectHit {
+fn intersect_objects_segment(start: vec3<f32>, end: vec3<f32>) -> ObjectHit {
     var result: ObjectHit;
     result.hit = false;
+    let segment = end - start;
+    let segment_len2 = max(dot(segment, segment), 1.0);
     for (var i = 0; i < objects.num_objects; i++) {
         let center = objects.pos_radius[i].xyz;
         let radius = objects.pos_radius[i].w;
-        let offset = pos - center;
+        let t = clamp(dot(center - start, segment) / segment_len2, 0.0, 1.0);
+        let closest = start + segment * t;
+        let offset = closest - center;
         if radius >= 0.0 && dot(offset, offset) <= radius * radius {
             result.hit = true;
             result.color = objects.color[i];
@@ -564,6 +571,76 @@ fn sample_skybox(dir: vec3<f32>) -> vec3<f32> {
     return hdr / (hdr + vec3<f32>(1.0));
 }
 
+// Binary mode uses a superposed Schwarzschild weak-field null-geodesic
+// approximation. It has no origin-centred Kerr horizon and no accretion disk.
+fn object_schwarzschild_radius(i: i32) -> f32 {
+    let mass_fraction = max(objects.mass[i].x / SAGA_MASS, 0.0);
+    return SAGA_RS * mass_fraction;
+}
+
+fn nearest_object_clearance(pos: vec3<f32>) -> f32 {
+    var nearest = ESCAPE_R;
+    for (var i = 0; i < objects.num_objects; i++) {
+        let center = objects.pos_radius[i].xyz;
+        let radius = max(objects.pos_radius[i].w, SAGA_RS * 0.05);
+        nearest = min(nearest, max(length(pos - center) - radius, 0.0));
+    }
+    return nearest;
+}
+
+fn binary_deflection(pos: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
+    var bend = vec3<f32>(0.0);
+    for (var i = 0; i < objects.num_objects; i++) {
+        let center = objects.pos_radius[i].xyz;
+        let radius = max(objects.pos_radius[i].w, SAGA_RS * 0.05);
+        let to_center = center - pos;
+        let r2 = max(dot(to_center, to_center), radius * radius);
+        let r = sqrt(r2);
+        let transverse = to_center - dot(to_center, dir) * dir;
+        bend += BINARY_BEND_MULTIPLIER * object_schwarzschild_radius(i) * transverse / max(r2 * r, 1.0);
+    }
+    return bend;
+}
+
+fn shade_object_hit(hit: ObjectHit, p: vec3<f32>) -> vec3<f32> {
+    let n = normalize(p - hit.center);
+    let view = normalize(cam.pos - p);
+    let diff = max(dot(n, view), 0.0);
+    let intensity = 0.1 + 0.9 * diff;
+    return hit.color.rgb * intensity;
+}
+
+struct BinaryTrace {
+    rgb: vec3<f32>,
+    iter_count: u32,
+}
+
+fn trace_binary_scene(origin: vec3<f32>, initial_dir: vec3<f32>) -> BinaryTrace {
+    var pos = origin;
+    var dir = initial_dir;
+    var iter_count = 0u;
+
+    for (var i = 0u; i < BINARY_TRACE_STEPS; i++) {
+        iter_count = i + 1u;
+        let clearance = nearest_object_clearance(pos);
+        let ds = clamp(clearance * 0.08, D_LAMBDA_BASE * 25.0, D_LAMBDA_MAX);
+        dir = normalize(dir + binary_deflection(pos, dir) * ds);
+
+        let new_pos = pos + dir * ds;
+        let hit = intersect_objects_segment(pos, new_pos);
+        if hit.hit {
+            return BinaryTrace(shade_object_hit(hit, new_pos), iter_count);
+        }
+
+        pos = new_pos;
+        if length(pos) > ESCAPE_R {
+            break;
+        }
+    }
+
+    return BinaryTrace(sample_skybox(dir), iter_count);
+}
+
 // -- Debug heatmap -----------------------------------------------------------
 
 // Maps t ∈ [0, 1] to a black→red→yellow→white gradient.
@@ -588,6 +665,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let v = (1.0 - 2.0 * (f32(pix.y) + 0.5 + cam.jitter_y) / f32(dims.y)) * cam.tan_half_fov;
     let dir = normalize(u * cam.right - v * cam.up + cam.forward);
 
+    if disk.binary_enabled != 0u {
+        let traced = trace_binary_scene(cam.pos, dir);
+        if cam.debug_heatmap != 0u {
+            let t = f32(traced.iter_count) / f32(BINARY_TRACE_STEPS);
+            textureStore(out_image, pix, vec4<f32>(heatmap_color(t), 1.0));
+            return;
+        }
+        textureStore(out_image, pix, vec4<f32>(traced.rgb, 1.0));
+        return;
+    }
+
     let spin_a = spin_clamped();
     let spin_a2 = spin_a * spin_a;
     let disk_r1_2 = disk.r1 * disk.r1;
@@ -602,7 +690,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var disk_accum = 0.0;
     var any_disk = false;
 
-    var hit_black_hole = false;
     var hit_object = false;
     var obj_hit: ObjectHit;
     var passed_ergosphere = false;
@@ -611,11 +698,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     for (var i = 0; i < i32(cam.max_iter); i++) {
         iter_count = u32(i) + 1u;
-        if ray.r <= disk.horizon_r {
-            hit_black_hole = true;
-            break;
-        }
-
         let static_limit = kerr_static_limit(ray.theta, spin_a2);
         if ray.r < static_limit {
             passed_ergosphere = true;
@@ -664,7 +746,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
-        obj_hit = intersect_objects(new_pos);
+        obj_hit = intersect_objects_segment(prev_pos, new_pos);
         if obj_hit.hit { hit_object = true; break; }
 
         prev_pos = new_pos;
@@ -678,9 +760,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     var scene_rgb: vec3<f32>;
-    if hit_black_hole {
-        scene_rgb = vec3<f32>(0.0);
-    } else if hit_object {
+    if hit_object {
         let p = vec3<f32>(ray.x, ray.y, ray.z);
         let n = normalize(p - obj_hit.center);
         let view = normalize(cam.pos - p);

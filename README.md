@@ -7,15 +7,16 @@
 
 Real-time black hole visualization using GPU ray-tracing in Bevy (Rust).
 
-Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagittarius A*, with an accretion disk and a deformed spacetime grid.
+Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagittarius A*, with a default binary black-hole scene, an accretion disk, and a deformed spacetime grid.
 
 ## Features
 
 1. **GPU ray-tracing** — compute shader integrates null geodesics using RK4 in spin-aligned Kerr coordinates
 2. **Accretion disk** — four switchable geometry presets (thin NT, truncated thin + hot flow, slim/super-Eddington, warped Bardeen-Petterson) with Kerr ISCO, frame dragging, Doppler beaming, and gravitational redshift
 3. **Spacetime grid** — wireframe grid deformed by the Schwarzschild metric of each massive object
-4. **N-body gravity** — optional Newtonian gravity simulation between scene objects
-5. **HDR skyboxes** — equirectangular space backgrounds sampled along each ray's lensed escape direction
+4. **Binary black holes** — equal-mass black-hole silhouettes orbit a shared barycentre with a circumbinary disk cavity
+5. **N-body gravity** — optional Newtonian gravity simulation between scene objects
+6. **HDR skyboxes** — equirectangular space backgrounds sampled along each ray's lensed escape direction
 
 ## Controls
 
@@ -29,6 +30,7 @@ Simulates null geodesics (light paths) in Kerr spacetime around a spinning Sagit
 | Z / X           | Decrease / increase outer disk radius (±1 r_s) |
 | M               | Cycle disk geometry preset                     |
 | F               | Toggle spacetime grid                          |
+| N               | Toggle binary black holes                      |
 | G               | Toggle n-body gravity                          |
 | O               | Toggle debug bodies                            |
 | B               | Cycle HDR skybox                               |

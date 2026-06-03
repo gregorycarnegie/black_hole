@@ -1,12 +1,11 @@
 use bevy::prelude::*;
 
 use crate::{
-    camera::{OrbitalCamera, ITER_PRESETS},
-    compute::{RenderScale, SkyboxImage, SkyboxSet, SCALE_PRESETS, SKYBOX_NAMES},
+    camera::{ITER_PRESETS, OrbitalCamera},
+    compute::{RenderScale, SCALE_PRESETS, SKYBOX_NAMES, SkyboxImage, SkyboxSet},
     grid::GridVisible,
     simulation::{
-        DiskConfig, DebugBodiesEnabled, GravityEnabled, SimObjects, kerr_horizon_radius,
-        scene_objects,
+        BinaryBlackHoles, DebugBodiesEnabled, DiskConfig, GravityEnabled, SimObjects, scene_objects,
     },
 };
 
@@ -47,6 +46,7 @@ enum UiAction {
     ToggleGrid,
     ToggleGravity,
     ToggleHeatmap,
+    ToggleBinary,
     ToggleDebugBodies,
 }
 
@@ -68,6 +68,7 @@ enum ToggleLabel {
     Grid,
     Gravity,
     Heatmap,
+    Binary,
     DebugBodies,
 }
 
@@ -105,39 +106,102 @@ fn setup_panel(mut commands: Commands) {
         .with_children(|root| {
             root.spawn((
                 Text::new("CONTROLS"),
-                TextFont { font_size: 11.0, ..default() },
+                TextFont {
+                    font_size: 11.0,
+                    ..default()
+                },
                 TextColor(HEADER_COLOR),
             ));
 
             spawn_sep(root);
 
-            spawn_step_row(root, "Spin a*", UiAction::SpinDown, UiAction::SpinUp, ValueDisplay::Spin);
-            spawn_step_row(root, "Outer R", UiAction::DiskRadiusDown, UiAction::DiskRadiusUp, ValueDisplay::DiskRadius);
-            spawn_step_row(root, "Iterations", UiAction::MaxIterDown, UiAction::MaxIterUp, ValueDisplay::MaxIter);
-            spawn_step_row(root, "FOV", UiAction::FovDown, UiAction::FovUp, ValueDisplay::Fov);
-            spawn_step_row(root, "Render %", UiAction::RenderScaleDown, UiAction::RenderScaleUp, ValueDisplay::RenderScale);
+            spawn_step_row(
+                root,
+                "Spin a*",
+                UiAction::SpinDown,
+                UiAction::SpinUp,
+                ValueDisplay::Spin,
+            );
+            spawn_step_row(
+                root,
+                "Outer R",
+                UiAction::DiskRadiusDown,
+                UiAction::DiskRadiusUp,
+                ValueDisplay::DiskRadius,
+            );
+            spawn_step_row(
+                root,
+                "Iterations",
+                UiAction::MaxIterDown,
+                UiAction::MaxIterUp,
+                ValueDisplay::MaxIter,
+            );
+            spawn_step_row(
+                root,
+                "FOV",
+                UiAction::FovDown,
+                UiAction::FovUp,
+                ValueDisplay::Fov,
+            );
+            spawn_step_row(
+                root,
+                "Render %",
+                UiAction::RenderScaleDown,
+                UiAction::RenderScaleUp,
+                ValueDisplay::RenderScale,
+            );
 
             spawn_sep(root);
 
-            spawn_cycle_row(root, "Skybox", UiAction::SkyboxPrev, UiAction::SkyboxNext, ValueDisplay::Skybox);
-            spawn_cycle_row(root, "Disk", UiAction::DiskModelPrev, UiAction::DiskModelNext, ValueDisplay::DiskModel);
+            spawn_cycle_row(
+                root,
+                "Skybox",
+                UiAction::SkyboxPrev,
+                UiAction::SkyboxNext,
+                ValueDisplay::Skybox,
+            );
+            spawn_cycle_row(
+                root,
+                "Disk",
+                UiAction::DiskModelPrev,
+                UiAction::DiskModelNext,
+                ValueDisplay::DiskModel,
+            );
 
             spawn_sep(root);
 
-            spawn_toggle_row(root, &[
-                ("Grid", UiAction::ToggleGrid, ToggleLabel::Grid),
-                ("Gravity", UiAction::ToggleGravity, ToggleLabel::Gravity),
-            ]);
-            spawn_toggle_row(root, &[
-                ("Heatmap", UiAction::ToggleHeatmap, ToggleLabel::Heatmap),
-                ("Debug", UiAction::ToggleDebugBodies, ToggleLabel::DebugBodies),
-            ]);
+            spawn_toggle_row(
+                root,
+                &[
+                    ("Grid", UiAction::ToggleGrid, ToggleLabel::Grid),
+                    ("Binary", UiAction::ToggleBinary, ToggleLabel::Binary),
+                ],
+            );
+            spawn_toggle_row(
+                root,
+                &[
+                    ("Gravity", UiAction::ToggleGravity, ToggleLabel::Gravity),
+                    ("Heatmap", UiAction::ToggleHeatmap, ToggleLabel::Heatmap),
+                ],
+            );
+            spawn_toggle_row(
+                root,
+                &[(
+                    "Debug",
+                    UiAction::ToggleDebugBodies,
+                    ToggleLabel::DebugBodies,
+                )],
+            );
         });
 }
 
 fn spawn_sep(parent: &mut ChildSpawnerCommands) {
     parent.spawn((
-        Node { height: Val::Px(1.0), width: Val::Percent(100.0), ..default() },
+        Node {
+            height: Val::Px(1.0),
+            width: Val::Percent(100.0),
+            ..default()
+        },
         BackgroundColor(SEP_COLOR),
     ));
 }
@@ -158,16 +222,29 @@ fn spawn_step_row(
         })
         .with_children(|row| {
             row.spawn((
-                Node { min_width: Val::Px(72.0), ..default() },
+                Node {
+                    min_width: Val::Px(72.0),
+                    ..default()
+                },
                 Text::new(label),
-                TextFont { font_size: 11.0, ..default() },
+                TextFont {
+                    font_size: 11.0,
+                    ..default()
+                },
                 TextColor(LABEL_COLOR),
             ));
             spawn_arrow_btn(row, "<", down);
             row.spawn((
-                Node { min_width: Val::Px(58.0), justify_content: JustifyContent::Center, ..default() },
+                Node {
+                    min_width: Val::Px(58.0),
+                    justify_content: JustifyContent::Center,
+                    ..default()
+                },
                 Text::new("--"),
-                TextFont { font_size: 11.0, ..default() },
+                TextFont {
+                    font_size: 11.0,
+                    ..default()
+                },
                 TextColor(VALUE_COLOR),
                 display,
             ));
@@ -191,9 +268,15 @@ fn spawn_cycle_row(
         })
         .with_children(|row| {
             row.spawn((
-                Node { min_width: Val::Px(72.0), ..default() },
+                Node {
+                    min_width: Val::Px(72.0),
+                    ..default()
+                },
                 Text::new(label),
-                TextFont { font_size: 11.0, ..default() },
+                TextFont {
+                    font_size: 11.0,
+                    ..default()
+                },
                 TextColor(LABEL_COLOR),
             ));
             spawn_arrow_btn(row, "<", prev);
@@ -204,7 +287,10 @@ fn spawn_cycle_row(
                     ..default()
                 },
                 Text::new("--"),
-                TextFont { font_size: 10.0, ..default() },
+                TextFont {
+                    font_size: 10.0,
+                    ..default()
+                },
                 TextColor(VALUE_COLOR),
                 display,
             ));
@@ -229,16 +315,16 @@ fn spawn_arrow_btn(parent: &mut ChildSpawnerCommands, symbol: &str, action: UiAc
         .with_children(|b| {
             b.spawn((
                 Text::new(symbol),
-                TextFont { font_size: 11.0, ..default() },
+                TextFont {
+                    font_size: 11.0,
+                    ..default()
+                },
                 TextColor(Color::WHITE),
             ));
         });
 }
 
-fn spawn_toggle_row(
-    parent: &mut ChildSpawnerCommands,
-    toggles: &[(&str, UiAction, ToggleLabel)],
-) {
+fn spawn_toggle_row(parent: &mut ChildSpawnerCommands, toggles: &[(&str, UiAction, ToggleLabel)]) {
     parent
         .spawn(Node {
             flex_direction: FlexDirection::Row,
@@ -263,7 +349,10 @@ fn spawn_toggle_row(
                 .with_children(|b| {
                     b.spawn((
                         Text::new(*label),
-                        TextFont { font_size: 11.0, ..default() },
+                        TextFont {
+                            font_size: 11.0,
+                            ..default()
+                        },
                         TextColor(Color::WHITE),
                     ));
                 });
@@ -281,6 +370,7 @@ fn handle_button_press(
     mut grid: ResMut<GridVisible>,
     mut gravity: ResMut<GravityEnabled>,
     mut debug: ResMut<DebugBodiesEnabled>,
+    mut binary: ResMut<BinaryBlackHoles>,
     mut scale: ResMut<RenderScale>,
     mut skybox_set: ResMut<SkyboxSet>,
     mut skybox_active: ResMut<SkyboxImage>,
@@ -292,12 +382,12 @@ fn handle_button_press(
         match action {
             UiAction::SpinDown => {
                 disk.spin = (disk.spin - 0.05).clamp(-0.999, 0.999);
-                sync_bh_radius(&disk, &mut objects);
+                rebuild_scene_objects(&disk, &debug, &binary, &mut objects);
                 cam.is_moving = true;
             }
             UiAction::SpinUp => {
                 disk.spin = (disk.spin + 0.05).clamp(-0.999, 0.999);
-                sync_bh_radius(&disk, &mut objects);
+                rebuild_scene_objects(&disk, &debug, &binary, &mut objects);
                 cam.is_moving = true;
             }
             UiAction::DiskRadiusDown => {
@@ -376,20 +466,27 @@ fn handle_button_press(
                 cam.debug_heatmap = !cam.debug_heatmap;
                 cam.is_moving = true;
             }
+            UiAction::ToggleBinary => {
+                binary.enabled = !binary.enabled;
+                rebuild_scene_objects(&disk, &debug, &binary, &mut objects);
+                cam.is_moving = true;
+            }
             UiAction::ToggleDebugBodies => {
                 debug.0 = !debug.0;
-                let spin = disk.spin;
-                objects.0 = scene_objects(spin, debug.0);
+                rebuild_scene_objects(&disk, &debug, &binary, &mut objects);
                 cam.is_moving = true;
             }
         }
     }
 }
 
-fn sync_bh_radius(disk: &DiskConfig, objects: &mut SimObjects) {
-    if let Some(bh) = objects.0.last_mut() {
-        bh.radius = kerr_horizon_radius(disk.spin);
-    }
+fn rebuild_scene_objects(
+    disk: &DiskConfig,
+    debug: &DebugBodiesEnabled,
+    binary: &BinaryBlackHoles,
+    objects: &mut SimObjects,
+) {
+    objects.0 = scene_objects(disk.spin, debug.0, binary.enabled, binary.phase);
 }
 
 fn iter_idx(max_iter: u32) -> usize {
@@ -434,6 +531,7 @@ fn update_toggle_buttons(
     cam: Res<OrbitalCamera>,
     grid: Res<GridVisible>,
     gravity: Res<GravityEnabled>,
+    binary: Res<BinaryBlackHoles>,
     debug: Res<DebugBodiesEnabled>,
     mut query: Query<(&Interaction, &mut BackgroundColor, &ToggleLabel)>,
 ) {
@@ -442,10 +540,15 @@ fn update_toggle_buttons(
             ToggleLabel::Grid => grid.0,
             ToggleLabel::Gravity => gravity.0,
             ToggleLabel::Heatmap => cam.debug_heatmap,
+            ToggleLabel::Binary => binary.enabled,
             ToggleLabel::DebugBodies => debug.0,
         };
         *bg = BackgroundColor(if *interaction == Interaction::Hovered {
-            if active { TOGGLE_ON_HOVER } else { TOGGLE_OFF_HOVER }
+            if active {
+                TOGGLE_ON_HOVER
+            } else {
+                TOGGLE_OFF_HOVER
+            }
         } else if active {
             TOGGLE_ON
         } else {

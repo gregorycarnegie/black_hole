@@ -19,7 +19,7 @@ use accumulate::{AccumulateNode, init_accumulate_pipeline, prepare_accumulate_bi
 
 use crate::{
     camera::OrbitalCamera,
-    simulation::{DiskConfig, KERR_SPIN, SimObjects},
+    simulation::{BinaryBlackHoles, DiskConfig, KERR_SPIN, SimObjects},
 };
 
 pub struct GeodesicComputePlugin;
@@ -121,6 +121,7 @@ pub struct DiskConfigUniform {
     pub tilt_deg: f32,
     pub r_bp_rs: f32,
     pub twist_deg: f32,
+    pub binary_enabled: bool,
 }
 
 impl Default for DiskConfigUniform {
@@ -135,6 +136,7 @@ impl Default for DiskConfigUniform {
             tilt_deg: 0.0,
             r_bp_rs: 5.0,
             twist_deg: 0.0,
+            binary_enabled: true,
         }
     }
 }
@@ -314,6 +316,7 @@ fn halton(mut i: u32, base: u32) -> f32 {
 
 fn sync_camera_uniform(
     cam: Res<OrbitalCamera>,
+    objects: Res<SimObjects>,
     mut uniform: ResMut<CameraUniform>,
     mut counter: ResMut<StillFrameCounter>,
     mut render_fc: ResMut<RenderFrameCount>,
@@ -334,14 +337,15 @@ fn sync_camera_uniform(
 
     // fc = frame_count sent to the GPU for THIS render frame.
     // 0 means "reset accumulation", ≥1 means "blend".
-    let fc = if cam.is_moving { 0u32 } else { counter.0 };
+    let scene_moving = cam.is_moving || objects.is_changed();
+    let fc = if scene_moving { 0u32 } else { counter.0 };
     render_fc.0 = fc;
     // even fc → parity=true → b_prev bind group (writes into AccumA)
     parity.0 = fc % 2 == 0;
 
     // Suppress jitter in heatmap mode: each frame is deterministic so averaging
     // slightly-shifted heatmaps would blur the per-pixel iteration counts.
-    let (jx, jy) = if cam.is_moving || cam.debug_heatmap {
+    let (jx, jy) = if scene_moving || cam.debug_heatmap {
         (0.0f32, 0.0f32)
     } else {
         // Halton(1,2)=0.5 → jx=0 on first still frame, varies thereafter.
@@ -349,7 +353,7 @@ fn sync_camera_uniform(
     };
 
     // Advance counter for the next frame.
-    if cam.is_moving {
+    if scene_moving {
         counter.0 = 0;
     } else {
         counter.0 = counter.0.saturating_add(1);
@@ -366,7 +370,7 @@ fn sync_camera_uniform(
         _pad3: 0.0,
         tan_half_fov: cam.tan_half_fov(),
         aspect,
-        moving: cam.is_moving as u32,
+        moving: scene_moving as u32,
         jitter_x: jx,
         jitter_y: jy,
         debug_heatmap: cam.debug_heatmap as u32,
@@ -387,8 +391,12 @@ fn sync_objects_uniform(objects: Res<SimObjects>, mut uniform: ResMut<ObjectsUni
     }
 }
 
-fn sync_disk_config_uniform(disk: Res<DiskConfig>, mut uniform: ResMut<DiskConfigUniform>) {
-    if !disk.is_changed() {
+fn sync_disk_config_uniform(
+    disk: Res<DiskConfig>,
+    binary: Res<BinaryBlackHoles>,
+    mut uniform: ResMut<DiskConfigUniform>,
+) {
+    if !disk.is_changed() && uniform.binary_enabled == binary.enabled {
         return;
     }
     uniform.spin = disk.spin;
@@ -400,6 +408,7 @@ fn sync_disk_config_uniform(disk: Res<DiskConfig>, mut uniform: ResMut<DiskConfi
     uniform.tilt_deg = disk.tilt_deg;
     uniform.r_bp_rs = disk.r_bp_rs;
     uniform.twist_deg = disk.twist_deg;
+    uniform.binary_enabled = binary.enabled;
 }
 
 pub(crate) const SCALE_PRESETS: &[f32] = &[0.25, 0.5, 0.75, 1.0];
