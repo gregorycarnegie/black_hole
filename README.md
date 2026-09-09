@@ -7,6 +7,8 @@
 
 Real-time black hole visualization using GPU ray-tracing in Bevy (Rust).
 
+Current version: **0.3.0**. See the [changelog](CHANGELOG.md) for release notes.
+
 Simulates null geodesics (light paths) in Kerr spacetime in mass-independent gravitational units, with a default binary black-hole scene, an accretion disk, and a deformed spacetime grid.
 
 ## Features
