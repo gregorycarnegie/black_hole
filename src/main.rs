@@ -45,7 +45,7 @@ fn setup_fps_ui(mut commands: Commands) {
         },
         Text::new("FPS: --"),
         TextFont {
-            font_size: 14.0,
+            font_size: FontSize::Px(14.0),
             ..default()
         },
         TextColor(Color::WHITE),

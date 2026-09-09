@@ -5,7 +5,6 @@ use bevy::{
     prelude::*,
     render::{
         render_asset::RenderAssets,
-        render_graph,
         render_resource::{
             binding_types::{texture_2d, texture_storage_2d, uniform_buffer_sized},
             *,
@@ -13,7 +12,7 @@ use bevy::{
         renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
     },
-    shader::PipelineCacheError,
+    shader::ShaderCacheError,
 };
 
 use super::{AccumA, AccumB, DisplayImage, FrameParity, GeodesicImage, RenderFrameCount};
@@ -81,7 +80,7 @@ pub fn init_accumulate_pipeline(
     let pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some(Cow::Borrowed("accumulate_pipeline")),
         layout: vec![layout.clone()],
-        push_constant_ranges: vec![],
+        immediate_size: 0,
         shader: asset_server.load("shaders/accumulate.wgsl"),
         shader_defs: vec![],
         entry_point: Some(Cow::Borrowed("main")),
@@ -208,89 +207,44 @@ pub fn prepare_accumulate_bind_group(
 
 // ── Render graph node ────────────────────────────────────────────────────────
 
-enum NodeState {
-    Loading,
-    Ready,
-}
-
-pub struct AccumulateNode {
-    state: NodeState,
-}
-
-impl Default for AccumulateNode {
-    fn default() -> Self {
-        Self {
-            state: NodeState::Loading,
+pub fn dispatch_accumulate(
+    mut render_context: RenderContext,
+    pipeline: Option<Res<AccumulatePipeline>>,
+    groups: Option<Res<AccumulateBindGroups>>,
+    parity: Option<Res<FrameParity>>,
+    display: Option<Res<DisplayImage>>,
+    images: Res<RenderAssets<GpuImage>>,
+    cache: Res<PipelineCache>,
+) {
+    let (Some(pipeline), Some(groups), Some(parity), Some(display)) =
+        (pipeline, groups, parity, display)
+    else {
+        return;
+    };
+    if let CachedPipelineState::Err(err) = cache.get_compute_pipeline_state(pipeline.pipeline_id) {
+        if !matches!(err, ShaderCacheError::ShaderNotLoaded(_)) {
+            panic!("accumulate shader error: {err}");
         }
     }
-}
-
-impl render_graph::Node for AccumulateNode {
-    fn update(&mut self, world: &mut World) {
-        let Some(pipeline) = world.get_resource::<AccumulatePipeline>() else {
-            return;
-        };
-        let cache = world.resource::<PipelineCache>();
-        if let NodeState::Loading = self.state {
-            match cache.get_compute_pipeline_state(pipeline.pipeline_id) {
-                CachedPipelineState::Ok(_) => self.state = NodeState::Ready,
-                CachedPipelineState::Err(PipelineCacheError::ShaderNotLoaded(_)) => {}
-                CachedPipelineState::Err(e) => panic!("accumulate shader error: {e}"),
-                _ => {}
-            }
-        }
-    }
-
-    fn run(
-        &self,
-        _graph: &mut render_graph::RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
-        if matches!(self.state, NodeState::Loading) {
-            return Ok(());
-        }
-
-        let (Some(groups), Some(pipeline_res), Some(parity), Some(display)) = (
-            world.get_resource::<AccumulateBindGroups>(),
-            world.get_resource::<AccumulatePipeline>(),
-            world.get_resource::<FrameParity>(),
-            world.get_resource::<DisplayImage>(),
-        ) else {
-            return Ok(());
-        };
-
-        let cache = world.resource::<PipelineCache>();
-        let Some(pipeline) = cache.get_compute_pipeline(pipeline_res.pipeline_id) else {
-            return Ok(());
-        };
-
-        let gpu_images = world.resource::<RenderAssets<GpuImage>>();
-        let Some(disp_gpu) = gpu_images.get(&display.0) else {
-            return Ok(());
-        };
-
-        let (dispatch_x, dispatch_y) = (
-            disp_gpu.size.width.div_ceil(16),
-            disp_gpu.size.height.div_ceil(16),
-        );
-
-        // frame_count even → parity=true → prev=B, curr=A → use b_prev
-        // frame_count odd  → parity=false → prev=A, curr=B → use a_prev
-        let bind_group = if parity.0 {
-            &groups.b_prev
-        } else {
-            &groups.a_prev
-        };
-
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
-
-        pass.set_bind_group(0, bind_group, &[]);
-        pass.set_pipeline(pipeline);
-        pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-
-        Ok(())
-    }
+    let (Some(compute), Some(image)) = (
+        cache.get_compute_pipeline(pipeline.pipeline_id),
+        images.get(&display.0),
+    ) else {
+        return;
+    };
+    let group = if parity.0 {
+        &groups.b_prev
+    } else {
+        &groups.a_prev
+    };
+    let mut pass = render_context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor::default());
+    pass.set_bind_group(0, group, &[]);
+    pass.set_pipeline(compute);
+    pass.dispatch_workgroups(
+        image.texture_descriptor.size.width.div_ceil(16),
+        image.texture_descriptor.size.height.div_ceil(16),
+        1,
+    );
 }

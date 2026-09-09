@@ -5,7 +5,6 @@ use bevy::{
     prelude::*,
     render::{
         render_asset::RenderAssets,
-        render_graph,
         render_resource::{
             binding_types::{texture_2d, texture_storage_2d, uniform_buffer_sized},
             *,
@@ -13,12 +12,14 @@ use bevy::{
         renderer::{RenderContext, RenderDevice, RenderQueue},
         texture::GpuImage,
     },
-    shader::PipelineCacheError,
+    shader::ShaderCacheError,
 };
 use bytemuck::Zeroable;
 
 use super::{CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform, SkyboxImage};
-use crate::simulation::{BINARY_DISK_INNER_RS, SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
+use crate::simulation::{
+    BINARY_DISK_INNER_RS, SCHWARZSCHILD_RADIUS, kerr_horizon_radius, kerr_isco_radius,
+};
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
 
@@ -48,16 +49,16 @@ struct GpuCameraUniform {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuDiskUniform {
-    r1: f32,     // inner emitting radius (metres)
-    r2: f32,     // outer radius (metres)
+    r1: f32,     // inner emitting radius (r_g)
+    r2: f32,     // outer radius (r_g)
     h_thin: f32, // H/R for thin disk component
     h_hot: f32,  // H/R for hot / thick inner component
     spin: f32,
     horizon_r: f32,
     isco_r: f32,
-    r_trunc: f32,   // truncation or puff radius (metres)
+    r_trunc: f32,   // truncation or puff radius (r_g)
     tilt_deg: f32,  // outer disk tilt (degrees)
-    r_bp: f32,      // Bardeen-Petterson alignment radius (metres)
+    r_bp: f32,      // Bardeen-Petterson alignment radius (r_g)
     twist_deg: f32, // twist per ln(r/r_bp) (degrees)
     model: u32,     // 0=ThinNT 1=TruncHot 2=Slim 3=Warped
     binary_enabled: u32,
@@ -146,7 +147,7 @@ pub fn init_geodesic_pipeline(
     let pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some(Cow::Borrowed("geodesic_pipeline")),
         layout: vec![layout.clone()],
-        push_constant_ranges: vec![],
+        immediate_size: 0,
         shader: asset_server.load("shaders/geodesic.wgsl"),
         shader_defs: vec![],
         entry_point: Some(Cow::Borrowed("main")),
@@ -171,21 +172,21 @@ fn build_disk_uniform(cfg: &DiskConfigUniform) -> GpuDiskUniform {
     let isco_r = kerr_isco_radius(cfg.spin);
     let horizon_r = kerr_horizon_radius(cfg.spin);
     let inner_r = if cfg.binary_enabled {
-        (SAGA_RS * BINARY_DISK_INNER_RS).max(isco_r)
+        (SCHWARZSCHILD_RADIUS * BINARY_DISK_INNER_RS).max(isco_r)
     } else {
         isco_r
     };
     GpuDiskUniform {
         r1: inner_r,
-        r2: SAGA_RS * cfg.r_outer_rs,
+        r2: SCHWARZSCHILD_RADIUS * cfg.r_outer_rs,
         h_thin: cfg.h_thin,
         h_hot: cfg.h_hot,
         spin: cfg.spin,
         horizon_r,
         isco_r,
-        r_trunc: SAGA_RS * cfg.r_trunc_rs,
+        r_trunc: SCHWARZSCHILD_RADIUS * cfg.r_trunc_rs,
         tilt_deg: cfg.tilt_deg,
-        r_bp: SAGA_RS * cfg.r_bp_rs,
+        r_bp: SCHWARZSCHILD_RADIUS * cfg.r_bp_rs,
         twist_deg: cfg.twist_deg,
         model: cfg.model,
         binary_enabled: cfg.binary_enabled as u32,
@@ -336,76 +337,36 @@ pub fn prepare_bind_group(mut commands: Commands, sources: GeodesicSources, gpu:
 
 // ── Render graph node ────────────────────────────────────────────────────────
 
-enum NodeState {
-    Loading,
-    Ready,
-}
-
-pub struct GeodesicNode {
-    state: NodeState,
-}
-
-impl Default for GeodesicNode {
-    fn default() -> Self {
-        Self {
-            state: NodeState::Loading,
+pub fn dispatch_geodesic(
+    mut render_context: RenderContext,
+    pipeline: Option<Res<GeodesicPipeline>>,
+    group: Option<Res<GeodesicBindGroup>>,
+    image: Option<Res<GeodesicImage>>,
+    images: Res<RenderAssets<GpuImage>>,
+    cache: Res<PipelineCache>,
+) {
+    let (Some(pipeline), Some(group), Some(image)) = (pipeline, group, image) else {
+        return;
+    };
+    if let CachedPipelineState::Err(err) = cache.get_compute_pipeline_state(pipeline.pipeline_id) {
+        if !matches!(err, ShaderCacheError::ShaderNotLoaded(_)) {
+            panic!("geodesic shader error: {err}");
         }
     }
-}
-
-impl render_graph::Node for GeodesicNode {
-    fn update(&mut self, world: &mut World) {
-        let Some(pipeline) = world.get_resource::<GeodesicPipeline>() else {
-            return;
-        };
-        let cache = world.resource::<PipelineCache>();
-
-        if let NodeState::Loading = self.state {
-            match cache.get_compute_pipeline_state(pipeline.pipeline_id) {
-                CachedPipelineState::Ok(_) => self.state = NodeState::Ready,
-                CachedPipelineState::Err(PipelineCacheError::ShaderNotLoaded(_)) => {}
-                CachedPipelineState::Err(err) => panic!("geodesic shader error: {err}"),
-                _ => {}
-            }
-        }
-    }
-
-    fn run(
-        &self,
-        _graph: &mut render_graph::RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), render_graph::NodeRunError> {
-        if matches!(self.state, NodeState::Loading) {
-            return Ok(());
-        }
-
-        let (Some(bind_group), Some(pipeline_res)) = (
-            world.get_resource::<GeodesicBindGroup>(),
-            world.get_resource::<GeodesicPipeline>(),
-        ) else {
-            return Ok(());
-        };
-
-        let cache = world.resource::<PipelineCache>();
-        let Some(pipeline) = cache.get_compute_pipeline(pipeline_res.pipeline_id) else {
-            return Ok(());
-        };
-
-        let (dispatch_x, dispatch_y) = world
-            .get_resource::<GeodesicImage>()
-            .and_then(|gi| world.resource::<RenderAssets<GpuImage>>().get(&gi.0))
-            .map(|img| (img.size.width.div_ceil(16), img.size.height.div_ceil(16)))
-            .unwrap_or((1, 1));
-
-        let mut pass = render_context
-            .command_encoder()
-            .begin_compute_pass(&ComputePassDescriptor::default());
-
-        pass.set_bind_group(0, &bind_group.0, &[]);
-        pass.set_pipeline(pipeline);
-        pass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-
-        Ok(())
-    }
+    let (Some(compute), Some(image)) = (
+        cache.get_compute_pipeline(pipeline.pipeline_id),
+        images.get(&image.0),
+    ) else {
+        return;
+    };
+    let mut pass = render_context
+        .command_encoder()
+        .begin_compute_pass(&ComputePassDescriptor::default());
+    pass.set_bind_group(0, &group.0, &[]);
+    pass.set_pipeline(compute);
+    pass.dispatch_workgroups(
+        image.texture_descriptor.size.width.div_ceil(16),
+        image.texture_descriptor.size.height.div_ceil(16),
+        1,
+    );
 }

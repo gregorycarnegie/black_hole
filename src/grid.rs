@@ -1,10 +1,6 @@
 use bevy::prelude::*;
 
-use crate::{
-    camera::OrbitalCamera,
-    controller::active_gamepad,
-    simulation::{C, G_CONST, SimObjects},
-};
+use crate::{camera::OrbitalCamera, controller::active_gamepad, simulation::SimObjects};
 
 pub struct GridPlugin;
 
@@ -50,12 +46,12 @@ struct GridCache {
 /// Closer camera → finer grid; farther → coarser grid with wider spacing
 /// so the scene fills roughly the same visual area.
 fn grid_lod(radius: f64) -> (i32, f32) {
-    if radius < 1.5e11 {
-        (25, 1.0e10) // 626 verts, 1250 segments
-    } else if radius < 5.0e11 {
-        (13, 2.0e10) // 196 verts,  338 segments
+    if radius < 24.0 {
+        (25, 1.6) // 626 verts, 1250 segments
+    } else if radius < 80.0 {
+        (13, 3.2) // 196 verts,  338 segments
     } else {
-        (9, 4.0e10) //  100 verts,  162 segments
+        (9, 6.4) //  100 verts,  162 segments
     }
 }
 
@@ -86,11 +82,11 @@ fn draw_spacetime_grid(
                 let mut y = 0.0_f32;
 
                 for obj in &objects.0 {
-                    let r_s = (2.0 * G_CONST * obj.mass as f64 / (C * C)) as f32;
+                    let r_s = 2.0 * obj.mass;
                     let dx = world_x - obj.position.x;
                     let dz = world_z - obj.position.z;
                     let dist = (dx * dx + dz * dz).sqrt();
-                    y += 2.0 * (r_s * (dist - r_s).max(0.0)).sqrt() - 3e10;
+                    y += 2.0 * (r_s * (dist - r_s).max(0.0)).sqrt() - 4.8;
                 }
 
                 cache.verts[zi as usize * count + xi as usize] = Vec3::new(world_x, y, world_z);

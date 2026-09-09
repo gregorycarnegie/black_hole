@@ -28,7 +28,7 @@ impl Plugin for OrbitalCameraPlugin {
 ///
 /// Orbital parameters (`radius`, `azimuth`, `elevation`) are stored as `f64`
 /// so that accumulated mouse/scroll input doesn't lose precision when the
-/// camera is very close to the event horizon (~1e10 m). The GPU uniform is
+/// camera is very close to the event horizon (~1 r_g). The GPU uniform is
 /// still written as `f32` — the precision gain is on the CPU accumulation side.
 #[derive(Resource)]
 pub struct OrbitalCamera {
@@ -52,13 +52,13 @@ pub struct OrbitalCamera {
 impl Default for OrbitalCamera {
     fn default() -> Self {
         Self {
-            radius: 3.0e11,
+            radius: 48.0,
             azimuth: 0.0,
             elevation: PI / 2.0 - 0.35,
-            min_radius: 1e10,
-            max_radius: 1e12,
+            min_radius: 1.6,
+            max_radius: 160.0,
             orbit_speed: 0.005,
-            zoom_speed: 25e9,
+            zoom_speed: 4.0,
             fov_degrees: 60.0,
             dragging: false,
             is_moving: false,
@@ -339,7 +339,7 @@ mod tests {
     proptest! {
         #[test]
         fn position_radius_preserved(
-            radius    in 1e10_f64..=1e12_f64,
+            radius    in 1.6_f64..=160.0_f64,
             azimuth   in -100.0_f64..=100.0_f64,
             elevation in 0.01_f64..=(PI - 0.01),
         ) {
@@ -354,7 +354,7 @@ mod tests {
         // forward ∥ Y and the cross product collapses.
         #[test]
         fn frame_orthonormal_across_orientations(
-            radius    in 1e10_f64..=1e12_f64,
+            radius    in 1.6_f64..=160.0_f64,
             azimuth   in -100.0_f64..=100.0_f64,
             elevation in 0.1_f64..=(PI - 0.1),
         ) {

@@ -62,16 +62,15 @@ struct Objects {
 // -- Constants ---------------------------------------------------------------
 
 const PI:             f32 = 3.141592653589793;
-const SAGA_RS:        f32 = 1.269e10;
-const BH_M:           f32 = 0.5 * SAGA_RS;
+const SCHWARZSCHILD_RADIUS:        f32 = 2.0; // r_g = GM/c^2 = 1
+const BH_M:           f32 = 0.5 * SCHWARZSCHILD_RADIUS;
 const INV_BH_M:       f32 = 1.0 / BH_M;
 const INV_BH_M2:      f32 = INV_BH_M * INV_BH_M;
-const D_LAMBDA_BASE:  f32 = 1.0e7;
-const D_LAMBDA_MAX:   f32 = 1.0e10;
-const ESCAPE_R:       f32 = 1.0e13;
+const D_LAMBDA_BASE:  f32 = 0.0016;
+const D_LAMBDA_MAX:   f32 = 1.6;
+const ESCAPE_R:       f32 = 1600.0;
 const SIN2_FLOOR:     f32 = 1.0e-6;
 const DELTA_FLOOR:    f32 = 1.0e-5;
-const SAGA_MASS:      f32 = 8.54e36;
 const BINARY_TRACE_STEPS: u32 = 768u;
 const BINARY_BEND_MULTIPLIER: f32 = 2.0;
 const BINARY_FRAME_DRAG_MULTIPLIER: f32 = 4.0;
@@ -370,7 +369,7 @@ fn intersect_objects_segment(start: vec3<f32>, end: vec3<f32>) -> ObjectHit {
     var result: ObjectHit;
     result.hit = false;
     let segment = end - start;
-    let segment_len2 = max(dot(segment, segment), 1.0);
+    let segment_len2 = max(dot(segment, segment), 1.0e-12);
     for (var i = 0; i < objects.num_objects; i++) {
         let center = objects.pos_radius[i].xyz;
         let radius = objects.pos_radius[i].w;
@@ -411,7 +410,7 @@ fn blackbody_color(t: f32) -> vec3<f32> {
 }
 
 fn disk_edge_fade(r_disk: f32) -> f32 {
-    let edge_width = max(0.06 * (disk.r2 - disk.r1), 0.35 * SAGA_RS);
+    let edge_width = max(0.06 * (disk.r2 - disk.r1), 0.35 * SCHWARZSCHILD_RADIUS);
     let inner = smoothstep(disk.r1, disk.r1 + edge_width, r_disk);
     let outer = 1.0 - smoothstep(disk.r2 - edge_width, disk.r2, r_disk);
     return clamp(inner * outer, 0.0, 1.0);
@@ -421,14 +420,14 @@ fn disk_edge_fade(r_disk: f32) -> f32 {
 fn get_h_over_r(r_xz: f32) -> f32 {
     if disk.model == 1u {
         // TruncHot: tanh transition — h_hot inside r_trunc, h_thin outside.
-        let safe_r  = max(r_xz,        SAGA_RS * 1.0e-3);
-        let safe_rt = max(disk.r_trunc, SAGA_RS * 1.0e-3);
+        let safe_r  = max(r_xz,        SCHWARZSCHILD_RADIUS * 1.0e-3);
+        let safe_rt = max(disk.r_trunc, SCHWARZSCHILD_RADIUS * 1.0e-3);
         let t = clamp((log(safe_r) - log(safe_rt)) / 0.4, -10.0, 10.0);
         let w = 0.5 * (1.0 + tanh(t));   // 0 deep inside, 1 far outside
         return w * disk.h_thin + (1.0 - w) * disk.h_hot;
     } else if disk.model == 2u {
         // Slim / super-Eddington: disk puffs up inward at r_trunc (used as r_puff).
-        let r_puff = max(disk.r_trunc, SAGA_RS * 0.5);
+        let r_puff = max(disk.r_trunc, SCHWARZSCHILD_RADIUS * 0.5);
         let ratio  = r_xz / r_puff;
         return disk.h_thin + (disk.h_hot - disk.h_thin) / (1.0 + ratio * ratio);
     }
@@ -440,8 +439,8 @@ fn get_h_over_r(r_xz: f32) -> f32 {
 // β(R): tilt 0 inside r_bp (aligned), tilt_deg outside. γ(R): azimuthal twist.
 fn disk_midplane_y(r_xz: f32, phi: f32) -> f32 {
     if disk.model != 3u { return 0.0; }
-    let r_bp_safe = max(disk.r_bp, SAGA_RS * 0.1);
-    let ln_norm   = clamp(log(max(r_xz, SAGA_RS * 0.01) / r_bp_safe) / 0.5, -10.0, 10.0);
+    let r_bp_safe = max(disk.r_bp, SCHWARZSCHILD_RADIUS * 0.1);
+    let ln_norm   = clamp(log(max(r_xz, SCHWARZSCHILD_RADIUS * 0.01) / r_bp_safe) / 0.5, -10.0, 10.0);
     let w     = 0.5 * (1.0 + tanh(ln_norm));   // 0 inside r_bp, 1 outside
     let beta  = disk.tilt_deg  * (PI / 180.0) * w;
     let gamma = disk.twist_deg * (PI / 180.0) * log(1.0 + r_xz / r_bp_safe);
@@ -523,8 +522,8 @@ fn shade_disk(ray: Ray, r_disk: f32, h_r: f32, a: f32) -> vec4<f32> {
     var base: vec3<f32>;
     if disk.model == 1u {
         // TruncHot: blend NT thermal (outer) with hot-flow synchrotron (inner).
-        let safe_r  = max(r_disk,       SAGA_RS * 1.0e-3);
-        let safe_rt = max(disk.r_trunc, SAGA_RS * 1.0e-3);
+        let safe_r  = max(r_disk,       SCHWARZSCHILD_RADIUS * 1.0e-3);
+        let safe_rt = max(disk.r_trunc, SCHWARZSCHILD_RADIUS * 1.0e-3);
         let t = clamp((log(safe_r) - log(safe_rt)) / 0.4, -10.0, 10.0);
         let w     = 0.5 * (1.0 + tanh(t));   // 1 in outer thin disk, 0 in inner hot flow
         let c_nt  = blackbody_color(nt_temp(r_disk) / 0.488);
@@ -535,7 +534,7 @@ fn shade_disk(ray: Ray, r_disk: f32, h_r: f32, a: f32) -> vec4<f32> {
     }
 
     let orb = orbital_kerr(r_disk, h_r, a);
-    let inv_r_disk = 1.0 / max(r_disk, 1.0);
+    let inv_r_disk = 1.0 / max(r_disk, 1.0e-6);
     let orbital = orb.orbit_sign * vec3<f32>(-ray.z * inv_r_disk, 0.0, ray.x * inv_r_disk);
 
     let to_cam = -ray_cart_dir(ray, a);
@@ -552,33 +551,49 @@ fn shade_disk(ray: Ray, r_disk: f32, h_r: f32, a: f32) -> vec4<f32> {
         base + vec3<f32>(-shift * 0.35, -shift * 0.1, shift * 0.55),
         vec3<f32>(0.0), vec3<f32>(1.0)
     ) * bright;
-    let mapped = disk_c / (disk_c + vec3<f32>(1.0));
     let fade = disk_edge_fade(r_disk);
 
-    return vec4<f32>(mapped * fade, fade);
+    return vec4<f32>(disk_c * fade, fade);
 }
 
 // -- Skybox ------------------------------------------------------------------
 
-// Equirectangular HDR sample. Expects a normalised direction.
-// Uses a single nearest-neighbour textureLoad; TAA accumulation averages
-// sub-pixel detail across still frames, making bilinear unnecessary here.
-// Reinhard-tonemapped to [0, 1].
+// ACES filmic curve fit by Krzysztof Narkowicz (CC0/MIT).
+// https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/
+// ponytail: compact ACES approximation; use a full colour transform if grading needs it.
+fn tonemap(hdr: vec3<f32>) -> vec3<f32> {
+    // Limit extreme inputs before the polynomial to avoid floating-point overflow.
+    let x = clamp(hdr, vec3<f32>(0.0), vec3<f32>(1.0e4));
+    return clamp((x * (2.51 * x + vec3<f32>(0.03))) /
+        (x * (2.43 * x + vec3<f32>(0.59)) + vec3<f32>(0.14)),
+        vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Linear HDR bilinear sample: wrap longitude, clamp latitude at the poles.
+// Manual filtering also works with non-filterable rgba32float skyboxes.
 fn sample_skybox(dir: vec3<f32>) -> vec3<f32> {
     let dims = vec2<i32>(textureDimensions(skybox));
-    let u = atan2(dir.z, dir.x) * (1.0 / (2.0 * PI)) + 0.5;
-    let v = acos(clamp(dir.y, -1.0, 1.0)) * (1.0 / PI);
-    let xi = ((i32(u * f32(dims.x)) % dims.x) + dims.x) % dims.x;
-    let yi = clamp(i32(v * f32(dims.y)), 0, dims.y - 1);
-    let hdr = textureLoad(skybox, vec2<i32>(xi, yi), 0).rgb;
-    return hdr / (hdr + vec3<f32>(1.0));
+    let uv = vec2<f32>(atan2(dir.z, dir.x) / (2.0 * PI) + 0.5,
+                       acos(clamp(dir.y, -1.0, 1.0)) / PI);
+    let texel = uv * vec2<f32>(dims) - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(texel));
+    let weight = fract(texel);
+    let x0 = ((base.x % dims.x) + dims.x) % dims.x;
+    let x1 = (x0 + 1) % dims.x;
+    let y0 = clamp(base.y, 0, dims.y - 1);
+    let y1 = clamp(base.y + 1, 0, dims.y - 1);
+    let top = mix(textureLoad(skybox, vec2<i32>(x0, y0), 0).rgb,
+                  textureLoad(skybox, vec2<i32>(x1, y0), 0).rgb, weight.x);
+    let bottom = mix(textureLoad(skybox, vec2<i32>(x0, y1), 0).rgb,
+                     textureLoad(skybox, vec2<i32>(x1, y1), 0).rgb, weight.x);
+    return mix(top, bottom, weight.y);
 }
 
 // Binary mode uses a superposed Schwarzschild weak-field null-geodesic
 // approximation. It has no origin-centred Kerr horizon and no accretion disk.
 fn object_schwarzschild_radius(i: i32) -> f32 {
-    let mass_fraction = max(objects.mass[i].x / SAGA_MASS, 0.0);
-    return SAGA_RS * mass_fraction;
+    let mass_fraction = max(objects.mass[i].x, 0.0);
+    return SCHWARZSCHILD_RADIUS * mass_fraction;
 }
 
 fn object_mass_length(i: i32) -> f32 {
@@ -595,7 +610,7 @@ fn nearest_object_clearance(pos: vec3<f32>) -> f32 {
     var nearest = ESCAPE_R;
     for (var i = 0; i < objects.num_objects; i++) {
         let center = objects.pos_radius[i].xyz;
-        let radius = max(objects.pos_radius[i].w, SAGA_RS * 0.05);
+        let radius = max(objects.pos_radius[i].w, SCHWARZSCHILD_RADIUS * 0.05);
         nearest = min(nearest, max(length(pos - center) - radius, 0.0));
     }
     return nearest;
@@ -605,17 +620,17 @@ fn binary_deflection(pos: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     var bend = vec3<f32>(0.0);
     for (var i = 0; i < objects.num_objects; i++) {
         let center = objects.pos_radius[i].xyz;
-        let radius = max(objects.pos_radius[i].w, SAGA_RS * 0.05);
+        let radius = max(objects.pos_radius[i].w, SCHWARZSCHILD_RADIUS * 0.05);
         let from_center = pos - center;
         let to_center = -from_center;
         let r2 = max(dot(from_center, from_center), radius * radius);
         let r = sqrt(r2);
         let transverse = to_center - dot(to_center, dir) * dir;
-        bend += BINARY_BEND_MULTIPLIER * object_schwarzschild_radius(i) * transverse / max(r2 * r, 1.0);
+        bend += BINARY_BEND_MULTIPLIER * object_schwarzschild_radius(i) * transverse / max(r2 * r, 1.0e-12);
 
-        let r_hat = from_center / max(r, 1.0);
+        let r_hat = from_center / max(r, 1.0e-6);
         let j = object_spin_angular_momentum(i);
-        let gravito_magnetic = (3.0 * r_hat * dot(j, r_hat) - j) / max(r2 * r, 1.0);
+        let gravito_magnetic = (3.0 * r_hat * dot(j, r_hat) - j) / max(r2 * r, 1.0e-12);
         bend += BINARY_FRAME_DRAG_MULTIPLIER * cross(dir, gravito_magnetic);
     }
     return bend;
@@ -691,7 +706,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             textureStore(out_image, pix, vec4<f32>(heatmap_color(t), 1.0));
             return;
         }
-        textureStore(out_image, pix, vec4<f32>(traced.rgb, 1.0));
+        textureStore(out_image, pix, vec4<f32>(tonemap(traced.rgb), 1.0));
         return;
     }
 
@@ -722,12 +737,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             passed_ergosphere = true;
             ergosphere_alpha = max(
                 ergosphere_alpha,
-                clamp((static_limit - ray.r) / max(static_limit - disk.horizon_r, 1.0), 0.0, 1.0)
+                clamp((static_limit - ray.r) / max(static_limit - disk.horizon_r, 1.0e-6), 0.0, 1.0)
             );
         }
 
         let dL = clamp(
-            D_LAMBDA_BASE * (ray.r - disk.horizon_r) / SAGA_RS,
+            D_LAMBDA_BASE * (ray.r - disk.horizon_r) / SCHWARZSCHILD_RADIUS,
             D_LAMBDA_BASE * 0.25,
             D_LAMBDA_MAX
         );
@@ -743,12 +758,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let h_r   = get_h_over_r(r_xz);
                 let H     = h_r * r_xz;
                 let y_mid = disk_midplane_y(r_xz, phi);   // 0 for all models except Warped
-                let z_norm = (new_pos.y - y_mid) / max(H, 1.0e-4 * SAGA_RS);
+                let z_norm = (new_pos.y - y_mid) / max(H, 1.0e-4 * SCHWARZSCHILD_RADIUS);
                 if abs(z_norm) < 4.0 {
                     let density = exp(-0.5 * z_norm * z_norm);
                     // Normaliser 0.4 ≈ 1/√(2π) so a perpendicular crossing totals ~1.
                     let ds = length(new_pos - prev_pos);
-                    let contrib = density * ds / max(H, 1.0e-4 * SAGA_RS) * 0.4;
+                    let contrib = density * ds / max(H, 1.0e-4 * SCHWARZSCHILD_RADIUS) * 0.4;
                     if contrib > 1.0e-5 {
                         let c = shade_disk(ray, r_xz, h_r, spin_a);
                         let w = min(contrib, 2.5 - disk_accum);
@@ -796,7 +811,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if any_disk {
         scene_rgb = disk_rgb + (1.0 - disk_alpha) * scene_rgb;
     }
-    color = vec4<f32>(scene_rgb, 1.0);
+    color = vec4<f32>(tonemap(scene_rgb), 1.0);
 
     textureStore(out_image, pix, color);
 }

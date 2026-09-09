@@ -1,21 +1,22 @@
 use bevy::{
     asset::RenderAssetUsages,
+    core_pipeline::schedule::camera_driver,
     ecs::system::SystemParam,
     prelude::*,
     render::{
         Render, RenderApp, RenderStartup, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
-        render_graph::{RenderGraph, RenderLabel},
         render_resource::{Extent3d, TextureDimension, TextureFormat, TextureUsages},
+        renderer::RenderGraph,
     },
     window::PrimaryWindow,
 };
 
 mod pipeline;
-use pipeline::{GeodesicNode, init_geodesic_pipeline, prepare_bind_group};
+use pipeline::{dispatch_geodesic, init_geodesic_pipeline, prepare_bind_group};
 
 mod accumulate;
-use accumulate::{AccumulateNode, init_accumulate_pipeline, prepare_accumulate_bind_group};
+use accumulate::{dispatch_accumulate, init_accumulate_pipeline, prepare_accumulate_bind_group};
 
 use crate::{
     camera::OrbitalCamera,
@@ -175,14 +176,6 @@ struct ComputeTexState {
     scale: f32,
 }
 
-// ── Render graph labels ──────────────────────────────────────────────────────
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub struct GeodesicLabel;
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub struct AccumulateLabel;
-
 // ── Plugin ───────────────────────────────────────────────────────────────────
 
 impl Plugin for GeodesicComputePlugin {
@@ -232,11 +225,12 @@ impl Plugin for GeodesicComputePlugin {
                     .in_set(RenderSystems::PrepareBindGroups),
             );
 
-        let mut graph = render_app.world_mut().resource_mut::<RenderGraph>();
-        graph.add_node(GeodesicLabel, GeodesicNode::default());
-        graph.add_node(AccumulateLabel, AccumulateNode::default());
-        graph.add_node_edge(GeodesicLabel, AccumulateLabel);
-        graph.add_node_edge(AccumulateLabel, bevy::render::graph::CameraDriverLabel);
+        render_app.add_systems(
+            RenderGraph,
+            (dispatch_geodesic, dispatch_accumulate)
+                .chain()
+                .before(camera_driver),
+        );
     }
 }
 
@@ -577,5 +571,109 @@ fn cycle_skybox(
         active.0 = set.handles[set.current].clone();
         cam.is_moving = true; // reset TAA history
         info!("Skybox: {} ({})", set.current, SKYBOX_NAMES[set.current]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::{
+        render::{
+            RenderPlugin,
+            gpu_readback::{Readback, ReadbackComplete},
+        },
+        window::ExitCondition,
+        winit::WinitPlugin,
+    };
+    use std::time::{Duration, Instant};
+
+    #[derive(Resource, Default)]
+    struct Pixels(Vec<u8>);
+
+    #[test]
+    #[ignore = "requires a GPU; run with cargo test headless_render -- --ignored --nocapture"]
+    fn headless_render() {
+        let mut app = App::new();
+        app.add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: None,
+                    exit_condition: ExitCondition::DontExit,
+                    ..default()
+                })
+                .set(RenderPlugin {
+                    synchronous_pipeline_compilation: true,
+                    ..default()
+                })
+                .disable::<WinitPlugin>(),
+        )
+        .init_resource::<OrbitalCamera>()
+        .init_resource::<SimObjects>()
+        .init_resource::<DiskConfig>()
+        .init_resource::<BinaryBlackHoles>()
+        .init_resource::<Pixels>()
+        .insert_resource(RenderScale(0.08)) // 64 x 48; 256-byte aligned rows for readback.
+        .add_plugins(GeodesicComputePlugin)
+        .add_systems(
+            Startup,
+            (|mut commands: Commands,
+              output: Res<DisplayImage>,
+              mut images: ResMut<Assets<Image>>| {
+                images.get_mut(&output.0).unwrap().texture_descriptor.usage |=
+                    TextureUsages::COPY_SRC;
+                commands.spawn(Readback::texture(output.0.clone())).observe(
+                    |event: On<ReadbackComplete>, mut pixels: ResMut<Pixels>| {
+                        pixels.0 = event.data.clone();
+                    },
+                );
+            })
+            .after(setup_compute_texture),
+        );
+        while app.plugins_state() != bevy::app::PluginsState::Ready {
+            bevy::tasks::tick_global_task_pools_on_main_thread();
+        }
+        app.finish();
+        app.cleanup();
+        for binary in [true, false] {
+            app.world_mut().resource_mut::<BinaryBlackHoles>().enabled = binary;
+            app.world_mut().resource_mut::<SimObjects>().0 = crate::simulation::scene_objects(
+                KERR_SPIN,
+                false,
+                binary,
+                0.0,
+                crate::simulation::default_binary_spins(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let mut frames = 0;
+            loop {
+                app.update();
+                frames += 1;
+                let pixels = &app.world().resource::<Pixels>().0;
+                if frames >= 20 && pixels.chunks_exact(4).any(|p| p[0] > 0) {
+                    assert!(pixels.chunks_exact(4).any(|p| p[..3] == [0, 0, 0]));
+                    let image = Image::new(
+                        Extent3d {
+                            width: 64,
+                            height: 48,
+                            depth_or_array_layers: 1,
+                        },
+                        TextureDimension::D2,
+                        pixels.clone(),
+                        TextureFormat::Rgba8UnormSrgb,
+                        RenderAssetUsages::MAIN_WORLD,
+                    );
+                    image
+                        .try_into_dynamic()
+                        .unwrap()
+                        .save(format!("target/render-smoke-{binary}.png"))
+                        .unwrap();
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no rendered pixels received from GPU"
+                );
+            }
+        }
     }
 }

@@ -144,7 +144,7 @@ fn setup_panel(mut commands: Commands) {
             root.spawn((
                 Text::new("CONTROLS"),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 TextColor(HEADER_COLOR),
@@ -296,7 +296,7 @@ fn spawn_step_row(
                 },
                 Text::new(label),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 TextColor(LABEL_COLOR),
@@ -310,7 +310,7 @@ fn spawn_step_row(
                 },
                 Text::new("--"),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 TextColor(VALUE_COLOR),
@@ -342,7 +342,7 @@ fn spawn_cycle_row(
                 },
                 Text::new(label),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 TextColor(LABEL_COLOR),
@@ -356,7 +356,7 @@ fn spawn_cycle_row(
                 },
                 Text::new("--"),
                 TextFont {
-                    font_size: 10.0,
+                    font_size: FontSize::Px(10.0),
                     ..default()
                 },
                 TextColor(VALUE_COLOR),
@@ -384,7 +384,7 @@ fn spawn_arrow_btn(parent: &mut ChildSpawnerCommands, symbol: &str, action: UiAc
             b.spawn((
                 Text::new(symbol),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 TextColor(Color::WHITE),
@@ -418,7 +418,7 @@ fn spawn_toggle_row(parent: &mut ChildSpawnerCommands, toggles: &[(&str, UiActio
                     b.spawn((
                         Text::new(*label),
                         TextFont {
-                            font_size: 11.0,
+                            font_size: FontSize::Px(11.0),
                             ..default()
                         },
                         TextColor(Color::WHITE),

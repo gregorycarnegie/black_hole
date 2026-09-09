@@ -8,19 +8,18 @@ use crate::{
 };
 
 // Re-export so compute::pipeline can keep its existing `use crate::simulation::…` imports.
-pub use black_hole::physics::{SAGA_RS, kerr_horizon_radius, kerr_isco_radius};
-
-pub const C: f64 = 299_792_458.0;
-pub const G_CONST: f64 = 6.6743e-11;
-pub const SAGA_MASS: f64 = 8.54e36;
+pub use black_hole::physics::{
+    SCHWARZSCHILD_RADIUS, kerr_horizon_radius_rg as kerr_horizon_radius,
+    kerr_isco_radius_rg as kerr_isco_radius,
+};
 
 /// Default dimensionless Kerr spin parameter a* = J/M². Positive = prograde.
 pub const KERR_SPIN: f32 = 0.82;
 
-/// Center-to-center separation of the binary black holes, in units of SAGA_RS.
+/// Center-to-center separation of the binary black holes, in units of SCHWARZSCHILD_RADIUS.
 pub const BINARY_SEPARATION_RS: f32 = 7.0;
 
-/// Inner radius used for the circumbinary disk cavity, in units of SAGA_RS.
+/// Inner radius used for the circumbinary disk cavity, in units of SCHWARZSCHILD_RADIUS.
 pub const BINARY_DISK_INNER_RS: f32 = 5.0;
 
 pub const BINARY_SPIN_STEP: f32 = 0.05;
@@ -97,7 +96,7 @@ impl DiskModel {
 pub struct DiskConfig {
     /// Dimensionless Kerr spin parameter a* ∈ (−0.999, 0.999).
     pub spin: f32,
-    /// Outer disk radius in units of SAGA_RS.
+    /// Outer disk radius in units of SCHWARZSCHILD_RADIUS.
     pub r_outer_rs: f32,
     /// Geometry regime / preset.
     pub model: DiskModel,
@@ -105,11 +104,11 @@ pub struct DiskConfig {
     pub h_thin: f32,
     /// H/R for the hot / thick inner component (TruncHot, Slim).
     pub h_hot: f32,
-    /// Truncation radius (TruncHot) or puff radius (Slim), in units of SAGA_RS.
+    /// Truncation radius (TruncHot) or puff radius (Slim), in units of SCHWARZSCHILD_RADIUS.
     pub r_trunc_rs: f32,
     /// Outer disk tilt angle in degrees (Warped).
     pub tilt_deg: f32,
-    /// Bardeen-Petterson alignment radius in units of SAGA_RS (Warped).
+    /// Bardeen-Petterson alignment radius in units of SCHWARZSCHILD_RADIUS (Warped).
     pub r_bp_rs: f32,
     /// Azimuthal twist per ln(r/r_bp) in degrees (Warped).
     pub twist_deg: f32,
@@ -182,6 +181,7 @@ impl Plugin for SimulationPlugin {
             .init_resource::<DebugBodiesEnabled>()
             .init_resource::<BinaryBlackHoles>()
             .init_resource::<DiskConfig>()
+            .add_systems(FixedUpdate, gravity_system)
             .add_systems(
                 Update,
                 (
@@ -189,7 +189,6 @@ impl Plugin for SimulationPlugin {
                     toggle_gravity,
                     toggle_debug_bodies,
                     update_disk_config,
-                    gravity_system,
                     animate_binary_black_holes,
                 )
                     .chain(),
@@ -199,10 +198,12 @@ impl Plugin for SimulationPlugin {
 
 #[derive(Clone, Debug)]
 pub struct SimObject {
+    /// Position and radius in r_g; mass in units of the total black-hole mass.
     pub position: Vec3,
     pub radius: f32,
     pub color: Vec4,
     pub mass: f32,
+    /// Velocity in gravitational radii per simulation time unit (c = 1).
     pub velocity: Vec3,
     /// Dimensionless spin vector a*. Direction is the spin axis; length is clamped to < 1.
     pub spin: Vec3,
@@ -248,7 +249,7 @@ fn black_hole_object(
         position,
         radius: black_hole_shadow_radius(spin.length(), mass_fraction),
         color: Vec4::new(0., 0., 0., 1.),
-        mass: SAGA_MASS as f32 * mass_fraction,
+        mass: mass_fraction,
         velocity,
         spin,
     }
@@ -259,7 +260,7 @@ fn single_black_hole(spin: f32) -> SimObject {
 }
 
 fn binary_black_holes(spins: [BinarySpin; 2], phase: f32) -> [SimObject; 2] {
-    let orbital_radius = 0.5 * BINARY_SEPARATION_RS * SAGA_RS;
+    let orbital_radius = 0.5 * BINARY_SEPARATION_RS * SCHWARZSCHILD_RADIUS;
     let angular_velocity = TAU / BINARY_ORBIT_PERIOD_SECONDS;
     let (sin_phase, cos_phase) = phase.sin_cos();
     let position = Vec3::new(cos_phase * orbital_radius, 0.0, sin_phase * orbital_radius);
@@ -287,18 +288,18 @@ pub(crate) fn scene_objects(
     if include_debug_bodies {
         objects.extend([
             SimObject {
-                position: Vec3::new(4e11, 0.0, 0.0),
-                radius: 4e10,
+                position: Vec3::new(64.0, 0.0, 0.0),
+                radius: 6.4,
                 color: Vec4::new(1., 1., 0., 1.),
-                mass: 1.98892e30,
+                mass: 2.33e-7,
                 velocity: Vec3::ZERO,
                 spin: Vec3::ZERO,
             },
             SimObject {
-                position: Vec3::new(0.0, 0.0, 4e11),
-                radius: 4e10,
+                position: Vec3::new(0.0, 0.0, 64.0),
+                radius: 6.4,
                 color: Vec4::new(1., 0., 0., 1.),
-                mass: 1.98892e30,
+                mass: 2.33e-7,
                 velocity: Vec3::ZERO,
                 spin: Vec3::ZERO,
             },
@@ -617,6 +618,7 @@ fn toggle_debug_bodies(
 }
 
 fn gravity_system(
+    time: Res<Time<Fixed>>,
     mut objects: ResMut<SimObjects>,
     gravity: Res<GravityEnabled>,
     binary: Res<BinaryBlackHoles>,
@@ -636,17 +638,16 @@ fn gravity_system(
             let diff = objects.0[j].position - objects.0[i].position;
             let dist = diff.length();
             if dist > 0.0 {
-                let force =
-                    (G_CONST as f32 * objects.0[i].mass * objects.0[j].mass) / (dist * dist);
-                let acc = force / objects.0[i].mass;
+                // G = 1; cancel the receiving mass before evaluating acceleration.
+                let acc = objects.0[j].mass / (dist * dist);
                 *acc_i += diff.normalize() * acc;
             }
         }
     }
 
     for (i, obj) in objects.0.iter_mut().enumerate() {
-        obj.velocity += accelerations[i];
-        obj.position += obj.velocity;
+        obj.velocity += accelerations[i] * time.delta_secs();
+        obj.position += obj.velocity * time.delta_secs();
     }
 }
 
@@ -666,4 +667,80 @@ fn animate_binary_black_holes(
         (binary.phase + time.delta_secs() * TAU / BINARY_ORBIT_PERIOD_SECONDS).rem_euclid(TAU);
     objects.0 = scene_objects(disk.spin, debug.0, true, binary.phase, binary.spins);
     cam.is_moving = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::time::TimeUpdateStrategy;
+    use std::time::Duration;
+
+    #[test]
+    fn gravity_uses_elapsed_time_and_is_independent_of_render_rate() {
+        let simulate = |fps: u32, enabled: bool, binary: bool| {
+            let mut app = App::new();
+            app.add_plugins(MinimalPlugins)
+                .init_resource::<ButtonInput<KeyCode>>()
+                .init_resource::<OrbitalCamera>()
+                .add_plugins(SimulationPlugin)
+                .insert_resource(GravityEnabled(enabled))
+                .insert_resource(DebugBodiesEnabled(true))
+                .insert_resource(BinaryBlackHoles {
+                    enabled: binary,
+                    ..default()
+                })
+                .insert_resource(SimObjects(scene_objects(
+                    KERR_SPIN,
+                    true,
+                    false,
+                    0.0,
+                    default_binary_spins(),
+                )))
+                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+            app.update();
+            let mut elapsed = Duration::ZERO;
+            for frame in 1..=fps * 4 {
+                let next = Duration::from_secs_f64(frame as f64 / fps as f64);
+                app.insert_resource(TimeUpdateStrategy::ManualDuration(next - elapsed));
+                app.update();
+                elapsed = next;
+            }
+            app.world().resource::<SimObjects>().0.clone()
+        };
+        let reference = simulate(60, true, false);
+        assert!(reference[0].velocity.x < 0.0);
+        assert!(reference[0].position.x < 64.0);
+        for fps in [30, 120] {
+            for (actual, expected) in simulate(fps, true, false).iter().zip(&reference) {
+                assert!(actual.position.is_finite() && actual.velocity.is_finite());
+                assert_eq!(actual.position, expected.position);
+                assert_eq!(actual.velocity, expected.velocity);
+            }
+        }
+        assert_eq!(simulate(60, false, false)[0].position.x, 64.0);
+        assert_eq!(simulate(60, true, true)[0].position.x, 64.0);
+
+        // A massless test particle still accelerates; one half-unit step at r=10.
+        let mut source = single_black_hole(0.0);
+        source.mass = 1.0;
+        let mut tracer = source.clone();
+        tracer.position = Vec3::X * 10.0;
+        tracer.mass = 0.0;
+        let mut app = App::new();
+        let mut time = Time::<Fixed>::default();
+        time.advance_by(Duration::from_secs_f32(0.5));
+        app.insert_resource(time)
+            .insert_resource(GravityEnabled(true))
+            .insert_resource(BinaryBlackHoles {
+                enabled: false,
+                ..default()
+            })
+            .insert_resource(SimObjects(vec![source, tracer]))
+            .add_systems(FixedUpdate, gravity_system);
+        app.world_mut().run_schedule(FixedUpdate);
+        let objects = app.world().resource::<SimObjects>();
+        assert!((objects.0[1].velocity.x + 0.005).abs() < 1e-7);
+        assert!((objects.0[1].position.x - 9.9975).abs() < 1e-6);
+        assert_eq!(objects.0[0].velocity, Vec3::ZERO);
+    }
 }

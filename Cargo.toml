@@ -4,10 +4,12 @@ version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-bevy = "0.18.1"
-bytemuck = { version = "1.25.0", features = ["derive"] }
+bevy = "0.19.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 
 [dev-dependencies]
+# Reuse Bevy's shader validator for offline WGSL regression checks.
+naga = { version = "30.0.1", features = ["wgsl-in"] }
 proptest = "1.11.0"
 
 # Fast compiles in dev

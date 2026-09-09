@@ -1,6 +1,9 @@
 /// Schwarzschild radius of Sagittarius A* in metres (2GM/c²).
 pub const SAGA_RS: f32 = 1.269e10;
 
+/// Schwarzschild radius in gravitational units, r_g = GM/c² = 1.
+pub const SCHWARZSCHILD_RADIUS: f32 = 2.0;
+
 const KERR_SPIN_LIMIT: f32 = 0.999;
 
 /// Kerr event-horizon radius r₊ = M(1 + √(1 − a²)) in metres.
@@ -37,15 +40,20 @@ const KERR_SPIN_LIMIT: f32 = 0.999;
 /// assert!((kerr_horizon_radius(0.7) - kerr_horizon_radius(-0.7)).abs() < 1.0);
 /// ```
 pub fn kerr_horizon_radius(spin: f32) -> f32 {
+    0.5 * SAGA_RS * kerr_horizon_radius_rg(spin)
+}
+
+/// Kerr horizon in gravitational radii, independent of the physical mass.
+pub fn kerr_horizon_radius_rg(spin: f32) -> f32 {
     let a = spin.abs().min(KERR_SPIN_LIMIT);
-    0.5 * SAGA_RS * (1.0 + (1.0 - a * a).sqrt())
+    1.0 + (1.0 - a * a).sqrt()
 }
 
 /// Kerr ISCO radius using the Bardeen-Press-Teukolsky formula, in metres.
 ///
 /// For prograde orbits (spin > 0) the ISCO lies inside the Schwarzschild value
 /// of 3 r_s (= 6M); for retrograde orbits (spin < 0) it moves outward, up to
-/// 9 r_s at the extremal limit. The ISCO is always outside the event horizon.
+/// 9 M (= 4.5 r_s) at the extremal limit. The ISCO is always outside the event horizon.
 ///
 /// The spin is clamped to (−0.999, 0.999).
 ///
@@ -77,6 +85,11 @@ pub fn kerr_horizon_radius(spin: f32) -> f32 {
 /// assert!(kerr_isco_radius(-0.9) > 3.0 * SAGA_RS);
 /// ```
 pub fn kerr_isco_radius(spin: f32) -> f32 {
+    0.5 * SAGA_RS * kerr_isco_radius_rg(spin)
+}
+
+/// Kerr ISCO in gravitational radii, independent of the physical mass.
+pub fn kerr_isco_radius_rg(spin: f32) -> f32 {
     let a = spin.clamp(-KERR_SPIN_LIMIT, KERR_SPIN_LIMIT);
     let abs_a = a.abs();
     let z1 = 1.0
@@ -84,8 +97,7 @@ pub fn kerr_isco_radius(spin: f32) -> f32 {
             * ((1.0 + abs_a).powf(1.0 / 3.0) + (1.0 - abs_a).powf(1.0 / 3.0));
     let z2 = (3.0 * abs_a * abs_a + z1 * z1).sqrt();
     let direction = if a >= 0.0 { -1.0 } else { 1.0 };
-    let r_over_m = 3.0 + z2 + direction * ((3.0 - z1) * (3.0 + z1 + 2.0 * z2)).sqrt();
-    0.5 * SAGA_RS * r_over_m
+    3.0 + z2 + direction * ((3.0 - z1) * (3.0 + z1 + 2.0 * z2)).sqrt()
 }
 
 #[cfg(test)]
