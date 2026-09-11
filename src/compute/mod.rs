@@ -66,7 +66,7 @@ pub struct RenderFrameCount(pub u32);
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct FrameParity(pub bool);
 
-/// Camera data packed for the uniform buffer (matches Camera struct in geodesic.wgsl, 96 bytes).
+/// Camera data packed for the uniform buffer (matches Camera struct in geodesic.wgsl, 112 bytes).
 #[derive(Resource, Clone, Default, ExtractResource)]
 pub struct CameraUniform {
     pub pos: Vec3,
@@ -86,6 +86,10 @@ pub struct CameraUniform {
     pub debug_heatmap: u32,
     /// Maximum geodesic steps per pixel.
     pub max_iter: u32,
+    pub polarization_view: u32,
+    pub frequency_ghz: f32,
+    pub faraday_depth: f32,
+    pub conversion_depth: f32,
     pub _pad7: f32,
 }
 
@@ -334,7 +338,12 @@ fn sync_camera_uniform(
 
     // fc = frame_count sent to the GPU for THIS render frame.
     // 0 means "reset accumulation", ≥1 means "blend".
-    let scene_moving = cam.is_moving || objects.is_changed();
+    let scene_moving = cam.is_moving
+        || objects.is_changed()
+        || uniform.polarization_view != cam.polarization_view
+        || uniform.frequency_ghz != cam.frequency_ghz
+        || uniform.faraday_depth != cam.faraday_depth
+        || uniform.conversion_depth != cam.conversion_depth;
     let fc = if scene_moving { 0u32 } else { counter.0 };
     render_fc.0 = fc;
     // even fc → parity=true → b_prev bind group (writes into AccumA)
@@ -372,6 +381,10 @@ fn sync_camera_uniform(
         jitter_y: jy,
         debug_heatmap: cam.debug_heatmap as u32,
         max_iter: cam.max_iter,
+        polarization_view: cam.polarization_view,
+        frequency_ghz: cam.frequency_ghz,
+        faraday_depth: cam.faraday_depth,
+        conversion_depth: cam.conversion_depth,
         _pad7: 0.0,
     };
 }
@@ -605,14 +618,15 @@ mod tests {
                     synchronous_pipeline_compilation: true,
                     ..default()
                 })
-                .disable::<WinitPlugin>(),
+                .disable::<WinitPlugin>()
+                .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>(),
         )
         .init_resource::<OrbitalCamera>()
         .init_resource::<SimObjects>()
         .init_resource::<DiskConfig>()
         .init_resource::<BinaryBlackHoles>()
         .init_resource::<Pixels>()
-        .insert_resource(RenderScale(0.08)) // 64 x 48; 256-byte aligned rows for readback.
+        .insert_resource(RenderScale(0.16)) // 128 x 96; 256-byte aligned rows for readback.
         .add_plugins(GeodesicComputePlugin)
         .add_systems(
             Startup,
@@ -634,7 +648,32 @@ mod tests {
         }
         app.finish();
         app.cleanup();
-        for binary in [true, false] {
+        {
+            let world = app.world();
+            pipeline::check_relativity(
+                world.resource::<bevy::render::renderer::RenderDevice>(),
+                world.resource::<bevy::render::renderer::RenderQueue>(),
+            );
+        }
+        use crate::simulation::DiskModel;
+        let mut previous = Vec::new();
+        for (binary, model, view) in [
+            (true, DiskModel::ThinNt, 0),
+            (false, DiskModel::ThinNt, 0),
+            (false, DiskModel::TruncatedHotFlow, 1),
+            (false, DiskModel::TruncatedHotFlow, 2),
+            (false, DiskModel::TruncatedHotFlow, 5),
+            (true, DiskModel::TruncatedHotFlow, 1),
+        ] {
+            *app.world_mut().resource_mut::<DiskConfig>() = DiskConfig::for_model(model, KERR_SPIN);
+            {
+                let mut camera = app.world_mut().resource_mut::<OrbitalCamera>();
+                camera.polarization_view = view;
+                camera.is_moving = true; // deterministic rays, reset accumulation for every frame
+                camera.frequency_ghz = 90.0;
+                camera.conversion_depth = 3.0;
+            }
+            app.world_mut().resource_mut::<Pixels>().0.clear();
             app.world_mut().resource_mut::<BinaryBlackHoles>().enabled = binary;
             app.world_mut().resource_mut::<SimObjects>().0 = crate::simulation::scene_objects(
                 KERR_SPIN,
@@ -647,14 +686,41 @@ mod tests {
             let mut frames = 0;
             loop {
                 app.update();
+                app.world()
+                    .resource::<bevy::render::renderer::RenderDevice>()
+                    .poll(bevy::render::render_resource::PollType::Wait {
+                        submission_index: None,
+                        timeout: Some(Duration::from_secs(30)),
+                    })
+                    .unwrap();
                 frames += 1;
                 let pixels = &app.world().resource::<Pixels>().0;
-                if frames >= 20 && pixels.chunks_exact(4).any(|p| p[0] > 0) {
-                    assert!(pixels.chunks_exact(4).any(|p| p[..3] == [0, 0, 0]));
+                if frames >= 10
+                    && pixels != &previous
+                    && pixels.as_chunks::<4>().0.iter().any(|p| p[0] > 0)
+                {
+                    assert!(
+                        pixels
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .any(|p| p[..3] == [0, 0, 0])
+                    );
+                    if view == 1 {
+                        assert!(
+                            pixels
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .all(|p| p[0] == p[1] && p[1] == p[2]),
+                            "linear fraction must be grayscale"
+                        );
+                    }
+                    previous = pixels.clone();
                     let image = Image::new(
                         Extent3d {
-                            width: 64,
-                            height: 48,
+                            width: 128,
+                            height: 96,
                             depth_or_array_layers: 1,
                         },
                         TextureDimension::D2,
@@ -665,13 +731,13 @@ mod tests {
                     image
                         .try_into_dynamic()
                         .unwrap()
-                        .save(format!("target/render-smoke-{binary}.png"))
+                        .save(format!("target/render-smoke-{binary}-{view}.png"))
                         .unwrap();
                     break;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "no rendered pixels received from GPU"
+                    "no updated rendered pixels from GPU for binary={binary}, view={view}"
                 );
             }
         }

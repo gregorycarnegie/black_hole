@@ -19,7 +19,11 @@ struct Camera {
     jitter_y:      f32,
     debug_heatmap: u32,
     max_iter:      u32,
-    _pad7:         f32,
+    polarization_view: u32,
+    frequency_ghz: f32,
+    faraday_depth: f32,
+    conversion_depth: f32,
+    _pad7: f32,
 }
 @group(0) @binding(1) var<uniform> cam: Camera;
 
@@ -60,305 +64,206 @@ struct Objects {
 @group(0) @binding(4) var skybox: texture_2d<f32>;
 
 // -- Constants ---------------------------------------------------------------
+const PI: f32 = 3.141592653589793;
+const SCHWARZSCHILD_RADIUS: f32 = 2.0;
+const ESCAPE_R: f32 = 1600.0;
 
-const PI:             f32 = 3.141592653589793;
-const SCHWARZSCHILD_RADIUS:        f32 = 2.0; // r_g = GM/c^2 = 1
-const BH_M:           f32 = 0.5 * SCHWARZSCHILD_RADIUS;
-const INV_BH_M:       f32 = 1.0 / BH_M;
-const INV_BH_M2:      f32 = INV_BH_M * INV_BH_M;
-const D_LAMBDA_BASE:  f32 = 0.0016;
-const D_LAMBDA_MAX:   f32 = 1.6;
-const ESCAPE_R:       f32 = 1600.0;
-const SIN2_FLOOR:     f32 = 1.0e-6;
-const DELTA_FLOOR:    f32 = 1.0e-5;
-const BINARY_TRACE_STEPS: u32 = 768u;
-const BINARY_BEND_MULTIPLIER: f32 = 2.0;
-const BINARY_FRAME_DRAG_MULTIPLIER: f32 = 4.0;
+// Cartesian ingoing Kerr-Schild, signature (-,+,+,+), vector order (t,x,y,z).
+// g = eta + sum(2 H l l^T). One source is exact Kerr outside excision.
+// ponytail: frozen, unboosted superposition for separated binaries; use evolved
+// numerical-relativity metric data for inspiral/merger or retarded-time imaging.
+const ETA = mat4x4<f32>(vec4<f32>(-1,0,0,0), vec4<f32>(0,1,0,0),
+                        vec4<f32>(0,0,1,0), vec4<f32>(0,0,0,1));
 
-// -- Kerr metric helpers -----------------------------------------------------
-
-fn spin_clamped() -> f32 {
-    return clamp(disk.spin, -0.999, 0.999);
+fn outer(a: vec4<f32>, b: vec4<f32>) -> mat4x4<f32> {
+    return mat4x4<f32>(a*b.x, a*b.y, a*b.z, a*b.w);
 }
 
-fn metric_rho(r: f32) -> f32 {
-    let horizon_rho = max(disk.horizon_r * INV_BH_M, 1.0);
-    return max(r * INV_BH_M, horizon_rho + 1.0e-4);
+fn kerr_radius(x: vec3<f32>, a: vec3<f32>) -> f32 {
+    let q = dot(x,x) - dot(a,a);
+    let ax = dot(a,x);
+    let root = sqrt(q*q + 4.0*ax*ax);
+    // Rationalized negative-q branch avoids cancellation near the Kerr disk.
+    var r2 = 0.5 * (q + root);
+    if q < 0.0 { r2 = 2.0*ax*ax / max(root-q, 1.0e-20); }
+    return sqrt(max(r2, 1.0e-12));
 }
 
-fn kerr_static_limit(theta: f32, a2: f32) -> f32 {
-    let c = cos(theta);
-    return BH_M * (1.0 + sqrt(max(1.0 - a2 * c * c, 0.0)));
+struct Metric {
+    g: mat4x4<f32>,
+    inv: mat4x4<f32>,
+    dx: mat4x4<f32>,
+    dy: mat4x4<f32>,
+    dz: mat4x4<f32>,
+    clearance: f32,
+    valid: bool,
 }
 
-struct CovMetric {
-    g_tt:         f32,
-    g_tphi:       f32,
-    g_rr:         f32,
-    g_thetatheta: f32,
-    g_phiphi:     f32,
+fn flat_metric() -> Metric {
+    var m: Metric;
+    m.g = ETA;
+    m.inv = ETA;
+    m.clearance = ESCAPE_R;
+    m.valid = true;
+    return m;
 }
 
-fn cov_metric(r: f32, theta: f32, a: f32) -> CovMetric {
-    let rho = metric_rho(r);
-    let a2 = a * a;
-    let sin_t = sin(theta);
-    let cos_t = cos(theta);
-    let sin2_t = max(sin_t * sin_t, SIN2_FLOOR);
-    let rho2 = rho * rho;
-    let sigma = rho2 + a2 * cos_t * cos_t;
-    let delta = max(rho2 - 2.0 * rho + a2, DELTA_FLOOR);
-    let rr_aa = rho2 + a2;
-    let big_a = rr_aa * rr_aa - a2 * delta * sin2_t;
-    let m2 = BH_M * BH_M;
-
-    var g: CovMetric;
-    g.g_tt = -(1.0 - 2.0 * rho / sigma);
-    g.g_tphi = -2.0 * a * rho * BH_M * sin2_t / sigma;
-    g.g_rr = sigma / delta;
-    g.g_thetatheta = m2 * sigma;
-    g.g_phiphi = m2 * big_a * sin2_t / sigma;
-    return g;
+fn add_kerr(base: Metric, x: vec3<f32>, mass: f32, spin: vec3<f32>) -> Metric {
+    var m = base;
+    if mass <= 0.0 { return m; }
+    let a = mass * spin / max(1.0, length(spin)/0.999);
+    let a2 = dot(a,a);
+    let ax = dot(a,x);
+    let raw_r = kerr_radius(x,a);
+    let horizon = mass + sqrt(max(mass*mass-a2, 0.0));
+    m.clearance = min(m.clearance, raw_r-horizon);
+    // RK stages may enter excision; reject the step before using these values.
+    let r = max(raw_r, 0.8*horizon);
+    let r2 = r*r;
+    let den = r2*r2 + ax*ax;
+    let h = mass*r*r2/den;
+    let numerator = r*x - cross(a,x) + (ax/r)*a;
+    let ell = vec4<f32>(1.0, numerator/(r2+a2));
+    let ll = outer(ell,ell);
+    let dr = (r*x + (ax/r)*a) / max(2.0*r2-dot(x,x)+a2, 1.0e-12);
+    var deriv: array<mat4x4<f32>,3>;
+    for (var j=0u; j<3u; j++) {
+        var ej = vec3<f32>(0.0);
+        ej[j] = 1.0;
+        let dh = h*(3.0*dr[j]/r - (4.0*r*r2*dr[j]+2.0*ax*a[j])/den);
+        let dn = dr[j]*x + r*ej - cross(a,ej) + (a[j]/r-ax*dr[j]/r2)*a;
+        let dl = vec4<f32>(0.0, (dn - ell.yzw*2.0*r*dr[j])/(r2+a2));
+        deriv[j] = 2.0*dh*ll + 2.0*h*(outer(dl,ell)+outer(ell,dl));
+    }
+    m.g += 2.0*h*ll;
+    m.dx += deriv[0]; m.dy += deriv[1]; m.dz += deriv[2];
+    // Sherman-Morrison inverts the SUM, including inter-source cross terms.
+    let raised = m.inv*ell;
+    let divisor = 1.0 + 2.0*h*dot(ell,raised);
+    if divisor <= 1.0e-6 { m.valid = false; return m; }
+    m.inv -= (2.0*h/divisor)*outer(raised,raised);
+    m.valid = m.valid && m.inv[0][0] < -1.0e-6;
+    return m;
 }
 
-struct ContraMetric {
-    g_tt:             f32,
-    g_tphi:           f32,
-    g_rr:             f32,
-    g_thetatheta:     f32,
-    g_phiphi:         f32,
-    dg_tt_dr:         f32,
-    dg_tphi_dr:       f32,
-    dg_rr_dr:         f32,
-    dg_thetatheta_dr: f32,
-    dg_phiphi_dr:     f32,
-    dg_tt_dt:         f32,
-    dg_tphi_dt:       f32,
-    dg_rr_dt:         f32,
-    dg_thetatheta_dt: f32,
-    dg_phiphi_dt:     f32,
+fn scene_metric(pos: vec3<f32>) -> Metric {
+    var m = flat_metric();
+    for (var i=0; i<objects.num_objects; i++) {
+        m = add_kerr(m, pos-objects.pos_radius[i].xyz,
+                     max(objects.mass[i].x,0.0), objects.spin[i].xyz);
+    }
+    return m;
 }
 
-fn contra_metric(r: f32, theta: f32, a: f32) -> ContraMetric {
-    let rho = metric_rho(r);
-    let rho2 = rho * rho;
-    let a2 = a * a;
-    let sin_t = sin(theta);
-    let cos_t = cos(theta);
-    let sin2_raw = sin_t * sin_t;
-    let sin2_t = max(sin2_raw, SIN2_FLOOR);
-    let d_sin2_dt = select(0.0, 2.0 * sin_t * cos_t, sin2_raw >= SIN2_FLOOR);
-
-    let sigma = rho2 + a2 * cos_t * cos_t;
-    let d_sigma_drho = 2.0 * rho;
-    let d_sigma_dt = -2.0 * a2 * sin_t * cos_t;
-
-    let delta_raw = rho2 - 2.0 * rho + a2;
-    let delta = max(delta_raw, DELTA_FLOOR);
-    let d_delta_drho = select(0.0, 2.0 * rho - 2.0, delta_raw >= DELTA_FLOOR);
-
-    let rr_aa = rho2 + a2;
-    let big_a = rr_aa * rr_aa - a2 * delta * sin2_t;
-    let d_big_a_drho = 4.0 * rho * rr_aa - a2 * d_delta_drho * sin2_t;
-    let d_big_a_dt = -a2 * delta * d_sin2_dt;
-
-    let den = max(delta * sigma, 1.0e-6);
-    let d_den_drho = d_delta_drho * sigma + delta * d_sigma_drho;
-    let d_den_dt = delta * d_sigma_dt;
-    let inv_den = 1.0 / den;
-    let inv_den2 = inv_den * inv_den;
-    let inv_sigma = 1.0 / sigma;
-    let inv_sigma2 = inv_sigma * inv_sigma;
-    let inv_sin2 = 1.0 / sin2_t;
-
-    var g: ContraMetric;
-    let p = delta - a2 * sin2_t;
-    g.g_tt = -big_a * inv_den;
-    g.g_tphi = -2.0 * a * rho * INV_BH_M * inv_den;
-    g.g_rr = delta * inv_sigma;
-    g.g_thetatheta = INV_BH_M2 * inv_sigma;
-    g.g_phiphi = p * INV_BH_M2 * inv_den * inv_sin2;
-
-    let dgtt_drho = -(d_big_a_drho * den - big_a * d_den_drho) * inv_den2;
-    let dgtt_dt = -(d_big_a_dt * den - big_a * d_den_dt) * inv_den2;
-
-    let tphi_num = -2.0 * a * rho;
-    let dtphi_num_drho = -2.0 * a;
-    let dgtphi_drho = INV_BH_M * (dtphi_num_drho * den - tphi_num * d_den_drho) * inv_den2;
-    let dgtphi_dt = -INV_BH_M * tphi_num * d_den_dt * inv_den2;
-
-    let dgrr_drho = (d_delta_drho * sigma - delta * d_sigma_drho) * inv_sigma2;
-    let dgrr_dt = -delta * d_sigma_dt * inv_sigma2;
-
-    let dgth_drho = -INV_BH_M2 * d_sigma_drho * inv_sigma2;
-    let dgth_dt = -INV_BH_M2 * d_sigma_dt * inv_sigma2;
-
-    let dp_drho = d_delta_drho;
-    let dp_dt = -a2 * d_sin2_dt;
-    let pp_den = den * sin2_t;
-    let inv_pp_den = select(1.0e6, inv_den * inv_sin2, pp_den >= 1.0e-6);
-    let inv_pp_den2 = inv_pp_den * inv_pp_den;
-    let d_pp_den_drho = d_den_drho * sin2_t;
-    let d_pp_den_dt = d_den_dt * sin2_t + den * d_sin2_dt;
-    let dgpp_drho = INV_BH_M2 * (dp_drho * pp_den - p * d_pp_den_drho) * inv_pp_den2;
-    let dgpp_dt = INV_BH_M2 * (dp_dt * pp_den - p * d_pp_den_dt) * inv_pp_den2;
-
-    g.dg_tt_dr = dgtt_drho * INV_BH_M;
-    g.dg_tphi_dr = dgtphi_drho * INV_BH_M;
-    g.dg_rr_dr = dgrr_drho * INV_BH_M;
-    g.dg_thetatheta_dr = dgth_drho * INV_BH_M;
-    g.dg_phiphi_dr = dgpp_drho * INV_BH_M;
-    g.dg_tt_dt = dgtt_dt;
-    g.dg_tphi_dt = dgtphi_dt;
-    g.dg_rr_dt = dgrr_dt;
-    g.dg_thetatheta_dt = dgth_dt;
-    g.dg_phiphi_dt = dgpp_dt;
-    return g;
+fn spatial_metric(m: Metric) -> mat3x3<f32> {
+    return mat3x3<f32>(m.g[1].yzw, m.g[2].yzw, m.g[3].yzw);
 }
 
-// -- Ray state ---------------------------------------------------------------
+fn spatial_unit(v: vec3<f32>, gamma: mat3x3<f32>) -> vec3<f32> {
+    return v * inverseSqrt(max(dot(v,gamma*v), 1.0e-20));
+}
 
 struct Ray {
-    x:      f32,
-    y:      f32,
-    z:      f32,
-    r:      f32,
-    theta:  f32,
-    phi:    f32,
-    pr:     f32,
-    ptheta: f32,
-    e:      f32,
-    l:      f32,
+    pos: vec3<f32>,
+    p: vec4<f32>,       // covariant photon momentum; p_t conserved in frozen metric
+    screen: vec4<f32>,  // parallel-transported horizontal polarization basis
 }
 
-fn init_ray(pos: vec3<f32>, dir: vec3<f32>, a: f32) -> Ray {
-    var ray: Ray;
-    ray.x = pos.x; ray.y = pos.y; ray.z = pos.z;
-    ray.r = max(length(pos), BH_M);
-    ray.theta = acos(clamp(pos.y / ray.r, -1.0, 1.0));
-    ray.phi = atan2(pos.z, pos.x);
-
-    let sin_t = sin(ray.theta);
-    let cos_t = cos(ray.theta);
-    let sin_p = sin(ray.phi);
-    let cos_p = cos(ray.phi);
-
-    let dr = sin_t * cos_p * dir.x
-           + cos_t * dir.y
-           + sin_t * sin_p * dir.z;
-    let dtheta = (cos_t * cos_p * dir.x
-               - sin_t * dir.y
-               + cos_t * sin_p * dir.z) / ray.r;
-    let dphi_denom = ray.r * sin_t;
-    let dphi = select(
-        (-sin_p * dir.x + cos_p * dir.z) / dphi_denom,
-        0.0,
-        abs(dphi_denom) < 1.0e-10
-    );
-
-    let g = cov_metric(ray.r, ray.theta, a);
-    let spatial = g.g_rr * dr * dr
-                + g.g_thetatheta * dtheta * dtheta
-                + g.g_phiphi * dphi * dphi;
-    let qa = g.g_tt;
-    let qb = 2.0 * g.g_tphi * dphi;
-    let disc = max(qb * qb - 4.0 * qa * spatial, 0.0);
-    let denom = select(2.0 * qa, -1.0e-6, abs(qa) < 5.0e-7);
-    let dt_dlambda = (-qb - sqrt(disc)) / denom;
-
-    ray.e = -(g.g_tt * dt_dlambda + g.g_tphi * dphi);
-    ray.l = g.g_tphi * dt_dlambda + g.g_phiphi * dphi;
-    ray.pr = g.g_rr * dr;
-    ray.ptheta = g.g_thetatheta * dtheta;
-    return ray;
+fn init_ray(pos: vec3<f32>, dir: vec3<f32>, m: Metric) -> Ray {
+    let gamma = spatial_metric(m);
+    let forward = spatial_unit(cam.forward,gamma);
+    let right = spatial_unit(cam.right-forward*dot(forward,gamma*cam.right),gamma);
+    let up = spatial_unit(cam.up-forward*dot(forward,gamma*cam.up)
+        -right*dot(right,gamma*cam.up),gamma);
+    let n = spatial_unit(dot(dir,cam.forward)*forward + dot(dir,cam.right)*right
+        + dot(dir,cam.up)*up,gamma);
+    let lapse = inverseSqrt(-m.inv[0][0]);
+    let shift = -m.inv[0].yzw/m.inv[0][0];
+    // Past-directed null tangent with unit energy in the camera Eulerian frame.
+    let k = vec4<f32>(-1.0/lapse, n+shift/lapse);
+    let screen = spatial_unit(right-n*dot(n,gamma*right),gamma);
+    return Ray(pos,m.g*k,vec4<f32>(0.0,screen));
 }
 
-// -- Geodesic RHS and integration -------------------------------------------
+struct Derivs { pos: vec3<f32>, p: vec4<f32>, screen: vec4<f32> }
 
-struct Derivs {
-    dq: vec3<f32>,
-    dp: vec2<f32>,
+fn geodesic_rhs(ray: Ray, m: Metric) -> Derivs {
+    let k = m.inv*ray.p;
+    let dg_k = k.y*m.dx + k.z*m.dy + k.w*m.dz;
+    let dg_f = ray.screen.y*m.dx + ray.screen.z*m.dy + ray.screen.w*m.dz;
+    let contracted = vec4<f32>(0.0, dot(k,m.dx*ray.screen),
+        dot(k,m.dy*ray.screen),dot(k,m.dz*ray.screen));
+    return Derivs(k.yzw,
+        0.5*vec4<f32>(0.0,dot(k,m.dx*k),dot(k,m.dy*k),dot(k,m.dz*k)),
+        -0.5*m.inv*(dg_k*ray.screen + dg_f*k - contracted));
 }
 
-fn geodesic_rhs(ray: Ray, a: f32) -> Derivs {
-    let g = contra_metric(ray.r, ray.theta, a);
-    let e = ray.e;
-    let l = ray.l;
-    let pr = ray.pr;
-    let ptheta = ray.ptheta;
-    let e2 = e * e;
-    let two_el = 2.0 * e * l;
-    let pr2 = pr * pr;
-    let ptheta2 = ptheta * ptheta;
-    let l2 = l * l;
-
-    var d: Derivs;
-    d.dq.x = g.g_rr * pr;
-    d.dq.y = g.g_thetatheta * ptheta;
-    d.dq.z = -g.g_tphi * e + g.g_phiphi * l;
-
-    d.dp.x = -0.5 * (
-        g.dg_tt_dr * e2
-        - g.dg_tphi_dr * two_el
-        + g.dg_rr_dr * pr2
-        + g.dg_thetatheta_dr * ptheta2
-        + g.dg_phiphi_dr * l2
-    );
-    d.dp.y = -0.5 * (
-        g.dg_tt_dt * e2
-        - g.dg_tphi_dt * two_el
-        + g.dg_rr_dt * pr2
-        + g.dg_thetatheta_dt * ptheta2
-        + g.dg_phiphi_dt * l2
-    );
-    return d;
+fn rk_state(ray: Ray, d: Derivs, h: f32) -> Ray {
+    return Ray(ray.pos+h*d.pos,ray.p+h*d.p,ray.screen+h*d.screen);
 }
 
-fn rk4_state(base: Ray, k: Derivs, h: f32) -> Ray {
-    var s = base;
-    s.r      = base.r      + h * k.dq.x;
-    s.theta  = base.theta  + h * k.dq.y;
-    s.phi    = base.phi    + h * k.dq.z;
-    s.pr     = base.pr     + h * k.dp.x;
-    s.ptheta = base.ptheta + h * k.dp.y;
-    return s;
+fn step_ray(ray: Ray, h: f32, m: Metric) -> Ray {
+    let k1 = geodesic_rhs(ray,m);
+    let r2 = rk_state(ray,k1,0.5*h);
+    let k2 = geodesic_rhs(r2,scene_metric(r2.pos));
+    let r3 = rk_state(ray,k2,0.5*h);
+    let k3 = geodesic_rhs(r3,scene_metric(r3.pos));
+    let r4 = rk_state(ray,k3,h);
+    let k4 = geodesic_rhs(r4,scene_metric(r4.pos));
+    return rk_state(ray,Derivs(k1.pos+2.0*k2.pos+2.0*k3.pos+k4.pos,
+        k1.p+2.0*k2.p+2.0*k3.p+k4.p,
+        k1.screen+2.0*k2.screen+2.0*k3.screen+k4.screen),h/6.0);
 }
 
-fn normalize_angles(ray: Ray) -> Ray {
-    var r = ray;
-    if r.theta < 0.0 {
-        r.theta = -r.theta;
-        r.phi += PI;
-        r.ptheta = -r.ptheta;
-    }
-    if r.theta > PI {
-        r.theta = 2.0 * PI - r.theta;
-        r.phi += PI;
-        r.ptheta = -r.ptheta;
-    }
-    return r;
+// Gauge-fix the transported screen to the local Eulerian observer. Adding a
+// multiple of k leaves the physical polarization unchanged.
+fn screen_frame(ray: Ray, m: Metric) -> mat3x3<f32> {
+    let k = m.inv*ray.p;
+    let shift = -m.inv[0].yzw/m.inv[0][0];
+    let gamma = spatial_metric(m);
+    let n = spatial_unit(k.yzw+shift*k.x,gamma);
+    let f = ray.screen.yzw-k.yzw*(ray.screen.x/k.x);
+    let e1 = spatial_unit(f-n*dot(n,gamma*f),gamma);
+    let e2 = spatial_unit(cross(gamma*n,gamma*e1),gamma);
+    return mat3x3<f32>(e1,e2,n);
 }
 
-fn step_ray(ray: Ray, dL: f32, a: f32) -> Ray {
-    let k1 = geodesic_rhs(ray, a);
-    let k2 = geodesic_rhs(rk4_state(ray, k1, 0.5 * dL), a);
-    let k3 = geodesic_rhs(rk4_state(ray, k2, 0.5 * dL), a);
-    let k4 = geodesic_rhs(rk4_state(ray, k3,       dL), a);
+// -- Polarized transfer ------------------------------------------------------
+// S=(I,Q,U,V); dP/ds = rho x P - alpha P + j_P, P=(Q,U,V).
+// Scalar absorption, no dichroism. The exact constant-cell solution stays
+// bounded at large Faraday depth; foreground operators compose camera-outward.
+fn faraday_rotation(rho: vec3<f32>, ds: f32) -> mat3x3<f32> {
+    let w = length(rho);
+    let axis = rho/max(w,1.0e-20);
+    let angle = w*ds;
+    let c = cos(angle); let s = sin(angle);
+    let identity = mat3x3<f32>(vec3<f32>(1,0,0),vec3<f32>(0,1,0),vec3<f32>(0,0,1));
+    let cross_matrix = mat3x3<f32>(vec3<f32>(0,axis.z,-axis.y),
+        vec3<f32>(-axis.z,0,axis.x),vec3<f32>(axis.y,-axis.x,0));
+    let aa = mat3x3<f32>(axis*axis.x,axis*axis.y,axis*axis.z);
+    return c*identity+s*cross_matrix+(1.0-c)*aa;
+}
 
-    let s = dL / 6.0;
-    var r = ray;
-    r.r      += s * (k1.dq.x + 2.0 * k2.dq.x + 2.0 * k3.dq.x + k4.dq.x);
-    r.theta  += s * (k1.dq.y + 2.0 * k2.dq.y + 2.0 * k3.dq.y + k4.dq.y);
-    r.phi    += s * (k1.dq.z + 2.0 * k2.dq.z + 2.0 * k3.dq.z + k4.dq.z);
-    r.pr     += s * (k1.dp.x + 2.0 * k2.dp.x + 2.0 * k3.dp.x + k4.dp.x);
-    r.ptheta += s * (k1.dp.y + 2.0 * k2.dp.y + 2.0 * k3.dp.y + k4.dp.y);
-    r = normalize_angles(r);
+fn absorption_integral(alpha: f32, ds: f32) -> f32 {
+    let tau = alpha*ds;
+    if abs(tau) < 1.0e-3 { return ds*(1.0-0.5*tau+tau*tau/6.0); }
+    return (1.0-exp(-tau))/alpha;
+}
 
-    let sin_t = sin(r.theta);
-    r.x = r.r * sin_t * cos(r.phi);
-    r.y = r.r * cos(r.theta);
-    r.z = r.r * sin_t * sin(r.phi);
-    return r;
+fn polarized_cell(j: vec4<f32>, alpha: f32, rho: vec3<f32>, ds: f32) -> vec4<f32> {
+    let integral = absorption_integral(alpha,ds);
+    let w = length(rho);
+    if w*ds < 1.0e-5 { return j*integral; }
+    let axis = rho/w;
+    let parallel = axis*dot(axis,j.yzw);
+    let perpendicular = j.yzw-parallel;
+    let e = exp(-alpha*ds);
+    let angle = w*ds;
+    let den = alpha*alpha+w*w;
+    let ic = (alpha*(1.0-e*cos(angle))+w*e*sin(angle))/den;
+    let is = (w*(1.0-e*cos(angle))-alpha*e*sin(angle))/den;
+    return vec4<f32>(j.x*integral,
+        integral*parallel+ic*perpendicular+is*cross(axis,perpendicular));
 }
 
 // -- Intersection tests ------------------------------------------------------
@@ -458,104 +363,6 @@ fn hot_emissivity_t(r: f32) -> f32 {
     return pow(clamp(r0 / max(r, r0), 0.0, 1.0), 0.6);
 }
 
-// Blackbody colour for synchrotron-dominated hot flow (orange → pale gold).
-fn hot_blackbody_color(t: f32) -> vec3<f32> {
-    let s = clamp(t, 0.0, 1.0);
-    if s < 0.5 {
-        return mix(vec3<f32>(0.02, 0.01, 0.0), vec3<f32>(0.85, 0.30, 0.05), s * 2.0);
-    }
-    return mix(vec3<f32>(0.85, 0.30, 0.05), vec3<f32>(1.0, 0.80, 0.50), (s - 0.5) * 2.0);
-}
-
-fn ray_cart_dir(ray: Ray, a: f32) -> vec3<f32> {
-    let g = contra_metric(ray.r, ray.theta, a);
-    let dr = g.g_rr * ray.pr;
-    let dtheta = g.g_thetatheta * ray.ptheta;
-    let dphi = -g.g_tphi * ray.e + g.g_phiphi * ray.l;
-
-    let sin_t = sin(ray.theta); let cos_t = cos(ray.theta);
-    let sin_p = sin(ray.phi);   let cos_p = cos(ray.phi);
-    let v = vec3<f32>(
-        sin_t * cos_p * dr + ray.r * (cos_t * cos_p * dtheta - sin_t * sin_p * dphi),
-        cos_t * dr - ray.r * sin_t * dtheta,
-        sin_t * sin_p * dr + ray.r * (cos_t * sin_p * dtheta + sin_t * cos_p * dphi)
-    );
-    let len2 = dot(v, v);
-    if len2 < 1.0e-20 {
-        return vec3<f32>(1.0, 0.0, 0.0);
-    }
-    return v * inverseSqrt(len2);
-}
-
-struct OrbitalResult {
-    beta:       f32,
-    lapse:      f32,
-    orbit_sign: f32,
-}
-
-// Returns orbital beta, gravitational lapse, and orbit direction in one pass.
-// h_r: local H/R used to derive the sub-Keplerian factor for thick flows.
-fn orbital_kerr(r_disk: f32, h_r: f32, a: f32) -> OrbitalResult {
-    let a2 = a * a;
-    let orbit_sign = select(-1.0, 1.0, a >= 0.0);
-    let rho_k = max(r_disk / BH_M, 1.0);
-    let omega_kep   = orbit_sign / (BH_M * max(rho_k * sqrt(rho_k) + orbit_sign * abs(a), 1.0e-4));
-    let omega_orbit = omega_kep * sub_keplerian_factor(h_r);
-
-    // Equatorial Kerr: sin(theta)^2 = 1 and cos(theta) = 0, so sigma = rho^2.
-    let rho_m = metric_rho(r_disk);
-    let rho2 = rho_m * rho_m;
-    let delta = max(rho2 - 2.0 * rho_m + a2, DELTA_FLOOR);
-    let rr_aa = rho2 + a2;
-    let big_a = rr_aa * rr_aa - a2 * delta;
-    let omega_drag = 2.0 * a * rho_m / max(BH_M * big_a, 1.0e-6);
-    let lapse = max(sqrt(max(rho2 * delta / max(big_a, 1.0e-6), 0.0)), 1.0e-4);
-    let g_phiphi = (BH_M * BH_M) * big_a / rho2;
-    let beta = clamp(abs((omega_orbit - omega_drag) * sqrt(max(g_phiphi, 0.0)) / lapse), 0.0, 0.95);
-    return OrbitalResult(beta, lapse, orbit_sign);
-}
-
-// r_disk: cylindrical radius already computed by caller.
-// h_r:    local H/R already computed by caller.
-fn shade_disk(ray: Ray, r_disk: f32, h_r: f32, a: f32) -> vec4<f32> {
-    // Model-dependent emissivity colour.
-    var base: vec3<f32>;
-    if disk.model == 1u {
-        // TruncHot: blend NT thermal (outer) with hot-flow synchrotron (inner).
-        let safe_r  = max(r_disk,       SCHWARZSCHILD_RADIUS * 1.0e-3);
-        let safe_rt = max(disk.r_trunc, SCHWARZSCHILD_RADIUS * 1.0e-3);
-        let t = clamp((log(safe_r) - log(safe_rt)) / 0.4, -10.0, 10.0);
-        let w     = 0.5 * (1.0 + tanh(t));   // 1 in outer thin disk, 0 in inner hot flow
-        let c_nt  = blackbody_color(nt_temp(r_disk) / 0.488);
-        let c_hot = hot_blackbody_color(hot_emissivity_t(r_disk));
-        base = w * c_nt + (1.0 - w) * c_hot;
-    } else {
-        base = blackbody_color(nt_temp(r_disk) / 0.488);
-    }
-
-    let orb = orbital_kerr(r_disk, h_r, a);
-    let inv_r_disk = 1.0 / max(r_disk, 1.0e-6);
-    let orbital = orb.orbit_sign * vec3<f32>(-ray.z * inv_r_disk, 0.0, ray.x * inv_r_disk);
-
-    let to_cam = -ray_cart_dir(ray, a);
-    let cos_alpha = dot(orbital, to_cam);
-
-    let gamma = 1.0 / sqrt(max(1.0 - orb.beta * orb.beta, 1.0e-6));
-    let doppler_kin = 1.0 / max(gamma * (1.0 - orb.beta * cos_alpha), 1.0e-4);
-    let doppler = doppler_kin * orb.lapse;
-
-    let doppler_clamped = clamp(doppler, 0.05, 8.0);
-    let bright = doppler_clamped * doppler_clamped * doppler_clamped;
-    let shift = clamp((doppler - 1.0) * 2.0, -1.0, 1.0);
-    let disk_c = clamp(
-        base + vec3<f32>(-shift * 0.35, -shift * 0.1, shift * 0.55),
-        vec3<f32>(0.0), vec3<f32>(1.0)
-    ) * bright;
-    let fade = disk_edge_fade(r_disk);
-
-    return vec4<f32>(disk_c * fade, fade);
-}
-
 // -- Skybox ------------------------------------------------------------------
 
 // ACES filmic curve fit by Krzysztof Narkowicz (CC0/MIT).
@@ -589,92 +396,6 @@ fn sample_skybox(dir: vec3<f32>) -> vec3<f32> {
     return mix(top, bottom, weight.y);
 }
 
-// Binary mode uses a superposed Schwarzschild weak-field null-geodesic
-// approximation. It has no origin-centred Kerr horizon and no accretion disk.
-fn object_schwarzschild_radius(i: i32) -> f32 {
-    let mass_fraction = max(objects.mass[i].x, 0.0);
-    return SCHWARZSCHILD_RADIUS * mass_fraction;
-}
-
-fn object_mass_length(i: i32) -> f32 {
-    return 0.5 * object_schwarzschild_radius(i);
-}
-
-fn object_spin_angular_momentum(i: i32) -> vec3<f32> {
-    let spin_vec = clamp(objects.spin[i].xyz, vec3<f32>(-0.999), vec3<f32>(0.999));
-    let m = object_mass_length(i);
-    return spin_vec * m * m;
-}
-
-fn nearest_object_clearance(pos: vec3<f32>) -> f32 {
-    var nearest = ESCAPE_R;
-    for (var i = 0; i < objects.num_objects; i++) {
-        let center = objects.pos_radius[i].xyz;
-        let radius = max(objects.pos_radius[i].w, SCHWARZSCHILD_RADIUS * 0.05);
-        nearest = min(nearest, max(length(pos - center) - radius, 0.0));
-    }
-    return nearest;
-}
-
-fn binary_deflection(pos: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
-    var bend = vec3<f32>(0.0);
-    for (var i = 0; i < objects.num_objects; i++) {
-        let center = objects.pos_radius[i].xyz;
-        let radius = max(objects.pos_radius[i].w, SCHWARZSCHILD_RADIUS * 0.05);
-        let from_center = pos - center;
-        let to_center = -from_center;
-        let r2 = max(dot(from_center, from_center), radius * radius);
-        let r = sqrt(r2);
-        let transverse = to_center - dot(to_center, dir) * dir;
-        bend += BINARY_BEND_MULTIPLIER * object_schwarzschild_radius(i) * transverse / max(r2 * r, 1.0e-12);
-
-        let r_hat = from_center / max(r, 1.0e-6);
-        let j = object_spin_angular_momentum(i);
-        let gravito_magnetic = (3.0 * r_hat * dot(j, r_hat) - j) / max(r2 * r, 1.0e-12);
-        bend += BINARY_FRAME_DRAG_MULTIPLIER * cross(dir, gravito_magnetic);
-    }
-    return bend;
-}
-
-fn shade_object_hit(hit: ObjectHit, p: vec3<f32>) -> vec3<f32> {
-    let n = normalize(p - hit.center);
-    let view = normalize(cam.pos - p);
-    let diff = max(dot(n, view), 0.0);
-    let intensity = 0.1 + 0.9 * diff;
-    return hit.color.rgb * intensity;
-}
-
-struct BinaryTrace {
-    rgb: vec3<f32>,
-    iter_count: u32,
-}
-
-fn trace_binary_scene(origin: vec3<f32>, initial_dir: vec3<f32>) -> BinaryTrace {
-    var pos = origin;
-    var dir = initial_dir;
-    var iter_count = 0u;
-
-    for (var i = 0u; i < BINARY_TRACE_STEPS; i++) {
-        iter_count = i + 1u;
-        let clearance = nearest_object_clearance(pos);
-        let ds = clamp(clearance * 0.08, D_LAMBDA_BASE * 25.0, D_LAMBDA_MAX);
-        dir = normalize(dir + binary_deflection(pos, dir) * ds);
-
-        let new_pos = pos + dir * ds;
-        let hit = intersect_objects_segment(pos, new_pos);
-        if hit.hit {
-            return BinaryTrace(shade_object_hit(hit, new_pos), iter_count);
-        }
-
-        pos = new_pos;
-        if length(pos) > ESCAPE_R {
-            break;
-        }
-    }
-
-    return BinaryTrace(sample_skybox(dir), iter_count);
-}
-
 // -- Debug heatmap -----------------------------------------------------------
 
 // Maps t ∈ [0, 1] to a black→red→yellow→white gradient.
@@ -687,131 +408,164 @@ fn heatmap_color(t: f32) -> vec3<f32> {
     );
 }
 
-// -- Main --------------------------------------------------------------------
+struct Plasma {
+    rgb: vec3<f32>,
+    j: vec4<f32>,
+    alpha: f32,
+    rho: vec3<f32>,
+    energy: f32,
+}
 
-@compute @workgroup_size(16, 16, 1)
+fn sample_plasma(ray: Ray, m: Metric) -> Plasma {
+    var plasma: Plasma;
+    let r = length(ray.pos.xz);
+    if r <= disk.r1 || r >= disk.r2 { return plasma; }
+    let h_r = get_h_over_r(r);
+    let height = max(h_r*r,1.0e-4);
+    let z = (ray.pos.y-disk_midplane_y(r,atan2(ray.pos.z,ray.pos.x)))/height;
+    if abs(z) >= 4.0 { return plasma; }
+    let density = 0.4*exp(-0.5*z*z)*disk_edge_fade(r)/height;
+    let k = m.inv*ray.p;
+    // Circular flow around +Y; negative BH spin is retrograde to this disk.
+    let omega = sub_keplerian_factor(h_r)/max(pow(r,1.5)+disk.spin,1.0e-3);
+    let tangent = vec3<f32>(ray.pos.z,0.0,-ray.pos.x);
+    var fluid = vec4<f32>(1.0,omega*tangent);
+    let norm = dot(fluid,m.g*fluid);
+    if norm < -1.0e-4 {
+        fluid *= inverseSqrt(-norm);
+    } else {
+        let lapse = inverseSqrt(-m.inv[0][0]);
+        fluid = -lapse*m.inv[0];
+    }
+    plasma.energy = max(dot(ray.p,fluid),1.0e-5);
+    let redshift = clamp(1.0/plasma.energy,0.01,20.0);
+    let freq_ratio = 230.0/max(cam.frequency_ghz/redshift,1.0);
+    let frame = screen_frame(ray,m);
+    var e1 = vec4<f32>(0.0,frame[0]);
+    var e2 = vec4<f32>(0.0,frame[1]);
+    e1 -= k*(dot(e1,m.g*fluid)/plasma.energy);
+    e2 -= k*(dot(e2,m.g*fluid)/plasma.energy);
+    // ponytail: prescribed toroidal field and p=3 electrons in arbitrary units;
+    // replace with calibrated GRMHD plasma/thermal coefficients for science.
+    var b = vec4<f32>(0.0,normalize(tangent));
+    b += fluid*dot(b,m.g*fluid);
+    b *= inverseSqrt(max(dot(b,m.g*b),1.0e-12));
+    let bx = dot(b,m.g*e1); let by = dot(b,m.g*e2);
+    let bparallel = -dot(b,m.g*k)/plasma.energy; // toward the observer
+    let perpendicular2 = clamp(bx*bx+by*by,0.0,1.0);
+    let evpa = vec2<f32>(by*by-bx*bx,-2.0*bx*by)/max(perpendicular2,1.0e-12);
+    var hot = 0.0;
+    if disk.model == 1u {
+        hot = 0.5*(1.0-tanh(clamp(log(r/max(disk.r_trunc,0.001))/0.4,-10.0,10.0)));
+    }
+    let thermal = (1.0-hot)*blackbody_color(nt_temp(r)/0.488);
+    let synch = hot*hot_emissivity_t(r)*perpendicular2*freq_ratio
+        *vec3<f32>(1.0,0.65,0.3);
+    let boost = redshift*redshift*redshift;
+    plasma.rgb = density*boost*(thermal+synch);
+    let intensity = dot(plasma.rgb,vec3<f32>(0.2126,0.7152,0.0722));
+    let synch_i = density*boost*dot(synch,vec3<f32>(0.2126,0.7152,0.0722));
+    plasma.j = vec4<f32>(intensity,0.75*synch_i*evpa,0.0);
+    plasma.alpha = 0.7*density;
+    let rotation = 2.0*cam.faraday_depth*density*bparallel*freq_ratio*freq_ratio;
+    let conversion = cam.conversion_depth*density*perpendicular2*pow(freq_ratio,3.0);
+    plasma.rho = vec3<f32>(conversion*evpa,rotation);
+    return plasma;
+}
+
+fn polarization_color(stokes: vec4<f32>) -> vec3<f32> {
+    if stokes.x <= 1.0e-8 { return vec3<f32>(0.0); }
+    let pol = clamp(stokes.yzw/stokes.x,vec3<f32>(-1.0),vec3<f32>(1.0));
+    if cam.polarization_view == 1u { return vec3<f32>(clamp(length(pol.xy),0.0,1.0)); }
+    if cam.polarization_view == 2u {
+        let angle = atan2(pol.y,pol.x);
+        let hue = 0.5+0.5*cos(angle+vec3<f32>(0.0,-2.0*PI/3.0,2.0*PI/3.0));
+        return hue*clamp(length(pol.xy),0.0,1.0);
+    }
+    var signed = pol.z;
+    if cam.polarization_view == 3u { signed = pol.x; }
+    if cam.polarization_view == 4u { signed = pol.y; }
+    return abs(signed)*select(vec3<f32>(0.15,0.4,1.0),vec3<f32>(1.0,0.25,0.1),signed>=0.0);
+}
+
+@compute @workgroup_size(16,16,1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = textureDimensions(out_image);
-    let pix = vec2<i32>(i32(gid.x), i32(gid.y));
-    if pix.x >= i32(dims.x) || pix.y >= i32(dims.y) { return; }
-
-    let u = (2.0 * (f32(pix.x) + 0.5 + cam.jitter_x) / f32(dims.x) - 1.0) * cam.aspect * cam.tan_half_fov;
-    let v = (1.0 - 2.0 * (f32(pix.y) + 0.5 + cam.jitter_y) / f32(dims.y)) * cam.tan_half_fov;
-    let dir = normalize(u * cam.right - v * cam.up + cam.forward);
-
-    if disk.binary_enabled != 0u {
-        let traced = trace_binary_scene(cam.pos, dir);
-        if cam.debug_heatmap != 0u {
-            let t = f32(traced.iter_count) / f32(BINARY_TRACE_STEPS);
-            textureStore(out_image, pix, vec4<f32>(heatmap_color(t), 1.0));
-            return;
-        }
-        textureStore(out_image, pix, vec4<f32>(tonemap(traced.rgb), 1.0));
-        return;
+    let pix = vec2<i32>(gid.xy);
+    if any(gid.xy >= dims) { return; }
+    let u = (2.0*(f32(pix.x)+0.5+cam.jitter_x)/f32(dims.x)-1.0)*cam.aspect*cam.tan_half_fov;
+    let v = (1.0-2.0*(f32(pix.y)+0.5+cam.jitter_y)/f32(dims.y))*cam.tan_half_fov;
+    let dir = normalize(u*cam.right-v*cam.up+cam.forward);
+    var metric = scene_metric(cam.pos);
+    if !metric.valid || metric.clearance <= 0.0 {
+        textureStore(out_image,pix,vec4<f32>(0,0,0,1)); return;
     }
-
-    let spin_a = spin_clamped();
-    let spin_a2 = spin_a * spin_a;
-    let disk_r1_2 = disk.r1 * disk.r1;
-    let disk_r2_2 = disk.r2 * disk.r2;
-
-    var ray = init_ray(cam.pos, dir, spin_a);
-    var prev_pos = vec3<f32>(ray.x, ray.y, ray.z);
-    var color = vec4<f32>(0.0);
-
-    var disk_rgb = vec3<f32>(0.0);
-    var disk_alpha = 0.0;
-    var disk_accum = 0.0;
-    var any_disk = false;
-
-    var hit_object = false;
-    var obj_hit: ObjectHit;
-    var passed_ergosphere = false;
-    var ergosphere_alpha = 0.0;
-    var iter_count: u32 = 0u;
-
-    for (var i = 0; i < i32(cam.max_iter); i++) {
-        iter_count = u32(i) + 1u;
-        let static_limit = kerr_static_limit(ray.theta, spin_a2);
-        if ray.r < static_limit {
-            passed_ergosphere = true;
-            ergosphere_alpha = max(
-                ergosphere_alpha,
-                clamp((static_limit - ray.r) / max(static_limit - disk.horizon_r, 1.0e-6), 0.0, 1.0)
-            );
+    var ray = init_ray(cam.pos,dir,metric);
+    var rgb = vec3<f32>(0.0);
+    var stokes = vec4<f32>(0.0);
+    var transmission = 1.0;
+    var foreground = faraday_rotation(vec3<f32>(0.0),0.0);
+    var iterations = 0u;
+    for (var i=0u; i<cam.max_iter; i++) {
+        iterations = i+1u;
+        if metric.clearance < 0.002 || !metric.valid { break; }
+        let velocity = (metric.inv*ray.p).yzw;
+        // Geometry-limited steps also resolve the thinnest disk crossing.
+        var distance = clamp(0.12*metric.clearance,0.0002,32.0);
+        let radius = length(ray.pos.xz);
+        let height = max(get_h_over_r(max(radius,disk.r1))*max(radius,disk.r1),0.001);
+        if radius > disk.r1-distance && radius < disk.r2+distance {
+            let mid = disk_midplane_y(max(radius,0.001),atan2(ray.pos.z,ray.pos.x));
+            let to_disk = max(abs(ray.pos.y-mid)-4.0*height,0.0);
+            distance = min(distance,max(0.25*height,0.5*to_disk));
         }
-
-        let dL = clamp(
-            D_LAMBDA_BASE * (ray.r - disk.horizon_r) / SCHWARZSCHILD_RADIUS,
-            D_LAMBDA_BASE * 0.25,
-            D_LAMBDA_MAX
-        );
-        ray = step_ray(ray, dL, spin_a);
-
-        let new_pos = vec3<f32>(ray.x, ray.y, ray.z);
-
-        if disk_accum < 2.5 && disk_alpha < 0.995 {
-            let r_xz2 = new_pos.x * new_pos.x + new_pos.z * new_pos.z;
-            if r_xz2 >= disk_r1_2 && r_xz2 <= disk_r2_2 {
-                let r_xz = sqrt(r_xz2);
-                let phi   = atan2(new_pos.z, new_pos.x);
-                let h_r   = get_h_over_r(r_xz);
-                let H     = h_r * r_xz;
-                let y_mid = disk_midplane_y(r_xz, phi);   // 0 for all models except Warped
-                let z_norm = (new_pos.y - y_mid) / max(H, 1.0e-4 * SCHWARZSCHILD_RADIUS);
-                if abs(z_norm) < 4.0 {
-                    let density = exp(-0.5 * z_norm * z_norm);
-                    // Normaliser 0.4 ≈ 1/√(2π) so a perpendicular crossing totals ~1.
-                    let ds = length(new_pos - prev_pos);
-                    let contrib = density * ds / max(H, 1.0e-4 * SCHWARZSCHILD_RADIUS) * 0.4;
-                    if contrib > 1.0e-5 {
-                        let c = shade_disk(ray, r_xz, h_r, spin_a);
-                        let w = min(contrib, 2.5 - disk_accum);
-                        disk_accum += w;
-                        let sample_alpha = clamp(c.a * (1.0 - exp(-0.7 * w)), 0.0, 0.98);
-                        if sample_alpha > 1.0e-5 {
-                            let remaining = 1.0 - disk_alpha;
-                            disk_rgb += remaining * c.rgb * sample_alpha;
-                            disk_alpha += remaining * sample_alpha;
-                            any_disk = true;
-                        }
-                    }
-                }
+        var h = distance/max(length(velocity),1.0e-6);
+        var next: Ray;
+        var next_metric: Metric;
+        var accepted = false;
+        for (var retry=0u; retry<6u; retry++) {
+            next = step_ray(ray,h,metric);
+            next_metric = scene_metric(next.pos);
+            let null_error = abs(dot(next.p,next_metric.inv*next.p))
+                /max(dot(next.p,next.p),1.0e-10);
+            if next_metric.valid && all(abs(next.pos)<vec3<f32>(1.0e8))
+                && all(abs(next.p)<vec4<f32>(1.0e8)) && null_error<2.0e-4 {
+                accepted = true; break;
             }
+            h *= 0.5;
         }
-
-        obj_hit = intersect_objects_segment(prev_pos, new_pos);
-        if obj_hit.hit { hit_object = true; break; }
-
-        prev_pos = new_pos;
-        if ray.r > ESCAPE_R { break; }
-    }
-
-    if cam.debug_heatmap != 0u {
-        let t = f32(iter_count) / 10000.0;
-        textureStore(out_image, pix, vec4<f32>(heatmap_color(t), 1.0));
-        return;
-    }
-
-    var scene_rgb: vec3<f32>;
-    if hit_object {
-        let p = vec3<f32>(ray.x, ray.y, ray.z);
-        let n = normalize(p - obj_hit.center);
-        let view = normalize(cam.pos - p);
-        let diff = max(dot(n, view), 0.0);
-        let intensity = 0.1 + 0.9 * diff;
-        scene_rgb = obj_hit.color.rgb * intensity;
-    } else {
-        scene_rgb = sample_skybox(ray_cart_dir(ray, spin_a));
-        if passed_ergosphere {
-            scene_rgb = mix(scene_rgb, vec3<f32>(0.95, 0.42, 0.08), 0.18 * ergosphere_alpha);
+        if !accepted { break; } // failed/incomplete rays never masquerade as escaped sky
+        let hit = intersect_objects_segment(ray.pos,next.pos);
+        if hit.hit {
+            let intensity = dot(hit.color.rgb,vec3<f32>(0.2126,0.7152,0.0722));
+            rgb += transmission*hit.color.rgb;
+            stokes.x += transmission*intensity;
+            break;
         }
+        // Midpoint cell coefficients, exact emission/absorption/Faraday cell solve.
+        let middle = Ray(0.5*(ray.pos+next.pos),0.5*(ray.p+next.p),0.5*(ray.screen+next.screen));
+        let plasma = sample_plasma(middle,scene_metric(middle.pos));
+        let ds = h*plasma.energy; // proper path length in the emitting fluid frame
+        if ds > 0.0 {
+            let cell = polarized_cell(plasma.j,plasma.alpha,plasma.rho,ds);
+            stokes += transmission*vec4<f32>(cell.x,foreground*cell.yzw);
+            rgb += transmission*plasma.rgb*absorption_integral(plasma.alpha,ds);
+            foreground = foreground*faraday_rotation(plasma.rho,ds);
+            transmission *= exp(-plasma.alpha*ds);
+        }
+        ray = next; metric = next_metric;
+        let frame = screen_frame(ray,metric);
+        ray.screen = vec4<f32>(0.0,frame[0]);
+        if length(ray.pos)>ESCAPE_R {
+            let sky = sample_skybox(normalize((metric.inv*ray.p).yzw));
+            rgb += transmission*sky;
+            stokes.x += transmission*dot(sky,vec3<f32>(0.2126,0.7152,0.0722));
+            break;
+        }
+        if transmission<0.001 { break; }
     }
-
-    if any_disk {
-        scene_rgb = disk_rgb + (1.0 - disk_alpha) * scene_rgb;
-    }
-    color = vec4<f32>(tonemap(scene_rgb), 1.0);
-
-    textureStore(out_image, pix, color);
+    var output = tonemap(rgb);
+    if cam.polarization_view != 0u { output = polarization_color(stokes); }
+    if cam.debug_heatmap != 0u { output = heatmap_color(f32(iterations)/f32(max(cam.max_iter,1u))); }
+    textureStore(out_image,pix,vec4<f32>(output,1.0));
 }

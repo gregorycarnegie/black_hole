@@ -26,7 +26,6 @@ pub const BINARY_SPIN_STEP: f32 = 0.05;
 pub const BINARY_AXIS_STEP: f32 = 0.1;
 
 const BINARY_ORBIT_PERIOD_SECONDS: f32 = 18.0;
-const BLACK_HOLE_SHADOW_RADIUS_MULTIPLIER: f32 = 2.6;
 const MAX_SPIN_MAGNITUDE: f32 = 0.999;
 const GAMEPAD_AXIS_EDIT_SPEED: f32 = 0.8;
 
@@ -225,8 +224,8 @@ impl Default for SimObjects {
     }
 }
 
-fn black_hole_shadow_radius(spin_magnitude: f32, mass_fraction: f32) -> f32 {
-    kerr_horizon_radius(spin_magnitude) * mass_fraction * BLACK_HOLE_SHADOW_RADIUS_MULTIPLIER
+fn black_hole_radius(spin_magnitude: f32, mass_fraction: f32) -> f32 {
+    kerr_horizon_radius(spin_magnitude) * mass_fraction
 }
 
 fn clamped_spin_vector(spin: Vec3) -> Vec3 {
@@ -247,7 +246,7 @@ fn black_hole_object(
     let spin = clamped_spin_vector(spin_vector);
     SimObject {
         position,
-        radius: black_hole_shadow_radius(spin.length(), mass_fraction),
+        radius: black_hole_radius(spin.length(), mass_fraction),
         color: Vec4::new(0., 0., 0., 1.),
         mass: mass_fraction,
         velocity,

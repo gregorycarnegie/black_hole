@@ -8,6 +8,8 @@ use crate::controller::{active_gamepad, axis, stick};
 
 pub struct OrbitalCameraPlugin;
 
+pub const POLARIZATION_VIEWS: &[&str] = &["Intensity", "Linear %", "EVPA", "Q/I", "U/I", "V/I"];
+
 const GAMEPAD_ORBIT_SPEED: f64 = 1.8;
 const GAMEPAD_ZOOM_SPEED_MULTIPLIER: f64 = 8.0;
 
@@ -47,6 +49,10 @@ pub struct OrbitalCamera {
     pub debug_heatmap: bool,
     /// Maximum geodesic integration steps per pixel. Press , / . to step through presets.
     pub max_iter: u32,
+    pub polarization_view: u32,
+    pub frequency_ghz: f32,
+    pub faraday_depth: f32,
+    pub conversion_depth: f32,
 }
 
 impl Default for OrbitalCamera {
@@ -64,6 +70,10 @@ impl Default for OrbitalCamera {
             is_moving: false,
             debug_heatmap: false,
             max_iter: 10_000,
+            polarization_view: 0,
+            frequency_ghz: 230.0,
+            faraday_depth: 1.0,
+            conversion_depth: 0.3,
         }
     }
 }
@@ -175,6 +185,10 @@ fn update_orbital_camera(
         }
     }
 
+    if keys.just_pressed(KeyCode::KeyP) {
+        cam.polarization_view = (cam.polarization_view + 1) % POLARIZATION_VIEWS.len() as u32;
+        cam.is_moving = true;
+    }
     if keys.just_pressed(KeyCode::BracketLeft) {
         cam.fov_degrees = (cam.fov_degrees - 5.0).clamp(10.0, 170.0);
         cam.is_moving = true;

@@ -23,7 +23,7 @@ use crate::simulation::{
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
 
-/// Matches the Camera uniform in geodesic.wgsl (std140, 96 bytes).
+/// Matches the Camera uniform in geodesic.wgsl (std140, 112 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuCameraUniform {
@@ -42,6 +42,10 @@ struct GpuCameraUniform {
     jitter_y: f32,
     debug_heatmap: u32,
     max_iter: u32,
+    polarization_view: u32,
+    frequency_ghz: f32,
+    faraday_depth: f32,
+    conversion_depth: f32,
     _pad7: f32,
 }
 
@@ -111,7 +115,7 @@ pub fn init_geodesic_pipeline(
             (
                 // binding 0 – output storage texture (write-only RGBA8)
                 texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
-                // binding 1 – camera uniform (80 bytes)
+                // binding 1 – camera uniform (112 bytes)
                 uniform_buffer_sized(false, Some(GpuCameraUniform::SIZE)),
                 // binding 2 – disk/Kerr uniform
                 uniform_buffer_sized(false, Some(GpuDiskUniform::SIZE)),
@@ -277,6 +281,10 @@ pub fn prepare_bind_group(mut commands: Commands, sources: GeodesicSources, gpu:
         jitter_y: camera_uniform.jitter_y,
         debug_heatmap: camera_uniform.debug_heatmap,
         max_iter: camera_uniform.max_iter,
+        polarization_view: camera_uniform.polarization_view,
+        frequency_ghz: camera_uniform.frequency_ghz,
+        faraday_depth: camera_uniform.faraday_depth,
+        conversion_depth: camera_uniform.conversion_depth,
         _pad7: 0.0,
     };
     gpu.queue
@@ -348,10 +356,10 @@ pub fn dispatch_geodesic(
     let (Some(pipeline), Some(group), Some(image)) = (pipeline, group, image) else {
         return;
     };
-    if let CachedPipelineState::Err(err) = cache.get_compute_pipeline_state(pipeline.pipeline_id) {
-        if !matches!(err, ShaderCacheError::ShaderNotLoaded(_)) {
-            panic!("geodesic shader error: {err}");
-        }
+    if let CachedPipelineState::Err(err) = cache.get_compute_pipeline_state(pipeline.pipeline_id)
+        && !matches!(err, ShaderCacheError::ShaderNotLoaded(_))
+    {
+        panic!("geodesic shader error: {err}");
     }
     let (Some(compute), Some(image)) = (
         cache.get_compute_pipeline(pipeline.pipeline_id),
@@ -369,4 +377,112 @@ pub fn dispatch_geodesic(
         image.texture_descriptor.size.height.div_ceil(16),
         1,
     );
+}
+
+#[cfg(test)]
+pub(super) fn check_relativity(device: &RenderDevice, queue: &RenderQueue) {
+    let source = format!(
+        "{}\n{}",
+        include_str!("../../assets/shaders/geodesic.wgsl"),
+        include_str!("../../tests/relativity.wgsl")
+    );
+    let shader = device.create_and_validate_shader_module(ShaderModuleDescriptor {
+        label: Some("physics checks"),
+        source: ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&RawComputePipelineDescriptor {
+        label: Some("physics checks"),
+        layout: None,
+        module: &shader,
+        entry_point: Some("check_physics"),
+        compilation_options: default(),
+        cache: None,
+    });
+    let camera = GpuCameraUniform {
+        right: [1.0, 0.0, 0.0],
+        up: [0.0, 1.0, 0.0],
+        forward: [0.0, 0.0, -1.0],
+        ..GpuCameraUniform::zeroed()
+    };
+    let mut objects = GpuObjectsUniform::zeroed();
+    objects.num_objects = 1;
+    objects.mass[0][0] = 1.0;
+    let camera_buf = device.create_buffer_with_data(&BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::bytes_of(&camera),
+        usage: BufferUsages::UNIFORM,
+    });
+    let objects_buf = device.create_buffer_with_data(&BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::bytes_of(&objects),
+        usage: BufferUsages::UNIFORM,
+    });
+    let uniform_group = device.create_bind_group(
+        None,
+        &pipeline.get_bind_group_layout(0).into(),
+        &[
+            BindGroupEntry {
+                binding: 1,
+                resource: camera_buf.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: objects_buf.as_entire_binding(),
+            },
+        ],
+    );
+    let results = device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: 112,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&BufferDescriptor {
+        label: None,
+        size: 112,
+        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let result_group = device.create_bind_group(
+        None,
+        &pipeline.get_bind_group_layout(1).into(),
+        &BindGroupEntries::single(results.as_entire_binding()),
+    );
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &uniform_group, &[]);
+        pass.set_bind_group(1, &result_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&results, 0, &readback, 0, 112);
+    queue.submit([encoder.finish()]);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    readback
+        .slice(..)
+        .map_async(MapMode::Read, move |result| sender.send(result).unwrap());
+    device
+        .poll(PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(30)),
+        })
+        .unwrap();
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .unwrap();
+    let data = readback.slice(..).get_mapped_range();
+    for (i, value) in bytemuck::cast_slice::<u8, f32>(&data)
+        .iter()
+        .take(20)
+        .enumerate()
+    {
+        assert_eq!(
+            *value,
+            1.0,
+            "WGSL physics check {i} failed (tests/relativity.wgsl); capture/escape diagnostics: {:?}",
+            &bytemuck::cast_slice::<u8, f32>(&data)[20..]
+        );
+    }
 }

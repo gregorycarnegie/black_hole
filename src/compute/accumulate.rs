@@ -221,10 +221,10 @@ pub fn dispatch_accumulate(
     else {
         return;
     };
-    if let CachedPipelineState::Err(err) = cache.get_compute_pipeline_state(pipeline.pipeline_id) {
-        if !matches!(err, ShaderCacheError::ShaderNotLoaded(_)) {
-            panic!("accumulate shader error: {err}");
-        }
+    if let CachedPipelineState::Err(err) = cache.get_compute_pipeline_state(pipeline.pipeline_id)
+        && !matches!(err, ShaderCacheError::ShaderNotLoaded(_))
+    {
+        panic!("accumulate shader error: {err}");
     }
     let (Some(compute), Some(image)) = (
         cache.get_compute_pipeline(pipeline.pipeline_id),

@@ -2,8 +2,13 @@ use black_hole::physics::*;
 
 #[test]
 fn shaders_validate() {
-    for source in [
+    let physics_checks = format!(
+        "{}\n{}",
         include_str!("../assets/shaders/geodesic.wgsl"),
+        include_str!("relativity.wgsl")
+    );
+    for source in [
+        physics_checks.as_str(),
         include_str!("../assets/shaders/accumulate.wgsl"),
     ] {
         let module = naga::front::wgsl::parse_str(source)

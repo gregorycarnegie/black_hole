@@ -1,7 +1,7 @@
 use bevy::{ecs::system::SystemParam, prelude::*};
 
 use crate::{
-    camera::{ITER_PRESETS, OrbitalCamera},
+    camera::{ITER_PRESETS, OrbitalCamera, POLARIZATION_VIEWS},
     compute::{RenderScale, SCALE_PRESETS, SKYBOX_NAMES, SkyboxImage, SkyboxSet},
     grid::GridVisible,
     simulation::{
@@ -52,6 +52,14 @@ enum UiAction {
     BinaryAxisYUp,
     BinaryAxisZDown,
     BinaryAxisZUp,
+    PolarizationPrev,
+    PolarizationNext,
+    FrequencyDown,
+    FrequencyUp,
+    FaradayDown,
+    FaradayUp,
+    ConversionDown,
+    ConversionUp,
     ToggleGrid,
     ToggleGravity,
     ToggleHeatmap,
@@ -69,6 +77,10 @@ enum ValueDisplay {
     RenderScale,
     Skybox,
     DiskModel,
+    Polarization,
+    Frequency,
+    Faraday,
+    Conversion,
     BinaryHole,
     BinaryAxisX,
     BinaryAxisY,
@@ -260,6 +272,60 @@ fn setup_panel(mut commands: Commands) {
                     ToggleLabel::DebugBodies,
                 )],
             );
+        });
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(48.0),
+                left: Val::Px(8.0),
+                flex_direction: FlexDirection::Column,
+                padding: UiRect::all(Val::Px(10.0)),
+                row_gap: Val::Px(5.0),
+                min_width: Val::Px(248.0),
+                ..default()
+            },
+            BackgroundColor(PANEL_BG),
+        ))
+        .with_children(|root| {
+            spawn_cycle_row(
+                root,
+                "Stokes",
+                UiAction::PolarizationPrev,
+                UiAction::PolarizationNext,
+                ValueDisplay::Polarization,
+            );
+            spawn_step_row(
+                root,
+                "GHz",
+                UiAction::FrequencyDown,
+                UiAction::FrequencyUp,
+                ValueDisplay::Frequency,
+            );
+            spawn_step_row(
+                root,
+                "Faraday",
+                UiAction::FaradayDown,
+                UiAction::FaradayUp,
+                ValueDisplay::Faraday,
+            );
+            spawn_step_row(
+                root,
+                "Convert",
+                UiAction::ConversionDown,
+                UiAction::ConversionUp,
+                ValueDisplay::Conversion,
+            );
+            spawn_sep(root);
+
+            root.spawn((
+                Text::new("P: cycle view | M: hot flow"),
+                TextFont {
+                    font_size: FontSize::Px(11.0),
+                    ..default()
+                },
+                TextColor(LABEL_COLOR),
+            ));
         });
 }
 
@@ -618,6 +684,43 @@ fn handle_button_press(query: UiButtonInteractionQuery<'_, '_>, mut params: Butt
             UiAction::ToggleGravity => {
                 params.gravity.0 = !params.gravity.0;
             }
+            UiAction::PolarizationPrev | UiAction::PolarizationNext => {
+                let count = POLARIZATION_VIEWS.len() as u32;
+                let step = if *action == UiAction::PolarizationNext {
+                    1
+                } else {
+                    count - 1
+                };
+                params.cam.polarization_view = (params.cam.polarization_view + step) % count;
+                params.cam.is_moving = true;
+            }
+            UiAction::FrequencyDown | UiAction::FrequencyUp => {
+                let step = if *action == UiAction::FrequencyUp {
+                    10.0
+                } else {
+                    -10.0
+                };
+                params.cam.frequency_ghz = (params.cam.frequency_ghz + step).clamp(30.0, 1000.0);
+                params.cam.is_moving = true;
+            }
+            UiAction::FaradayDown | UiAction::FaradayUp => {
+                let step = if *action == UiAction::FaradayUp {
+                    0.25
+                } else {
+                    -0.25
+                };
+                params.cam.faraday_depth = (params.cam.faraday_depth + step).clamp(-20.0, 20.0);
+                params.cam.is_moving = true;
+            }
+            UiAction::ConversionDown | UiAction::ConversionUp => {
+                let step = if *action == UiAction::ConversionUp {
+                    0.1
+                } else {
+                    -0.1
+                };
+                params.cam.conversion_depth = (params.cam.conversion_depth + step).clamp(0.0, 10.0);
+                params.cam.is_moving = true;
+            }
             UiAction::ToggleHeatmap => {
                 params.cam.debug_heatmap = !params.cam.debug_heatmap;
                 params.cam.is_moving = true;
@@ -700,6 +803,12 @@ fn update_value_displays(
             ValueDisplay::RenderScale => format!("{:.0}%", scale.0 * 100.0),
             ValueDisplay::Skybox => SKYBOX_NAMES[skybox_set.current].to_string(),
             ValueDisplay::DiskModel => disk.model.short_name().to_string(),
+            ValueDisplay::Polarization => {
+                POLARIZATION_VIEWS[cam.polarization_view as usize].to_string()
+            }
+            ValueDisplay::Frequency => format!("{:.0}", cam.frequency_ghz),
+            ValueDisplay::Faraday => format!("{:.2}", cam.faraday_depth),
+            ValueDisplay::Conversion => format!("{:.1}", cam.conversion_depth),
             ValueDisplay::BinaryHole => binary.selected_label().to_string(),
             ValueDisplay::BinaryAxisX => format!("{:+.2}", binary.selected_spin().axis.x),
             ValueDisplay::BinaryAxisY => format!("{:+.2}", binary.selected_spin().axis.y),
