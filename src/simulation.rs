@@ -672,74 +672,540 @@ fn animate_binary_black_holes(
 mod tests {
     use super::*;
     use bevy::time::TimeUpdateStrategy;
+    use proptest::prelude::*;
+    use rstest::rstest;
     use std::time::Duration;
 
-    #[test]
-    fn gravity_uses_elapsed_time_and_is_independent_of_render_rate() {
-        let simulate = |fps: u32, enabled: bool, binary: bool| {
-            let mut app = App::new();
-            app.add_plugins(MinimalPlugins)
-                .init_resource::<ButtonInput<KeyCode>>()
-                .init_resource::<OrbitalCamera>()
-                .add_plugins(SimulationPlugin)
-                .insert_resource(GravityEnabled(enabled))
-                .insert_resource(DebugBodiesEnabled(true))
-                .insert_resource(BinaryBlackHoles {
-                    enabled: binary,
-                    ..default()
-                })
-                .insert_resource(SimObjects(scene_objects(
-                    KERR_SPIN,
-                    true,
-                    false,
-                    0.0,
-                    default_binary_spins(),
-                )))
-                .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
-            app.update();
-            let mut elapsed = Duration::ZERO;
-            for frame in 1..=fps * 4 {
-                let next = Duration::from_secs_f64(frame as f64 / fps as f64);
-                app.insert_resource(TimeUpdateStrategy::ManualDuration(next - elapsed));
-                app.update();
-                elapsed = next;
-            }
-            app.world().resource::<SimObjects>().0.clone()
-        };
-        let reference = simulate(60, true, false);
-        assert!(reference[0].velocity.x < 0.0);
-        assert!(reference[0].position.x < 64.0);
-        for fps in [30, 120] {
-            for (actual, expected) in simulate(fps, true, false).iter().zip(&reference) {
-                assert!(actual.position.is_finite() && actual.velocity.is_finite());
-                assert_eq!(actual.position, expected.position);
-                assert_eq!(actual.velocity, expected.velocity);
-            }
-        }
-        assert_eq!(simulate(60, false, false)[0].position.x, 64.0);
-        assert_eq!(simulate(60, true, true)[0].position.x, 64.0);
+    const ALL_MODELS: [DiskModel; 4] = [
+        DiskModel::ThinNt,
+        DiskModel::TruncatedHotFlow,
+        DiskModel::SlimFunnel,
+        DiskModel::WarpedThin,
+    ];
 
-        // A massless test particle still accelerates; one half-unit step at r=10.
-        let mut source = single_black_hole(0.0);
-        source.mass = 1.0;
-        let mut tracer = source.clone();
-        tracer.position = Vec3::X * 10.0;
-        tracer.mass = 0.0;
+    fn assert_close(actual: f32, expected: f32, what: &str) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "{what}: {actual} != {expected}"
+        );
+    }
+
+    fn spin_strategy() -> impl Strategy<Value = BinarySpin> {
+        (0.0_f32..=0.999, -1.0_f32..1.0, -1.0_f32..1.0, -1.0_f32..1.0)
+            .prop_map(|(magnitude, x, y, z)| BinarySpin::new(magnitude, Vec3::new(x, y, z)))
+    }
+
+    // ── Gravity ──────────────────────────────────────────────────────────────
+
+    /// Runs the full plugin for four simulated seconds at `fps`.
+    fn simulate(fps: u32, enabled: bool, binary: bool) -> Vec<SimObject> {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<OrbitalCamera>()
+            .add_plugins(SimulationPlugin)
+            .insert_resource(GravityEnabled(enabled))
+            .insert_resource(DebugBodiesEnabled(true))
+            .insert_resource(BinaryBlackHoles {
+                enabled: binary,
+                ..default()
+            })
+            .insert_resource(SimObjects(scene_objects(
+                KERR_SPIN,
+                true,
+                false,
+                0.0,
+                default_binary_spins(),
+            )))
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+        app.update();
+        let mut elapsed = Duration::ZERO;
+        for frame in 1..=fps * 4 {
+            let next = Duration::from_secs_f64(frame as f64 / fps as f64);
+            app.insert_resource(TimeUpdateStrategy::ManualDuration(next - elapsed));
+            app.update();
+            elapsed = next;
+        }
+        app.world().resource::<SimObjects>().0.clone()
+    }
+
+    /// One fixed gravity step of `dt` seconds.
+    fn step_gravity(objects: Vec<SimObject>, dt: f32) -> Vec<SimObject> {
         let mut app = App::new();
         let mut time = Time::<Fixed>::default();
-        time.advance_by(Duration::from_secs_f32(0.5));
+        time.advance_by(Duration::from_secs_f32(dt));
         app.insert_resource(time)
             .insert_resource(GravityEnabled(true))
             .insert_resource(BinaryBlackHoles {
                 enabled: false,
                 ..default()
             })
-            .insert_resource(SimObjects(vec![source, tracer]))
+            .insert_resource(SimObjects(objects))
             .add_systems(FixedUpdate, gravity_system);
         app.world_mut().run_schedule(FixedUpdate);
-        let objects = app.world().resource::<SimObjects>();
-        assert!((objects.0[1].velocity.x + 0.005).abs() < 1e-7);
-        assert!((objects.0[1].position.x - 9.9975).abs() < 1e-6);
-        assert_eq!(objects.0[0].velocity, Vec3::ZERO);
+        app.world().resource::<SimObjects>().0.clone()
+    }
+
+    fn body(position: Vec3, mass: f32) -> SimObject {
+        SimObject {
+            position,
+            mass,
+            ..single_black_hole(0.0)
+        }
+    }
+
+    #[rstest]
+    fn gravity_is_independent_of_render_rate(#[values(30, 120)] fps: u32) {
+        let reference = simulate(60, true, false);
+        assert!(reference[0].velocity.x < 0.0, "debug body falls inward");
+        assert!(reference[0].position.x < 64.0);
+        for (actual, expected) in simulate(fps, true, false).iter().zip(&reference) {
+            assert!(actual.position.is_finite() && actual.velocity.is_finite());
+            assert_eq!(actual.position, expected.position);
+            assert_eq!(actual.velocity, expected.velocity);
+        }
+    }
+
+    #[rstest]
+    #[case::gravity_off(false, false)]
+    #[case::binary_mode(true, true)]
+    fn gravity_pauses(#[case] enabled: bool, #[case] binary: bool) {
+        assert_eq!(simulate(60, enabled, binary)[0].position.x, 64.0);
+    }
+
+    #[test]
+    fn massless_tracer_falls_toward_the_hole() {
+        // One half-unit step at r=10 from a unit mass: a = 1/100.
+        let objects = step_gravity(vec![body(Vec3::ZERO, 1.0), body(Vec3::X * 10.0, 0.0)], 0.5);
+        assert!((objects[1].velocity.x + 0.005).abs() < 1e-7);
+        assert!((objects[1].position.x - 9.9975).abs() < 1e-6);
+        assert_eq!(objects[0].velocity, Vec3::ZERO);
+    }
+
+    #[test]
+    fn coincident_bodies_do_not_produce_nan() {
+        let at = Vec3::new(3.0, 0.0, 7.0);
+        for object in step_gravity(vec![body(at, 1.0), body(at, 1.0)], 0.5) {
+            assert_eq!((object.position, object.velocity), (at, Vec3::ZERO));
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Newton's third law: bodies starting at rest keep zero total momentum.
+        #[test]
+        fn gravity_conserves_momentum(
+            a in prop::array::uniform3(-50.0_f32..50.0),
+            b in prop::array::uniform3(-50.0_f32..50.0),
+            masses in (0.1_f32..10.0, 0.1_f32..10.0),
+        ) {
+            let (a, b) = (Vec3::from_array(a), Vec3::from_array(b));
+            prop_assume!(a.distance(b) > 1.0);
+            let objects = step_gravity(vec![body(a, masses.0), body(b, masses.1)], 0.1);
+            let momentum = objects[0].velocity * masses.0 + objects[1].velocity * masses.1;
+            let scale = objects[0].velocity.length() * masses.0;
+            prop_assert!(momentum.length() <= 1e-4 * scale.max(1e-6), "{momentum}");
+            prop_assert!(objects[0].velocity.dot(b - a) > 0.0, "bodies attract");
+        }
+    }
+
+    // ── Disk models ──────────────────────────────────────────────────────────
+
+    /// `as_u32` is the `model` switch value in geodesic.wgsl.
+    #[rstest]
+    #[case(DiskModel::ThinNt, 0)]
+    #[case(DiskModel::TruncatedHotFlow, 1)]
+    #[case(DiskModel::SlimFunnel, 2)]
+    #[case(DiskModel::WarpedThin, 3)]
+    fn disk_models_cycle_in_shader_order(#[case] model: DiskModel, #[case] index: usize) {
+        assert_eq!(model.as_u32(), index as u32);
+        assert_eq!(model.next(), ALL_MODELS[(index + 1) % 4]);
+        assert_eq!(model.prev(), ALL_MODELS[(index + 3) % 4]);
+    }
+
+    proptest! {
+        #[test]
+        fn presets_keep_their_model_and_the_spin(
+            model in prop::sample::select(ALL_MODELS.to_vec()),
+            spin in -0.999_f32..=0.999,
+        ) {
+            let preset = DiskConfig::for_model(model.clone(), spin);
+            prop_assert_eq!(&preset.model, &model);
+            prop_assert_eq!(preset.spin, spin);
+            prop_assert_eq!(model.next().prev(), model.clone());
+            prop_assert_eq!(model.next().next().next().next(), model);
+        }
+    }
+
+    // ── Spins ────────────────────────────────────────────────────────────────
+
+    #[rstest]
+    #[case::scales_unit_axis(0.5, Vec3::new(0.0, 3.0, 4.0), 0.5, Vec3::new(0.0, 0.6, 0.8))]
+    #[case::clamps_overspin(1.5, Vec3::X, MAX_SPIN_MAGNITUDE, Vec3::X)]
+    #[case::degenerate_axis_points_up(-0.2, Vec3::ZERO, 0.0, Vec3::Y)]
+    fn binary_spin_clamps_magnitude_and_normalises_axis(
+        #[case] magnitude: f32,
+        #[case] axis: Vec3,
+        #[case] expected_magnitude: f32,
+        #[case] expected_axis: Vec3,
+    ) {
+        let spin = BinarySpin::new(magnitude, axis);
+        assert_eq!(spin.magnitude, expected_magnitude);
+        assert_eq!(spin.axis, expected_axis);
+        assert_eq!(spin.vector(), expected_axis * expected_magnitude);
+    }
+
+    proptest! {
+        #[test]
+        fn binary_spin_is_always_a_valid_kerr_spin(
+            magnitude in -10.0_f32..10.0,
+            axis in prop::array::uniform3(-10.0_f32..10.0),
+        ) {
+            let spin = BinarySpin::new(magnitude, Vec3::from_array(axis));
+            prop_assert!((0.0..=MAX_SPIN_MAGNITUDE).contains(&spin.magnitude));
+            prop_assert!((spin.axis.length() - 1.0).abs() < 1e-5);
+            prop_assert!((spin.vector().length() - spin.magnitude).abs() < 1e-5);
+        }
+
+        #[test]
+        fn clamped_spin_vector_limits_length_but_keeps_direction(
+            v in prop::array::uniform3(-5.0_f32..5.0),
+        ) {
+            let v = Vec3::from_array(v);
+            let clamped = clamped_spin_vector(v);
+            if v.length() <= MAX_SPIN_MAGNITUDE {
+                prop_assert_eq!(clamped, v);
+            } else {
+                prop_assert!((clamped.length() - MAX_SPIN_MAGNITUDE).abs() < 1e-5);
+                prop_assert!(clamped.normalize().dot(v.normalize()) > 0.99999);
+            }
+        }
+
+        #[test]
+        fn magnitude_edits_clamp_and_touch_only_the_selected_hole(
+            selected in 0_usize..2,
+            spins in [spin_strategy(), spin_strategy()],
+            delta in -2.0_f32..2.0,
+        ) {
+            let mut binary = BinaryBlackHoles { selected, spins, ..default() };
+            binary.adjust_selected_magnitude(delta);
+            let expected = (spins[selected].magnitude + delta).clamp(0.0, MAX_SPIN_MAGNITUDE);
+            prop_assert!((binary.spins[selected].magnitude - expected).abs() < 1e-6);
+            // Renormalising an already-unit axis may move it by an ulp.
+            prop_assert!((binary.spins[selected].axis - spins[selected].axis).length() < 1e-6);
+            prop_assert_eq!(binary.spins[1 - selected].vector(), spins[1 - selected].vector());
+        }
+
+        #[test]
+        fn axis_edits_keep_a_unit_axis_on_the_selected_hole_only(
+            selected in 0_usize..2,
+            spins in [spin_strategy(), spin_strategy()],
+            component in 0_usize..4,
+            delta in -3.0_f32..3.0,
+        ) {
+            let mut binary = BinaryBlackHoles { selected, spins, ..default() };
+            binary.adjust_selected_axis_component(component, delta);
+            let edited = binary.spins[selected];
+            prop_assert!((edited.axis.length() - 1.0).abs() < 1e-5);
+            prop_assert_eq!(edited.magnitude, spins[selected].magnitude);
+            prop_assert_eq!(binary.spins[1 - selected].vector(), spins[1 - selected].vector());
+            if component == 3 {
+                prop_assert_eq!(edited.axis, spins[selected].axis, "unknown component is a no-op");
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::grows_x(0, 0.5, Vec3::new(0.5, 1.0, 0.0))]
+    // ±5 clamps to ±1 before renormalising, giving 45° axes.
+    #[case::clamps_x(0, 5.0, Vec3::new(1.0, 1.0, 0.0))]
+    #[case::clamps_z(2, -5.0, Vec3::new(0.0, 1.0, -1.0))]
+    #[case::shrinks_y(1, -0.3, Vec3::Y)]
+    fn axis_edits_clamp_the_component_then_renormalise(
+        #[case] component: usize,
+        #[case] delta: f32,
+        #[case] expected: Vec3,
+    ) {
+        let mut binary = BinaryBlackHoles::default();
+        binary.adjust_selected_axis_component(component, delta);
+        assert_eq!(binary.spins[0].axis, expected.normalize());
+    }
+
+    #[rstest]
+    #[case(0, 1, "B")]
+    #[case(1, 0, "A")]
+    fn hole_selection_toggles(#[case] start: usize, #[case] next: usize, #[case] label: &str) {
+        let mut binary = BinaryBlackHoles {
+            selected: start,
+            ..default()
+        };
+        binary.select_next();
+        assert_eq!((binary.selected, binary.selected_label()), (next, label));
+        binary.select_prev();
+        assert_eq!(binary.selected, start);
+    }
+
+    #[test]
+    fn out_of_range_selection_reads_hole_b() {
+        let mut binary = BinaryBlackHoles::default();
+        binary.spins[1] = BinarySpin::new(0.3, Vec3::X);
+        binary.selected = 7;
+        assert_eq!(binary.selected_spin().magnitude, 0.3);
+        assert_eq!(binary.selected_label(), "B");
+    }
+
+    // ── Scene ────────────────────────────────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn binary_holes_orbit_opposite_each_other_at_circular_speed(
+            phase in 0.0_f32..TAU,
+            spins in [spin_strategy(), spin_strategy()],
+        ) {
+            let [a, b] = binary_black_holes(spins, phase);
+            let r = 0.5 * BINARY_SEPARATION_RS * SCHWARZSCHILD_RADIUS;
+            let speed = r * TAU / BINARY_ORBIT_PERIOD_SECONDS;
+
+            prop_assert!((a.position.x - phase.cos() * r).abs() < 1e-4);
+            prop_assert!((a.position.z - phase.sin() * r).abs() < 1e-4);
+            prop_assert_eq!(a.position.y, 0.0);
+            prop_assert!((a.velocity.length() - speed).abs() < 1e-4);
+            prop_assert!(a.velocity.dot(a.position).abs() < 1e-3, "velocity ⟂ radius");
+            prop_assert!(a.position.cross(a.velocity).y < 0.0, "orbits toward +phase");
+            prop_assert_eq!(b.position, -a.position);
+            prop_assert_eq!(b.velocity, -a.velocity);
+            for (hole, spin) in [(&a, spins[0]), (&b, spins[1])] {
+                prop_assert_eq!(hole.mass, 0.5);
+                prop_assert_eq!(hole.spin, spin.vector());
+                prop_assert!((hole.radius - kerr_horizon_radius(spin.magnitude) * 0.5).abs() < 1e-5);
+            }
+        }
+
+        #[test]
+        fn single_hole_sits_at_the_origin_with_the_disk_spin(spin in -0.999_f32..=0.999) {
+            let hole = &scene_objects(spin, false, false, 0.0, default_binary_spins())[0];
+            prop_assert_eq!(hole.spin, Vec3::Y * spin);
+            prop_assert_eq!((hole.mass, hole.position), (1.0, Vec3::ZERO));
+            prop_assert!((hole.radius - kerr_horizon_radius(spin.abs())).abs() < 1e-5);
+        }
+    }
+
+    #[rstest]
+    #[case::single_hole(false, false, 1)]
+    #[case::single_with_debug(true, false, 3)]
+    #[case::binary(false, true, 2)]
+    #[case::binary_with_debug(true, true, 4)]
+    fn scene_contains_requested_bodies(
+        #[case] debug: bool,
+        #[case] binary: bool,
+        #[case] expected: usize,
+    ) {
+        let scene = scene_objects(0.4, debug, binary, 0.0, default_binary_spins());
+        assert_eq!(scene.len(), expected);
+    }
+
+    // ── Systems driven through an App ────────────────────────────────────────
+
+    fn input_app(binary_enabled: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<OrbitalCamera>()
+            .add_plugins(SimulationPlugin)
+            .insert_resource(BinaryBlackHoles {
+                enabled: binary_enabled,
+                ..default()
+            })
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::ZERO));
+        app.update();
+        app
+    }
+
+    /// Presses and releases `key` across one update; returns whether the
+    /// camera was asked to reset accumulation.
+    fn press(app: &mut App, key: KeyCode) -> bool {
+        app.world_mut().resource_mut::<OrbitalCamera>().is_moving = false;
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+        app.world().resource::<OrbitalCamera>().is_moving
+    }
+
+    fn disk(app: &App) -> &DiskConfig {
+        app.world().resource::<DiskConfig>()
+    }
+
+    fn objects(app: &App) -> &[SimObject] {
+        &app.world().resource::<SimObjects>().0
+    }
+
+    #[rstest]
+    #[case::up(0.82, KeyCode::KeyE, 0.87)]
+    #[case::down(0.3, KeyCode::KeyQ, 0.25)]
+    #[case::clamps_prograde(0.97, KeyCode::KeyE, MAX_SPIN_MAGNITUDE)]
+    #[case::clamps_retrograde(-0.97, KeyCode::KeyQ, -MAX_SPIN_MAGNITUDE)]
+    fn spin_keys_step_the_single_hole(
+        #[case] start: f32,
+        #[case] key: KeyCode,
+        #[case] expected: f32,
+    ) {
+        let mut app = input_app(false);
+        app.world_mut().resource_mut::<DiskConfig>().spin = start;
+        assert!(press(&mut app, key), "accumulation reset");
+        assert_close(disk(&app).spin, expected, "spin");
+        assert_close(objects(&app)[0].spin.y, expected, "scene rebuilt");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn any_spin_key_sequence_stays_within_the_kerr_limit(
+            ups in prop::collection::vec(any::<bool>(), 1..30),
+        ) {
+            let mut app = input_app(false);
+            let mut expected = KERR_SPIN;
+            for up in ups {
+                let step = if up { 0.05 } else { -0.05 };
+                expected = (expected + step).clamp(-MAX_SPIN_MAGNITUDE, MAX_SPIN_MAGNITUDE);
+                press(&mut app, if up { KeyCode::KeyE } else { KeyCode::KeyQ });
+                prop_assert!((disk(&app).spin - expected).abs() < 1e-4);
+            }
+        }
+
+        #[test]
+        fn binary_phase_advances_one_orbit_per_period_and_wraps(
+            start in 0.0_f32..TAU,
+            dt in 0.01_f32..0.25,
+        ) {
+            let mut app = input_app(true);
+            app.world_mut().resource_mut::<BinaryBlackHoles>().phase = start;
+            app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f32(dt)));
+            app.update();
+
+            let binary = app.world().resource::<BinaryBlackHoles>();
+            let expected = (start + dt * TAU / BINARY_ORBIT_PERIOD_SECONDS).rem_euclid(TAU);
+            prop_assert!((0.0..TAU).contains(&binary.phase));
+            prop_assert!((binary.phase - expected).abs() < 1e-4, "{} != {expected}", binary.phase);
+            let [a, _] = binary_black_holes(binary.spins, binary.phase);
+            prop_assert_eq!(objects(&app)[0].position, a.position);
+        }
+    }
+
+    #[test]
+    fn spin_keys_in_binary_mode_edit_the_selected_hole_only() {
+        let mut app = input_app(true);
+        press(&mut app, KeyCode::Digit2);
+        assert!(press(&mut app, KeyCode::KeyQ));
+        let binary = app.world().resource::<BinaryBlackHoles>();
+        assert_close(binary.spins[1].magnitude, KERR_SPIN - BINARY_SPIN_STEP, "B");
+        assert_eq!(binary.spins[0].magnitude, KERR_SPIN);
+        assert_eq!(disk(&app).spin, KERR_SPIN, "disk spin untouched");
+        assert_close(objects(&app)[1].spin.length(), KERR_SPIN - 0.05, "scene");
+
+        press(&mut app, KeyCode::Digit1);
+        press(&mut app, KeyCode::KeyE);
+        let binary = app.world().resource::<BinaryBlackHoles>();
+        assert_close(binary.spins[0].magnitude, KERR_SPIN + 0.05, "A");
+    }
+
+    #[rstest]
+    #[case::smaller(15.0, KeyCode::KeyZ, 14.0)]
+    #[case::larger(15.0, KeyCode::KeyX, 16.0)]
+    #[case::stops_at_inner_limit(5.0, KeyCode::KeyZ, 4.0)]
+    #[case::stays_at_inner_limit(4.0, KeyCode::KeyZ, 4.0)]
+    #[case::stops_at_outer_limit(29.0, KeyCode::KeyX, 30.0)]
+    #[case::stays_at_outer_limit(30.0, KeyCode::KeyX, 30.0)]
+    fn disk_radius_keys_clamp_between_4_and_30(
+        #[case] start: f32,
+        #[case] key: KeyCode,
+        #[case] expected: f32,
+    ) {
+        let mut app = input_app(false);
+        app.world_mut().resource_mut::<DiskConfig>().r_outer_rs = start;
+        assert!(press(&mut app, key));
+        assert_eq!(disk(&app).r_outer_rs, expected);
+    }
+
+    #[rstest]
+    fn model_key_loads_the_next_preset_but_keeps_spin(
+        #[values(
+            DiskModel::ThinNt,
+            DiskModel::TruncatedHotFlow,
+            DiskModel::SlimFunnel,
+            DiskModel::WarpedThin
+        )]
+        model: DiskModel,
+    ) {
+        let mut app = input_app(false);
+        *app.world_mut().resource_mut::<DiskConfig>() = DiskConfig::for_model(model.clone(), 0.3);
+        assert!(press(&mut app, KeyCode::KeyM));
+        let expected = DiskConfig::for_model(model.next(), 0.3);
+        assert_eq!(disk(&app).model, expected.model);
+        assert_eq!(disk(&app).r_outer_rs, expected.r_outer_rs);
+        assert_eq!(disk(&app).spin, 0.3);
+    }
+
+    #[test]
+    fn unbound_key_changes_nothing() {
+        let mut app = input_app(false);
+        assert!(!press(&mut app, KeyCode::KeyK));
+        assert_eq!(disk(&app).spin, KERR_SPIN);
+    }
+
+    #[test]
+    fn toggle_keys_flip_state_and_rebuild_the_scene() {
+        let mut app = input_app(true);
+        app.world_mut().resource_mut::<SimObjects>().0.clear();
+
+        assert!(press(&mut app, KeyCode::KeyN));
+        assert!(!app.world().resource::<BinaryBlackHoles>().enabled);
+        assert_eq!(objects(&app).len(), 1);
+
+        assert!(press(&mut app, KeyCode::KeyO));
+        assert!(app.world().resource::<DebugBodiesEnabled>().0);
+        assert_eq!(objects(&app).len(), 3);
+
+        press(&mut app, KeyCode::KeyN);
+        assert!(app.world().resource::<BinaryBlackHoles>().enabled);
+        assert_eq!(objects(&app).len(), 4);
+
+        assert!(!app.world().resource::<GravityEnabled>().0);
+        press(&mut app, KeyCode::KeyG);
+        assert!(app.world().resource::<GravityEnabled>().0);
+    }
+
+    #[test]
+    fn gamepad_sticks_and_triggers_tilt_the_selected_spin_axis() {
+        let mut app = input_app(true);
+        app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            100,
+        )));
+        let mut gamepad = Gamepad::default();
+        gamepad.analog_mut().set(GamepadAxis::RightStickX, 0.5);
+        gamepad.analog_mut().set(GamepadAxis::RightStickY, -0.25);
+        gamepad.analog_mut().set(GamepadButton::RightTrigger, 0.9);
+        gamepad.analog_mut().set(GamepadButton::LeftTrigger, 0.25);
+        app.world_mut().spawn(gamepad);
+        app.world_mut().resource_mut::<OrbitalCamera>().is_moving = false;
+        app.update();
+
+        let mut expected = BinaryBlackHoles::default();
+        let scale = GAMEPAD_AXIS_EDIT_SPEED * 0.1;
+        expected.adjust_selected_axis_component(0, 0.5 * scale);
+        expected.adjust_selected_axis_component(1, -0.25 * scale);
+        expected.adjust_selected_axis_component(2, 0.65 * scale);
+        let actual = app.world().resource::<BinaryBlackHoles>().spins[0].axis;
+        assert!(
+            (actual - expected.spins[0].axis).length() < 1e-5,
+            "{actual} != {}",
+            expected.spins[0].axis
+        );
+        assert_eq!(objects(&app)[0].spin, actual * KERR_SPIN);
     }
 }

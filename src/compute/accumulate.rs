@@ -85,6 +85,7 @@ pub fn init_accumulate_pipeline(
         shader_defs: vec![],
         entry_point: Some(Cow::Borrowed("main")),
         zero_initialize_workgroup_memory: false,
+        constants: vec![],
     });
 
     commands.insert_resource(AccumulatePipeline {

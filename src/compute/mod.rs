@@ -30,22 +30,27 @@ pub struct GeodesicComputePlugin;
 
 /// Raw frame written by geodesic.wgsl each tick.
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct GeodesicImage(pub Handle<Image>);
 
 /// Ping-pong accumulation buffer A (rgba32float).
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct AccumA(pub Handle<Image>);
 
 /// Ping-pong accumulation buffer B (rgba32float).
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct AccumB(pub Handle<Image>);
 
 /// Final blended output shown by the sprite.
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct DisplayImage(pub Handle<Image>);
 
 /// HDR equirectangular skybox currently bound to the geodesic shader.
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct SkyboxImage(pub Handle<Image>);
 
 /// All loaded skyboxes; main-world-only, drives the cycle-on-B-key UI.
@@ -58,16 +63,19 @@ pub struct SkyboxSet {
 /// frame_count sent to the accumulate shader for this render frame.
 /// 0 = reset history; ≥1 = blend with α=0.1.
 #[derive(Resource, Clone, Default, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct RenderFrameCount(pub u32);
 
 /// Determines which ping-pong buffer is "prev" for this frame.
 /// true → frame_count even → use b_prev bind group (writes to AccumA)
 /// false → frame_count odd  → use a_prev bind group (writes to AccumB)
 #[derive(Resource, Clone, Default, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct FrameParity(pub bool);
 
 /// Camera data packed for the uniform buffer (matches Camera struct in geodesic.wgsl, 112 bytes).
 #[derive(Resource, Clone, Default, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct CameraUniform {
     pub pos: Vec3,
     pub _pad0: f32,
@@ -95,6 +103,7 @@ pub struct CameraUniform {
 
 /// Object data packed for the uniform buffer.
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct ObjectsUniform {
     pub num_objects: i32,
     pub _pad: [f32; 3],
@@ -119,6 +128,7 @@ impl Default for ObjectsUniform {
 
 /// Disk/BH parameters extracted from `DiskConfig` each frame for the render world.
 #[derive(Resource, Clone, ExtractResource)]
+#[extract_app(RenderApp)]
 pub struct DiskConfigUniform {
     pub spin: f32,
     pub r_outer_rs: f32,
@@ -209,11 +219,17 @@ impl Plugin for GeodesicComputePlugin {
         app.add_systems(
             Update,
             (
+                cycle_skybox,
+                (cycle_render_scale, sync_compute_textures).chain(),
+            ),
+        );
+        // Uniforms read the frame's final state, including `is_moving` set during Update.
+        app.add_systems(
+            PostUpdate,
+            (
                 sync_camera_uniform,
                 sync_objects_uniform,
                 sync_disk_config_uniform,
-                cycle_skybox,
-                (cycle_render_scale, sync_compute_textures).chain(),
             ),
         );
 
@@ -265,6 +281,7 @@ fn make_rgba32f_tex(w: u32, h: u32, images: &mut Assets<Image>) -> Handle<Image>
     images.add(img)
 }
 
+#[cfg_attr(test, mutants::skip)] // needs a window + render assets
 fn setup_compute_texture(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
@@ -598,10 +615,395 @@ mod tests {
         window::ExitCondition,
         winit::WinitPlugin,
     };
+    use proptest::prelude::*;
+    use rstest::rstest;
     use std::time::{Duration, Instant};
 
     #[derive(Resource, Default)]
     struct Pixels(Vec<u8>);
+
+    // ── Halton jitter sequence ───────────────────────────────────────────────
+
+    /// 1, 2, 3, 6 in base 2 → .1, .01, .11, .011; in base 3 → .1, .2, .01, .02
+    #[rstest]
+    #[case(0, 2, 0.0)]
+    #[case(1, 2, 0.5)]
+    #[case(2, 2, 0.25)]
+    #[case(3, 2, 0.75)]
+    #[case(6, 2, 0.375)]
+    #[case(1, 3, 1.0 / 3.0)]
+    #[case(2, 3, 2.0 / 3.0)]
+    #[case(3, 3, 1.0 / 9.0)]
+    #[case(6, 3, 2.0 / 9.0)]
+    fn halton_matches_radical_inverse(#[case] i: u32, #[case] base: u32, #[case] expected: f32) {
+        assert!(
+            (halton(i, base) - expected).abs() < 1e-6,
+            "{}",
+            halton(i, base)
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn halton_is_a_self_similar_unit_interval_sequence(i in 1_u32..10_000, base in 2_u32..8) {
+            let h = halton(i, base);
+            prop_assert!((0.0..1.0).contains(&h), "{h}");
+            // Appending a 0 digit (i·b) shifts the radical inverse one place right.
+            prop_assert!((halton(i * base, base) - h / base as f32).abs() < 1e-6);
+        }
+    }
+
+    // ── Camera uniform and accumulation ──────────────────────────────────────
+
+    fn camera_sync_app() -> App {
+        let mut app = App::new();
+        app.init_resource::<OrbitalCamera>()
+            .init_resource::<SimObjects>()
+            .init_resource::<CameraUniform>()
+            .init_resource::<StillFrameCounter>()
+            .init_resource::<RenderFrameCount>()
+            .init_resource::<FrameParity>()
+            .add_systems(Update, sync_camera_uniform);
+        app
+    }
+
+    /// (frame_count, parity, jitter_x, jitter_y, moving) after one update.
+    fn sync_frame(app: &mut App) -> (u32, bool, f32, f32, u32) {
+        app.update();
+        let world = app.world();
+        let uniform = world.resource::<CameraUniform>();
+        (
+            world.resource::<RenderFrameCount>().0,
+            world.resource::<FrameParity>().0,
+            uniform.jitter_x,
+            uniform.jitter_y,
+            uniform.moving,
+        )
+    }
+
+    #[test]
+    fn still_frames_count_up_and_movement_resets_accumulation() {
+        let mut app = camera_sync_app();
+        // First frame: SimObjects was just added, so the scene counts as moving.
+        assert_eq!(sync_frame(&mut app), (0, true, 0.0, 0.0, 1));
+        let (fc, parity, jx, jy, moving) = sync_frame(&mut app);
+        assert_eq!((fc, parity, jx, moving), (0, true, 0.0, 0));
+        assert!((jy + 1.0 / 6.0).abs() < 1e-6, "jitter_y = {jy}");
+        let (fc, parity, jx, jy, _) = sync_frame(&mut app);
+        assert_eq!((fc, parity, jx), (1, false, -0.25));
+        assert!((jy - 1.0 / 6.0).abs() < 1e-6, "jitter_y = {jy}");
+
+        app.world_mut().resource_mut::<OrbitalCamera>().is_moving = true;
+        assert_eq!(sync_frame(&mut app), (0, true, 0.0, 0.0, 1));
+        app.world_mut().resource_mut::<OrbitalCamera>().is_moving = false;
+        assert_eq!(sync_frame(&mut app).0, 0, "counter restarts from zero");
+        assert_eq!(sync_frame(&mut app).0, 1);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn still_frames_blend_with_sub_pixel_jitter(frames in 2_u32..120) {
+            let mut app = camera_sync_app();
+            let mut last = sync_frame(&mut app);
+            for _ in 1..frames {
+                last = sync_frame(&mut app);
+                let (_, _, jx, jy, _) = last;
+                prop_assert!((-0.5..0.5).contains(&jx) && (-0.5..0.5).contains(&jy), "({jx}, {jy})");
+            }
+            let (fc, parity, _, _, moving) = last;
+            prop_assert_eq!(fc, frames - 2);
+            prop_assert_eq!(parity, fc % 2 == 0);
+            prop_assert_eq!(moving, 0);
+        }
+
+        #[test]
+        fn camera_uniform_mirrors_the_orbital_camera(
+            radius in 1.6_f64..160.0,
+            azimuth in -10.0_f64..10.0,
+            elevation in 0.1_f64..3.0,
+            fov_degrees in 10.0_f64..170.0,
+            max_iter in prop::sample::select(crate::camera::ITER_PRESETS),
+            polarization_view in 0_u32..6,
+            heatmap in any::<bool>(),
+        ) {
+            let mut app = camera_sync_app();
+            let cam = OrbitalCamera {
+                radius, azimuth, elevation, fov_degrees, max_iter, polarization_view,
+                debug_heatmap: heatmap,
+                frequency_ghz: 86.0,
+                faraday_depth: -3.0,
+                conversion_depth: 7.0,
+                ..default()
+            };
+            app.insert_resource(cam);
+            app.update();
+            let cam = app.world().resource::<OrbitalCamera>();
+            let u = app.world().resource::<CameraUniform>();
+            prop_assert_eq!(u.pos, cam.position());
+            prop_assert_eq!((u.right, u.up, u.forward), (cam.right(), cam.up(), cam.forward()));
+            prop_assert_eq!(u.tan_half_fov, cam.tan_half_fov());
+            prop_assert_eq!((u.max_iter, u.polarization_view), (max_iter, polarization_view));
+            prop_assert_eq!(u.debug_heatmap, heatmap as u32);
+            prop_assert_eq!((u.frequency_ghz, u.faraday_depth, u.conversion_depth), (86.0, -3.0, 7.0));
+        }
+    }
+
+    #[rstest]
+    #[case::polarization_view(|w: &mut World| w.resource_mut::<OrbitalCamera>().polarization_view = 2)]
+    #[case::frequency(|w: &mut World| w.resource_mut::<OrbitalCamera>().frequency_ghz = 86.0)]
+    #[case::faraday(|w: &mut World| w.resource_mut::<OrbitalCamera>().faraday_depth = -3.0)]
+    #[case::conversion(|w: &mut World| w.resource_mut::<OrbitalCamera>().conversion_depth = 7.0)]
+    #[case::objects(|w: &mut World| w.resource_mut::<SimObjects>().set_changed())]
+    #[case::camera_motion(|w: &mut World| w.resource_mut::<OrbitalCamera>().is_moving = true)]
+    fn scene_changes_reset_accumulation(#[case] edit: fn(&mut World)) {
+        let mut app = camera_sync_app();
+        for _ in 0..3 {
+            sync_frame(&mut app);
+        }
+        assert_eq!(sync_frame(&mut app).0, 2, "accumulating before the change");
+        edit(app.world_mut());
+        assert_eq!(sync_frame(&mut app), (0, true, 0.0, 0.0, 1));
+    }
+
+    #[test]
+    fn heatmap_suppresses_jitter_without_resetting() {
+        let mut app = camera_sync_app();
+        for _ in 0..3 {
+            sync_frame(&mut app);
+        }
+        app.world_mut()
+            .resource_mut::<OrbitalCamera>()
+            .debug_heatmap = true;
+        let (fc, _, jx, jy, moving) = sync_frame(&mut app);
+        assert_eq!((fc, jx, jy, moving), (2, 0.0, 0.0, 0));
+    }
+
+    #[rstest]
+    #[case::wide(1000.0, 400.0, 2.5)]
+    #[case::square(600.0, 600.0, 1.0)]
+    #[case::minimised_falls_back_to_4_3(1000.0, 0.0, 800.0 / 600.0)]
+    fn aspect_ratio_comes_from_the_primary_window(
+        #[case] width: f32,
+        #[case] height: f32,
+        #[case] expected: f32,
+    ) {
+        let mut app = camera_sync_app();
+        let mut window = Window::default();
+        window.resolution.set(width, height);
+        app.world_mut().spawn((window, PrimaryWindow));
+        app.update();
+        assert_eq!(app.world().resource::<CameraUniform>().aspect, expected);
+    }
+
+    #[test]
+    fn no_window_falls_back_to_4_3() {
+        let mut app = camera_sync_app();
+        app.update();
+        assert_eq!(
+            app.world().resource::<CameraUniform>().aspect,
+            800.0 / 600.0
+        );
+    }
+
+    // ── Object and disk uniforms ─────────────────────────────────────────────
+
+    fn numbered_body(i: usize) -> crate::simulation::SimObject {
+        crate::simulation::SimObject {
+            position: Vec3::new(i as f32, 2.0 * i as f32, 3.0 * i as f32),
+            radius: 0.5 + i as f32,
+            color: Vec4::new(0.1, 0.2, 0.3, i as f32),
+            mass: 7.0 * i as f32,
+            velocity: Vec3::ZERO,
+            spin: Vec3::new(0.125 * i as f32, 0.02, 0.03),
+        }
+    }
+
+    fn objects_app(count: usize) -> App {
+        let mut app = App::new();
+        app.insert_resource(SimObjects((0..count).map(numbered_body).collect()))
+            .init_resource::<ObjectsUniform>()
+            .add_systems(Update, sync_objects_uniform);
+        app.update();
+        app
+    }
+
+    proptest! {
+        #[test]
+        fn objects_uniform_packs_up_to_sixteen_bodies(count in 0_usize..40) {
+            let app = objects_app(count);
+            let u = app.world().resource::<ObjectsUniform>();
+            prop_assert_eq!(u.num_objects, count.min(16) as i32);
+            for i in 0..count.min(16) {
+                let body = numbered_body(i);
+                prop_assert_eq!(u.pos_radius[i], body.position.extend(body.radius).to_array());
+                prop_assert_eq!(u.color[i], body.color.to_array());
+                prop_assert_eq!(u.mass[i], [body.mass, 0.0, 0.0, 0.0]);
+                prop_assert_eq!(u.spin[i], body.spin.extend(0.0).to_array());
+            }
+        }
+
+        #[test]
+        fn disk_uniform_mirrors_disk_config(
+            model in prop::sample::select(vec![
+                crate::simulation::DiskModel::ThinNt,
+                crate::simulation::DiskModel::TruncatedHotFlow,
+                crate::simulation::DiskModel::SlimFunnel,
+                crate::simulation::DiskModel::WarpedThin,
+            ]),
+            spin in -0.999_f32..=0.999,
+            binary in any::<bool>(),
+        ) {
+            let disk = DiskConfig::for_model(model, spin);
+            let mut app = App::new();
+            app.insert_resource(disk.clone())
+                .insert_resource(BinaryBlackHoles { enabled: binary, ..default() })
+                .init_resource::<DiskConfigUniform>()
+                .add_systems(Update, sync_disk_config_uniform);
+            app.update();
+            let u = app.world().resource::<DiskConfigUniform>();
+            prop_assert_eq!((u.spin, u.r_outer_rs, u.model), (disk.spin, disk.r_outer_rs, disk.model.as_u32()));
+            prop_assert_eq!((u.h_thin, u.h_hot, u.r_trunc_rs), (disk.h_thin, disk.h_hot, disk.r_trunc_rs));
+            prop_assert_eq!((u.tilt_deg, u.r_bp_rs, u.twist_deg), (disk.tilt_deg, disk.r_bp_rs, disk.twist_deg));
+            prop_assert_eq!(u.binary_enabled, binary);
+        }
+    }
+
+    #[test]
+    fn unchanged_objects_leave_the_uniform_alone() {
+        let mut app = objects_app(3);
+        app.world_mut().resource_mut::<ObjectsUniform>().num_objects = -1;
+        app.update();
+        assert_eq!(app.world().resource::<ObjectsUniform>().num_objects, -1);
+    }
+
+    #[test]
+    fn binary_toggle_alone_resyncs_the_disk_uniform() {
+        let mut app = App::new();
+        app.init_resource::<DiskConfig>()
+            .init_resource::<BinaryBlackHoles>()
+            .init_resource::<DiskConfigUniform>()
+            .add_systems(Update, sync_disk_config_uniform);
+        app.update();
+        app.update();
+        app.world_mut().resource_mut::<BinaryBlackHoles>().enabled = false;
+        app.update();
+        assert!(!app.world().resource::<DiskConfigUniform>().binary_enabled);
+    }
+
+    // ── Render scale and skyboxes ────────────────────────────────────────────
+
+    fn press_once<S: Resource>(app: &mut App, key: KeyCode) -> &S {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(key);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .reset_all();
+        app.world().resource::<S>()
+    }
+
+    fn scale_app(start: f32) -> App {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .insert_resource(RenderScale(start))
+            .add_systems(Update, cycle_render_scale);
+        app
+    }
+
+    #[rstest]
+    #[case::down(0.5, KeyCode::Minus, 0.25)]
+    #[case::stops_at_bottom(0.25, KeyCode::Minus, 0.25)]
+    #[case::up(0.5, KeyCode::Equal, 0.75)]
+    #[case::stops_at_top(1.0, KeyCode::Equal, 1.0)]
+    #[case::off_preset_counts_as_half(0.6, KeyCode::Equal, 0.75)]
+    #[case::unbound_key(0.5, KeyCode::KeyK, 0.5)]
+    fn render_scale_keys_step_through_presets(
+        #[case] start: f32,
+        #[case] key: KeyCode,
+        #[case] expected: f32,
+    ) {
+        let mut app = scale_app(start);
+        assert_eq!(press_once::<RenderScale>(&mut app, key).0, expected);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn render_scale_keys_walk_the_preset_list(ups in prop::collection::vec(any::<bool>(), 0..10)) {
+            let mut app = scale_app(0.5);
+            let mut idx = 1;
+            for up in ups {
+                let key = if up { KeyCode::Equal } else { KeyCode::Minus };
+                idx = if up { (idx + 1).min(SCALE_PRESETS.len() - 1) } else { idx.saturating_sub(1) };
+                prop_assert_eq!(press_once::<RenderScale>(&mut app, key).0, SCALE_PRESETS[idx]);
+            }
+        }
+    }
+
+    #[rstest]
+    #[case::advances(1, 2)]
+    #[case::wraps(2, 0)]
+    fn skybox_key_cycles_and_wraps(#[case] start: usize, #[case] expected: usize) {
+        let mut images = Assets::<Image>::default();
+        let handles: Vec<_> = (0..3).map(|_| images.add(Image::default())).collect();
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<OrbitalCamera>()
+            .insert_resource(SkyboxImage(handles[start].clone()))
+            .insert_resource(SkyboxSet {
+                handles: handles.clone(),
+                current: start,
+            })
+            .add_systems(Update, cycle_skybox);
+
+        assert_eq!(
+            press_once::<SkyboxSet>(&mut app, KeyCode::KeyB).current,
+            expected
+        );
+        assert_eq!(app.world().resource::<SkyboxImage>().0, handles[expected]);
+        assert!(app.world().resource::<OrbitalCamera>().is_moving);
+    }
+
+    /// The generated checker texture, built once for every test that inspects it.
+    fn checker_image() -> &'static Image {
+        static IMAGE: std::sync::LazyLock<Image> = std::sync::LazyLock::new(|| {
+            let mut images = Assets::<Image>::default();
+            let handle = make_checker_skybox(&mut images);
+            images.get(&handle).unwrap().clone()
+        });
+        &IMAGE
+    }
+
+    #[test]
+    fn checker_skybox_is_a_sampled_hdr_texture() {
+        let image = checker_image();
+        assert_eq!(image.size(), UVec2::new(1024, 512));
+        assert_eq!(
+            image.texture_descriptor.usage,
+            TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn checker_skybox_alternates_32_pixel_squares(x in 0_usize..1024, y in 0_usize..512) {
+            let data = checker_image().data.as_ref().unwrap();
+            let at = (y * 1024 + x) * 16;
+            let texel: Vec<f32> = data[at..at + 16]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_ne_bytes(*c))
+                .collect();
+            let bright = (x / 32 + y / 32) % 2 == 0;
+            let level = if bright { 8.0 } else { 0.02 };
+            prop_assert_eq!(texel, vec![level, level, level, 1.0]);
+        }
+    }
 
     #[test]
     #[ignore = "requires a GPU; run with cargo test headless_render -- --ignored --nocapture"]

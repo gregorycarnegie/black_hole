@@ -156,6 +156,7 @@ pub fn init_geodesic_pipeline(
         shader_defs: vec![],
         entry_point: Some(Cow::Borrowed("main")),
         zero_initialize_workgroup_memory: false,
+        constants: vec![],
     });
 
     commands.insert_resource(GeodesicPipeline {
@@ -472,7 +473,7 @@ pub(super) fn check_relativity(device: &RenderDevice, queue: &RenderQueue) {
         .recv_timeout(std::time::Duration::from_secs(30))
         .unwrap()
         .unwrap();
-    let data = readback.slice(..).get_mapped_range();
+    let data = readback.slice(..).get_mapped_range().unwrap();
     for (i, value) in bytemuck::cast_slice::<u8, f32>(&data)
         .iter()
         .take(20)

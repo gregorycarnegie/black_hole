@@ -112,3 +112,51 @@ fn draw_spacetime_grid(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(1.6, (25, 1.6))]
+    #[case(23.9, (25, 1.6))]
+    #[case(24.0, (13, 3.2))]
+    #[case(79.9, (13, 3.2))]
+    #[case(80.0, (9, 6.4))]
+    #[case(160.0, (9, 6.4))]
+    fn grid_gets_coarser_as_the_camera_backs_off(
+        #[case] radius: f64,
+        #[case] expected: (i32, f32),
+    ) {
+        assert_eq!(grid_lod(radius), expected);
+    }
+
+    proptest! {
+        /// Coarser levels widen their spacing so the grid covers roughly the same area.
+        #[test]
+        fn zooming_out_never_refines_or_shrinks_the_grid(near in 1.6_f64..160.0, gap in 0.0_f64..160.0) {
+            let (near_size, near_spacing) = grid_lod(near);
+            let (far_size, far_spacing) = grid_lod(near + gap);
+            prop_assert!(far_size <= near_size);
+            prop_assert!(far_spacing >= near_spacing);
+            prop_assert!(far_size as f32 * far_spacing >= near_size as f32 * near_spacing * 0.9);
+        }
+    }
+
+    #[rstest]
+    #[case::shows_hidden_grid(false, true)]
+    #[case::hides_visible_grid(true, false)]
+    fn f_key_toggles_grid_visibility(#[case] visible: bool, #[case] expected: bool) {
+        let mut app = App::new();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .insert_resource(GridVisible(visible))
+            .add_systems(Update, toggle_grid);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyF);
+        app.update();
+        assert_eq!(app.world().resource::<GridVisible>().0, expected);
+    }
+}

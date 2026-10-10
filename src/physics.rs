@@ -104,8 +104,9 @@ pub fn kerr_isco_radius_rg(spin: f32) -> f32 {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use rstest::rstest;
 
-    // ── Unit tests ───────────────────────────────────────────────────────────
+    // ── Reference values ─────────────────────────────────────────────────────
 
     #[test]
     fn horizon_equals_schwarzschild_at_zero_spin() {
@@ -114,37 +115,6 @@ mod tests {
             (r_h / SAGA_RS - 1.0).abs() < 1e-5,
             "expected r_h ≈ SAGA_RS ({SAGA_RS}), got {r_h}"
         );
-    }
-
-    #[test]
-    fn horizon_shrinks_monotonically_with_spin() {
-        let r0 = kerr_horizon_radius(0.0);
-        let r5 = kerr_horizon_radius(0.5);
-        let r9 = kerr_horizon_radius(0.9);
-        assert!(r0 > r5, "r_h(0)={r0} should be > r_h(0.5)={r5}");
-        assert!(r5 > r9, "r_h(0.5)={r5} should be > r_h(0.9)={r9}");
-    }
-
-    #[test]
-    fn horizon_symmetric_in_spin_sign() {
-        for &a in &[0.1_f32, 0.5, 0.8, 0.999] {
-            let rp = kerr_horizon_radius(a);
-            let rm = kerr_horizon_radius(-a);
-            assert!(
-                (rp - rm).abs() < 1.0,
-                "horizon should be symmetric: r_h({a})={rp}, r_h(-{a})={rm}"
-            );
-        }
-    }
-
-    #[test]
-    fn horizon_always_positive() {
-        for &a in &[-0.999_f32, -0.5, 0.0, 0.5, 0.999] {
-            assert!(
-                kerr_horizon_radius(a) > 0.0,
-                "horizon non-positive at a={a}"
-            );
-        }
     }
 
     #[test]
@@ -157,43 +127,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prograde_spin_moves_isco_inward() {
-        let r_schw = 3.0 * SAGA_RS;
-        for &a in &[0.1_f32, 0.5, 0.82, 0.999] {
-            let r = kerr_isco_radius(a);
-            assert!(
-                r < r_schw,
-                "prograde a={a}: r_isco={r} should be < {r_schw}"
-            );
-        }
+    /// Bardeen, Press & Teukolsky (1972), r_isco in units of M.
+    #[rstest]
+    #[case(0.5, 4.233)]
+    #[case(-0.5, 7.555)]
+    #[case(0.9, 2.321)]
+    #[case(-0.9, 8.717)]
+    fn isco_matches_bardeen_press_teukolsky_values(#[case] spin: f32, #[case] expected: f32) {
+        let actual = kerr_isco_radius_rg(spin);
+        assert!((actual - expected).abs() < 1e-3, "{actual} != {expected}");
     }
 
-    #[test]
-    fn retrograde_spin_moves_isco_outward() {
-        let r_schw = 3.0 * SAGA_RS;
-        for &a in &[-0.1_f32, -0.5, -0.82, -0.999] {
-            let r = kerr_isco_radius(a);
-            assert!(
-                r > r_schw,
-                "retrograde a={a}: r_isco={r} should be > {r_schw}"
-            );
-        }
+    /// Proptest ranges rarely land exactly on the spin limits, so pin them here.
+    #[rstest]
+    fn extremal_spin_keeps_horizon_positive_and_isco_outside(#[values(-0.999, 0.999)] spin: f32) {
+        let r_h = kerr_horizon_radius(spin);
+        assert!(r_h > 0.0, "horizon non-positive: {r_h}");
+        assert!(kerr_isco_radius(spin) > r_h);
+        assert_eq!(kerr_horizon_radius(spin), kerr_horizon_radius(-spin));
     }
 
-    #[test]
-    fn isco_outside_horizon_at_known_spins() {
-        for &a in &[-0.999_f32, -0.5, 0.0, 0.5, 0.82, 0.999] {
-            let r_h = kerr_horizon_radius(a);
-            let r_isco = kerr_isco_radius(a);
-            assert!(
-                r_isco > r_h,
-                "ISCO must be outside horizon at a={a}: r_isco={r_isco}, r_h={r_h}"
-            );
-        }
-    }
-
-    // ── Proptest ─────────────────────────────────────────────────────────────
+    // ── Properties ───────────────────────────────────────────────────────────
 
     proptest! {
         #[test]
@@ -275,6 +229,16 @@ mod tests {
                 (rp - rm).abs() < 1.0,
                 "horizon not symmetric: r_h({a})={rp}, r_h(-{a})={rm}"
             );
+        }
+
+        #[test]
+        fn spins_beyond_the_kerr_limit_clamp_to_it(
+            magnitude in 0.999_f32..100.0,
+            sign in prop_oneof![Just(1.0_f32), Just(-1.0)],
+        ) {
+            let spin = sign * magnitude;
+            prop_assert_eq!(kerr_horizon_radius_rg(spin), kerr_horizon_radius_rg(sign * 0.999));
+            prop_assert_eq!(kerr_isco_radius_rg(spin), kerr_isco_radius_rg(sign * 0.999));
         }
     }
 }

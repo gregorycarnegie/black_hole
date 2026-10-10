@@ -1,0 +1,16 @@
+# cargo-mutants: `cargo mutants -j6`.
+# Excluded code is unreachable from host tests; its mutants would all survive and bury real gaps.
+# Layout/spawn functions use `#[cfg_attr(test, mutants::skip)]` instead: as of cargo-mutants
+# 27.1, `exclude_re` does not filter "delete field" mutants.
+exclude_globs = [
+    "src/main.rs",               # window setup and FPS text
+    "src/compute/pipeline.rs",   # render-world GPU dispatch; only the ignored GPU test reaches it
+    "src/compute/accumulate.rs", # same
+]
+exclude_re = [
+    "impl Plugin for",                       # plugin wiring; covered by the app smoke run
+    "draw_spacetime_grid",                   # gizmo drawing needs a render app
+    "sync_compute_textures|make_rgba",       # needs a window + render assets
+    "load_skyboxes",                         # asset server
+]
+build_timeout_multiplier = 3

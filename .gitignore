@@ -6,3 +6,6 @@
 
 ##### Codex remote attachments
 .codex-remote-attachments/
+
+##### cargo-mutants
+mutants.out*/
