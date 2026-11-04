@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -9,7 +10,10 @@ ENV = {**os.environ, "LEAN_NUM_THREADS": "1"}
 
 
 def run(*arguments):
+    start = time.monotonic()
+    print("==> lake " + " ".join(arguments), flush=True)
     subprocess.run(["lake", *arguments], cwd=ROOT, env=ENV, check=True)
+    print(f"<== done in {time.monotonic() - start:.0f}s", flush=True)
 
 
 if __name__ == "__main__":
