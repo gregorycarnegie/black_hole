@@ -147,3 +147,108 @@ fn adaptive_controller_misses_trajectory_targets() {
     // controller is certified.
     assert!(failures > 0, "every traced ray met the trajectory targets");
 }
+
+/// Schwarzschild classification (obligation N4). A geodesic with conserved
+/// `E = |p_t|`, `L = z p_x - x p_z` and `m² = -g^{μν} p_μ p_ν` obeys
+/// `ṙ² = E² - V(r)` with `V = (1 - 2M/r)(L²/r² + m²)`. An ingoing ray from
+/// r ≈ 100 is captured iff `E²` exceeds the maximum of `V` outside the
+/// horizon, and otherwise turns and escapes. All three charges are evaluated
+/// in binary64 from the GPU's own binary32 initial state, so the binary32
+/// null residual is accounted for exactly (for a null ray this reduces to
+/// `b = |L|/E` versus `3√3 M`). The renderer's rules must never return the
+/// opposite class; critical rays may only end unresolved.
+#[test]
+#[ignore = "requires a GPU (lavapipe works); run with --release -- --ignored"]
+fn classification_against_the_critical_impact_parameter() {
+    let critical = 27.0_f64.sqrt() * MASS;
+    let run = |impacts: &[f32]| {
+        let mut input = Vec::new();
+        for &impact in impacts {
+            for value in [impact, 0.0, 0.0, 0.0] {
+                input.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let mut objects = vec![0u8; 1040];
+        objects[..4].copy_from_slice(&1i32.to_le_bytes());
+        objects[528..532].copy_from_slice(&1f32.to_le_bytes());
+        let data = crate::gpu::run_groups(
+            include_str!("../controller.wesl"),
+            "classify",
+            &[
+                &[(3, &objects, BufferUsages::UNIFORM)],
+                &[(0, &input, BufferUsages::STORAGE)],
+            ],
+            (impacts.len() * 64) as u64,
+            impacts.len() as u32,
+        );
+        let values: Vec<f64> = bytemuck::cast_slice::<u8, f32>(&data)
+            .iter()
+            .map(|&x| f64::from(x))
+            .collect();
+        (0..impacts.len())
+            .map(|n| {
+                let v = &values[16 * n..16 * n + 16];
+                let angular = v[2] * v[4 + 1] - v[0] * v[4 + 3];
+                // Past-directed rays: p_t > 0, energy is |p_t|.
+                let energy = v[4].abs();
+                let b = angular.abs() / energy;
+                let p = [v[4], v[5], v[6], v[7]];
+                let (inv, _) = inverse_and_derivative([v[0], v[1], v[2]]);
+                let mut norm = 0.0;
+                for a in 0..4 {
+                    for c in 0..4 {
+                        norm += inv[a][c] * p[a] * p[c];
+                    }
+                }
+                let mass2 = -norm;
+                let potential = |r: f64| (1.0 - 2.0 * MASS / r) * (angular * angular / (r * r) + mass2);
+                // V is unimodal on (2M, 100]; golden-section search for its peak.
+                let (mut lo, mut hi) = (2.5 * MASS, 4.0 * MASS);
+                for _ in 0..200 {
+                    let a = lo + 0.381_966_011_250_105 * (hi - lo);
+                    let c = hi - 0.381_966_011_250_105 * (hi - lo);
+                    if potential(a) < potential(c) { lo = a } else { hi = c }
+                }
+                let margin = (energy * energy - potential(0.5 * (lo + hi))) / (energy * energy);
+                (b, v[3] as u32, v[11] as u32, margin)
+            })
+            .collect::<Vec<_>>()
+    };
+    // Coarse pass to locate the critical impact, then every binary32 impact in
+    // a window around it.
+    let coarse: Vec<f32> = (0..64).map(|i| 5.0 + 0.4 * i as f32 / 63.0).collect();
+    let rays = run(&coarse);
+    let index = rays.iter().position(|r| r.3 < 0.0).unwrap();
+    let centre = coarse[index - 1] + (coarse[index] - coarse[index - 1])
+        * (rays[index - 1].3 / (rays[index - 1].3 - rays[index].3)) as f32;
+    let mut fine = Vec::new();
+    let mut impact = f32::from_bits(centre.to_bits() - 128);
+    for _ in 0..256 {
+        fine.push(impact);
+        impact = f32::from_bits(impact.to_bits() + 1);
+    }
+    let mut wrong = Vec::new();
+    let mut counts = [0; 4];
+    for (impact, (b, status, steps, margin)) in fine.iter().zip(run(&fine)) {
+        counts[status as usize] += 1;
+        // Positive margin: E² exceeds the potential barrier, so the ray is captured.
+        let exact = if margin > 0.0 { 1 } else { 2 };
+        if (status == 1 || status == 2) && status != exact {
+            wrong.push((*impact, b - critical, margin, status, steps));
+        }
+    }
+    println!(
+        "critical b = {critical}; window {:?}..{:?}; statuses captured/escaped/unresolved: {}/{}/{}",
+        fine[0], fine[255], counts[1], counts[2], counts[3]
+    );
+    for (impact, offset, margin, status, steps) in wrong.iter().take(8) {
+        println!(
+            "misclassified impact {impact}: b - b_c = {offset:.3e}, (E² - V_max)/E² = {margin:.3e}, \
+             status {status}, {steps} steps"
+        );
+    }
+    println!("{} of 256 rays misclassified", wrong.len());
+    // Records the counterexample to sound classification; remove once the
+    // renderer leaves near-critical rays unresolved.
+    assert!(!wrong.is_empty(), "no near-critical ray was misclassified");
+}
