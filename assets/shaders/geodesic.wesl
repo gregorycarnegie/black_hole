@@ -319,11 +319,37 @@ fn screen_frame(ray: Ray, m: Metric) -> mat3x3<f32> {
 // S=(I,Q,U,V); dP/ds = rho x P - alpha P + j_P, P=(Q,U,V).
 // Scalar absorption, no dichroism. The exact constant-cell solution stays
 // bounded at large Faraday depth; foreground operators compose camera-outward.
+// sin and cos from correctly rounded + - * only. WGSL guarantees builtin
+// f32 sin/cos to just 2^-11 absolute, and only on [-pi, pi]. Cody-Waite
+// reduction by pi/2, then degree-13/14 Taylor polynomials on |r| <= 1
+// (truncation < 1e-12). The clamp keeps every finite input bounded; it is
+// inactive for |x| <= 2^18, where WgslSinCos.sincos_error bounds the error by
+// 128 u (1 + |x|) under the WGSL accuracy model.
+const PIO2_HI: f32 = 1.5707963705062866;
+const PIO2_LO: f32 = -4.371138828673793e-8;
+const TWO_OVER_PI: f32 = 0.6366197466850281;
+
+fn sincos(x: f32) -> vec2<f32> {
+    let k = round(x*TWO_OVER_PI);
+    let r = clamp((x-k*PIO2_HI)-k*PIO2_LO,-1.0,1.0);
+    let r2 = r*r;
+    let s = r*(1.0+r2*(-1.0/6.0+r2*(1.0/120.0+r2*(-1.0/5040.0+r2*(1.0/362880.0
+        +r2*(-1.0/39916800.0+r2*(1.0/6227020800.0)))))));
+    let c = 1.0+r2*(-0.5+r2*(1.0/24.0+r2*(-1.0/720.0+r2*(1.0/40320.0
+        +r2*(-1.0/3628800.0+r2*(1.0/479001600.0+r2*(-1.0/87178291200.0)))))));
+    // Quadrant from the low two bits of k (two's complement handles k < 0).
+    let q = i32(k) & 3;
+    if q == 0 { return vec2<f32>(s,c); }
+    if q == 1 { return vec2<f32>(c,-s); }
+    if q == 2 { return vec2<f32>(-s,-c); }
+    return vec2<f32>(-c,s);
+}
+
 fn faraday_rotation(rho: vec3<f32>, ds: f32) -> mat3x3<f32> {
     let w = length(rho);
     let axis = rho/max(w,1.0e-20);
     let angle = w*ds;
-    let c = cos(angle); let s = sin(angle);
+    let sc = sincos(angle); let c = sc.y; let s = sc.x;
     let identity = mat3x3<f32>(vec3<f32>(1,0,0),vec3<f32>(0,1,0),vec3<f32>(0,0,1));
     let cross_matrix = mat3x3<f32>(vec3<f32>(0,axis.z,-axis.y),
         vec3<f32>(-axis.z,0,axis.x),vec3<f32>(axis.y,-axis.x,0));
@@ -346,7 +372,8 @@ fn transfer_phi(z: vec2<f32>) -> vec2<f32> {
         return acc;
     }
     let e = exp(-z.x);
-    let num = vec2<f32>(1.0-e*cos(z.y), e*sin(z.y)); // 1 - exp(-z)
+    let sc = sincos(z.y);
+    let num = vec2<f32>(1.0-e*sc.y, e*sc.x); // 1 - exp(-z)
     return vec2<f32>(num.x*z.x+num.y*z.y, num.y*z.x-num.x*z.y)/dot(z,z);
 }
 
@@ -453,7 +480,7 @@ fn disk_midplane_y(r_disk: f32, phi: f32) -> f32 {
     let w     = 0.5 * (1.0 + tanh(ln_norm));   // 0 inside r_bp, 1 outside
     let beta  = disk.tilt_deg  * (PI / 180.0) * w;
     let gamma = disk.twist_deg * (PI / 180.0) * log(1.0 + r_disk / r_bp_safe);
-    return r_disk * sin(beta) * sin(phi - gamma);
+    return r_disk * sincos(beta).x * sincos(phi - gamma).x;
 }
 
 // Sub-Keplerian factor: 1.0 for razor-thin, ~0.5 for thick hot flow.

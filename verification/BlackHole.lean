@@ -61,6 +61,7 @@ public import BlackHole.MatrixTransfer
 public import BlackHole.WgslSum
 public import BlackHole.WgslKerrRadius
 public import BlackHole.TransferPhi
+public import BlackHole.WgslSinCos
 public import Mathlib.Analysis.SpecialFunctions.Sqrt
 public import Mathlib.Analysis.SpecialFunctions.ExpDeriv
 public import Mathlib.Analysis.SpecialFunctions.Pow.Real
