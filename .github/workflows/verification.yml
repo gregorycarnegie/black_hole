@@ -7,6 +7,12 @@ on:
 permissions:
   contents: read
 
+# A full proof build takes hours. Queue newer pushes behind the running one
+# instead of competing for runners; the build cache carries results forward.
+concurrency:
+  group: proofs-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   proofs:
     runs-on: ubuntu-latest
