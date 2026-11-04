@@ -53,6 +53,11 @@ public import BlackHole.AdaptiveStep
 public import BlackHole.RadialRK4
 public import BlackHole.Transport
 public import BlackHole.Hamiltonian
+public import BlackHole.Binary32Bounds
+public import BlackHole.Units
+public import BlackHole.EnergyDrift
+public import BlackHole.KerrRadialStability
+public import BlackHole.MatrixTransfer
 public import Mathlib.Analysis.SpecialFunctions.Sqrt
 public import Mathlib.Analysis.SpecialFunctions.ExpDeriv
 public import Mathlib.Analysis.SpecialFunctions.Pow.Real

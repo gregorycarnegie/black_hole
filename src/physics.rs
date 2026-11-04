@@ -89,15 +89,23 @@ pub fn kerr_isco_radius(spin: f32) -> f32 {
 }
 
 /// Kerr ISCO in gravitational radii, independent of the physical mass.
+///
+/// This evaluates the Bardeen formula without its cancellation near zero spin.
+/// With q = ∛(1+|a|) and r = ∛(1−|a|), the cube-root factor (1−a²)^⅓ is qr
+/// and 3 − z₁ = (q+r)(q−r)², where q − r = 2|a|/(q²+qr+r²). The direct
+/// `3.0 - z1` lost up to 4731 binary32 units of relative accuracy near
+/// |a| = 5·10⁻⁴; this form stays within 18 (see `tests/exhaustive_binary32.rs`).
 pub fn kerr_isco_radius_rg(spin: f32) -> f32 {
     let a = spin.clamp(-KERR_SPIN_LIMIT, KERR_SPIN_LIMIT);
     let abs_a = a.abs();
-    let z1 = 1.0
-        + (1.0 - abs_a * abs_a).powf(1.0 / 3.0)
-            * ((1.0 + abs_a).powf(1.0 / 3.0) + (1.0 - abs_a).powf(1.0 / 3.0));
+    let q = (1.0 + abs_a).cbrt();
+    let r = (1.0 - abs_a).cbrt();
+    let gap = 2.0 * abs_a / (q * q + q * r + r * r);
+    let three_minus_z1 = (q + r) * gap * gap;
+    let z1 = 3.0 - three_minus_z1;
     let z2 = (3.0 * abs_a * abs_a + z1 * z1).sqrt();
     let direction = if a >= 0.0 { -1.0 } else { 1.0 };
-    3.0 + z2 + direction * ((3.0 - z1) * (3.0 + z1 + 2.0 * z2)).sqrt()
+    3.0 + z2 + direction * (three_minus_z1 * (3.0 + z1 + 2.0 * z2)).sqrt()
 }
 
 #[cfg(test)]
