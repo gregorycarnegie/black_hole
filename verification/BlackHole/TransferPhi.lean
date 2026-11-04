@@ -23,7 +23,7 @@ The shader now evaluates `ic + i·is = ds·φ(z)` with `z = (α - iw) ds` and
 * `phi_closed_form`: `ds·φ(z)` has exactly the former `ic`, `is` as real and
   imaginary parts, so the existing exact-real transfer theorems apply.
 * `horner_eq`: the shader's Horner recurrence is `Σ_{k<11} (-z)^k/(k+1)!`.
-* `phi_series_error`: that sum is within `10⁻¹¹` of `φ(z)` for `0 < |z| ≤ 1/2`. -/
+* `phi_series_error`: that sum is within `10⁻¹¹` of `φ(z)` for `0 < |z| ≤ 0.5001`. -/
 
 @[expose] public section
 noncomputable section
@@ -77,7 +77,7 @@ theorem horner_eq (z : ℂ) :
   ring
 
 /-- Truncation error of the 11-term series. -/
-theorem phi_series_error (z : ℂ) (hz0 : z ≠ 0) (hz : ‖z‖ ≤ 1/2) :
+theorem phi_series_error (z : ℂ) (hz0 : z ≠ 0) (hz : ‖z‖ ≤ 5001/10000) :
     ‖phi z-series z‖ ≤ 1/10^11 := by
   -- φ(z) - S(z) = -(e^{-z} - Σ_{n<12} (-z)^n/n!)/z.
   have hpartial : ∑ n ∈ range 12, ((n.factorial : ℝ)⁻¹) • (-z)^n = 1-z*series z := by
@@ -104,12 +104,12 @@ theorem phi_series_error (z : ℂ) (hz0 : z ≠ 0) (hz : ‖z‖ ≤ 1/2) :
     push_cast at this ⊢
     exact this
   have h2 : ‖z‖^12 = ‖z‖^11*‖z‖ := by ring
-  have h3 : ‖z‖^11 ≤ (1/2)^11 := pow_le_pow_left₀ (norm_nonneg _) hz 11
-  have h4 : (1/2:ℝ)^11*((Nat.succ 12 : ℝ)/((Nat.factorial 12 : ℝ)*12)) ≤ 1/10^11 := by
+  have h3 : ‖z‖^11 ≤ (5001/10000)^11 := pow_le_pow_left₀ (norm_nonneg _) hz 11
+  have h4 : (5001/10000:ℝ)^11*((Nat.succ 12 : ℝ)/((Nat.factorial 12 : ℝ)*12)) ≤ 1/10^11 := by
     norm_num [Nat.factorial]
   calc _ ≤ ‖z‖^12*((Nat.succ 12 : ℝ)/((Nat.factorial 12 : ℝ)*12)) := h1
     _ = (‖z‖^11*((Nat.succ 12 : ℝ)/((Nat.factorial 12 : ℝ)*12)))*‖z‖ := by rw [h2]; ring
-    _ ≤ ((1/2:ℝ)^11*((Nat.succ 12 : ℝ)/((Nat.factorial 12 : ℝ)*12)))*‖z‖ := by
+    _ ≤ ((5001/10000:ℝ)^11*((Nat.succ 12 : ℝ)/((Nat.factorial 12 : ℝ)*12)))*‖z‖ := by
         gcongr
     _ ≤ 1/10^11*‖z‖ := by gcongr
 
