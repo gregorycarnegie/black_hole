@@ -3,7 +3,7 @@
 //
 // Bindings (see accumulate.rs for the layout):
 //   0 – display      : rgba8unorm  write — what the sprite shows
-//   1 – new_frame    : texture_2d  read  — raw output of geodesic.wgsl
+//   1 – new_frame    : texture_2d  read  — raw output of geodesic.wesl
 //   2 – prev_accum   : texture_2d  read  — previous history buffer
 //   3 – curr_accum   : rgba32float write — history buffer being written
 //   4 – blend params : uniform

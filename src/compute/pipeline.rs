@@ -23,7 +23,7 @@ use crate::simulation::{
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
 
-/// Matches the Camera uniform in geodesic.wgsl (std140, 112 bytes).
+/// Matches the Camera uniform in geodesic.wesl (std140, 112 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuCameraUniform {
@@ -49,7 +49,7 @@ struct GpuCameraUniform {
     _pad7: f32,
 }
 
-/// Matches the Disk uniform in geodesic.wgsl (std140, 64 bytes).
+/// Matches the Disk uniform in geodesic.wesl (std140, 64 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuDiskUniform {
@@ -71,7 +71,7 @@ struct GpuDiskUniform {
     _pad2: f32,
 }
 
-/// Matches the Objects uniform in geodesic.wgsl.
+/// Matches the Objects uniform in geodesic.wesl.
 /// std140 pads f32 array elements to 16 bytes → use [f32;4].
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -152,7 +152,7 @@ pub fn init_geodesic_pipeline(
         label: Some(Cow::Borrowed("geodesic_pipeline")),
         layout: vec![layout.clone()],
         immediate_size: 0,
-        shader: asset_server.load("shaders/geodesic.wgsl"),
+        shader: asset_server.load("shaders/geodesic.wesl"),
         shader_defs: vec![],
         entry_point: Some(Cow::Borrowed("main")),
         zero_initialize_workgroup_memory: false,
@@ -381,12 +381,13 @@ pub fn dispatch_geodesic(
 }
 
 #[cfg(test)]
+#[path = "../../tests/common/mod.rs"]
+mod test_shaders;
+
+#[cfg(test)]
 pub(super) fn check_relativity(device: &RenderDevice, queue: &RenderQueue) {
-    let source = format!(
-        "{}\n{}",
-        include_str!("../../assets/shaders/geodesic.wgsl"),
-        include_str!("../../tests/relativity.wgsl")
-    );
+    const RESULT_BYTES: u64 = 124 * 4;
+    let source = test_shaders::compile_wesl(test_shaders::GEODESIC_WITH_CHECKS);
     let shader = device.create_and_validate_shader_module(ShaderModuleDescriptor {
         label: Some("physics checks"),
         source: ShaderSource::Wgsl(source.into()),
@@ -434,13 +435,13 @@ pub(super) fn check_relativity(device: &RenderDevice, queue: &RenderQueue) {
     );
     let results = device.create_buffer(&BufferDescriptor {
         label: None,
-        size: 112,
+        size: RESULT_BYTES,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
     let readback = device.create_buffer(&BufferDescriptor {
         label: None,
-        size: 112,
+        size: RESULT_BYTES,
         usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -457,7 +458,7 @@ pub(super) fn check_relativity(device: &RenderDevice, queue: &RenderQueue) {
         pass.set_bind_group(1, &result_group, &[]);
         pass.dispatch_workgroups(1, 1, 1);
     }
-    encoder.copy_buffer_to_buffer(&results, 0, &readback, 0, 112);
+    encoder.copy_buffer_to_buffer(&results, 0, &readback, 0, RESULT_BYTES);
     queue.submit([encoder.finish()]);
     let (sender, receiver) = std::sync::mpsc::channel();
     readback
@@ -476,14 +477,27 @@ pub(super) fn check_relativity(device: &RenderDevice, queue: &RenderQueue) {
     let data = readback.slice(..).get_mapped_range().unwrap();
     for (i, value) in bytemuck::cast_slice::<u8, f32>(&data)
         .iter()
-        .take(20)
+        .take(24)
         .enumerate()
     {
         assert_eq!(
             *value,
             1.0,
-            "WGSL physics check {i} failed (tests/relativity.wgsl); capture/escape diagnostics: {:?}",
-            &bytemuck::cast_slice::<u8, f32>(&data)[20..]
+            "WESL physics check {i} failed (tests/relativity.wesl); capture/escape diagnostics: {:?}",
+            &bytemuck::cast_slice::<u8, f32>(&data)[24..40]
         );
     }
+    for (i, value) in bytemuck::cast_slice::<u8, f32>(&data)[100..106]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(
+            *value,
+            1.0,
+            "adaptive WESL physics check {i} failed; statuses: {:?}; trajectory: {:?}",
+            &bytemuck::cast_slice::<u8, f32>(&data)[100..106],
+            &bytemuck::cast_slice::<u8, f32>(&data)[112..124]
+        );
+    }
+    super::verification::check_convergence(bytemuck::cast_slice(&data));
 }

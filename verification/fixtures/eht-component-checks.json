@@ -1,0 +1,81 @@
+{
+  "checked_on": "2026-11-04",
+  "scope": "Finite local checks on this machine; not an image calibration or all-input error proof.",
+  "sampling": {
+    "samples": 274,
+    "snapshot_sha256": "c2d1dfdc8c92320ec77d22953f55c2b5d71b685496f5199c73a1280f20a0d537",
+    "ipole_commit": "7f7a482cf91125aeeeb9c431485bba680e8941d7",
+    "max_component_scaled_error": 8.891067405344977e-14,
+    "electron_density_nonzero_samples": 215,
+    "radiating_samples": 179,
+    "length_unit_cm": 915765511089214.4,
+    "checks": [
+      "8 interpolated primitives",
+      "native velocity and magnetic four-vectors",
+      "4 physical scalars and sigma cut",
+      "native metric",
+      "Cartesian positions and metric pullback",
+      "timelike normalization and magnetic orthogonality",
+      "radiating-region mask"
+    ],
+    "gpu_max_scaled_error_by_family": [
+      2.0265579223632812e-06,
+      8.158385753631592e-07,
+      1.2160894584667403e-05,
+      2.980232238769531e-07
+    ]
+  },
+  "thermal": {
+    "cases": 292,
+    "ipole_commit": "7f7a482cf91125aeeeb9c431485bba680e8941d7",
+    "distribution": "Dexter 2016 thermal emissivity/conversion, Shcherbakov rotation",
+    "units": "observer-scaled CGS intensity per r_g of fluid path; absorption and Faraday per r_g",
+    "observer_frequency_hz": 230000000000.0,
+    "checks": [
+      "finite coefficients",
+      "0.99 emission/absorption cap above the 1e-20 intensity/opacity floor",
+      "zero field",
+      "parallel/antiparallel field",
+      "temperature floor",
+      "GSL cold underflow convention"
+    ],
+    "gpu_max_family_scaled_error": [
+      6.31716056886944e-06,
+      9.93433604890015e-06,
+      2.9015736799919978e-06
+    ],
+    "gsl_binary32_cold_threshold": 0.0013475478626787663
+  },
+  "transfer": {
+    "cases": 128,
+    "reference": "binary64 RK4 ODE, 4096/8192 steps",
+    "max_refinement_difference": 1.6086024179351455e-10,
+    "checks": [
+      "zero opacity exact solution",
+      "pure Faraday exact rotation",
+      "thermal equilibrium",
+      "Stokes cone",
+      "polarized absorption and noncommuting Faraday terms"
+    ],
+    "gpu_max_scaled_error": 6.379434580594534e-06
+  },
+  "source_sha256": {
+    "assets/shaders/snapshot.wesl": "9f61a442af096e8b50fc0e9901debc6da9a0e0b1e0f23a9626b77af90242d8cd",
+    "assets/shaders/thermal.wesl": "6186b967369500973b8b47b4924493354f17c223a7aea3d070f3964cce613274",
+    "assets/shaders/polarized_transfer.wesl": "cb058eb00288bc668d4031e0e752d9cd32440385acfb2c7013f872860e17ec3d",
+    "verification/eht_snapshot.py": "cdfe70bbdc168fc49988cfddf82fb2799f027d065c35fd7a6df8aaeb1c4def67",
+    "verification/BlackHole/SnapshotChart.lean": "fc766b8ece715528c069873d15e5ecc5a2be7175a2a8bc6d3c888fbf21ed804f",
+    "verification/benchmarks/sample_ipole.c": "5a9cc7c867762f8d9addc550604ddc69e96eb14ac080ca7ba8b6589e085a5c92",
+    "verification/benchmarks/thermal_ipole.h": "ff96731acaff5506a9f6349932bfb257c1e5295a785767e9e997c0af4da73ca8"
+  },
+  "validation": {
+    "lean_public_theorems_added": 12,
+    "audited_project_declarations": 1051,
+    "independent_kernel_replay": "BlackHole.SnapshotChart passed; previous whole-tree checkpoint retained for unchanged modules",
+    "rust_default_tests_passed": 279,
+    "python_tests_passed": 6,
+    "rendering_tests_including_gpu_passed": 15,
+    "clippy_all_targets": "passed with warnings denied",
+    "format": "passed"
+  }
+}

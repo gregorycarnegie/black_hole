@@ -67,6 +67,7 @@ struct Objects {
 const PI: f32 = 3.141592653589793;
 const SCHWARZSCHILD_RADIUS: f32 = 2.0;
 const ESCAPE_R: f32 = 1600.0;
+const STEP_TOLERANCE: f32 = 5.0e-8;
 
 // Cartesian ingoing Kerr-Schild, signature (-,+,+,+), vector order (t,x,y,z).
 // g = eta + sum(2 H l l^T). One source is exact Kerr outside excision.
@@ -87,6 +88,12 @@ fn kerr_radius(x: vec3<f32>, a: vec3<f32>) -> f32 {
     var r2 = 0.5 * (q + root);
     if q < 0.0 { r2 = 2.0*ax*ax / max(root-q, 1.0e-20); }
     return sqrt(max(r2, 1.0e-12));
+}
+
+fn disk_radius(pos: vec3<f32>, spin: f32, binary: bool) -> f32 {
+    if binary { return length(pos.xz); }
+    // Extend the equatorial Kerr radial label through the prescribed disk height.
+    return kerr_radius(vec3<f32>(pos.x,0.0,pos.z),vec3<f32>(0.0,clamp(spin,-0.999,0.999),0.0));
 }
 
 struct Metric {
@@ -160,7 +167,11 @@ fn spatial_metric(m: Metric) -> mat3x3<f32> {
 }
 
 fn spatial_unit(v: vec3<f32>, gamma: mat3x3<f32>) -> vec3<f32> {
-    return v * inverseSqrt(max(dot(v,gamma*v), 1.0e-20));
+    // Rescale before squaring to avoid losing very small or large vectors.
+    let scale=max(max(abs(v.x),abs(v.y)),abs(v.z));
+    if scale==0.0 { return v; }
+    let scaled=v/scale;
+    return scaled*inverseSqrt(max(dot(scaled,gamma*scaled),1.0e-20));
 }
 
 struct Ray {
@@ -202,17 +213,93 @@ fn rk_state(ray: Ray, d: Derivs, h: f32) -> Ray {
     return Ray(ray.pos+h*d.pos,ray.p+h*d.p,ray.screen+h*d.screen);
 }
 
-fn step_ray(ray: Ray, h: f32, m: Metric) -> Ray {
-    let k1 = geodesic_rhs(ray,m);
+struct RayStep { ray: Ray, valid: bool }
+
+fn ray_valid(ray: Ray, m: Metric) -> bool {
+    return m.valid && m.clearance > 0.0
+        && all(abs(ray.pos)<vec3<f32>(1.0e8))
+        && all(abs(ray.p)<vec4<f32>(1.0e8))
+        && all(abs(ray.screen)<vec4<f32>(1.0e8));
+}
+
+// Gauge transport adds a multiple of k; the electromagnetic bivector k wedge f is unchanged.
+fn ray_rhs(ray: Ray, m: Metric, gauged: bool) -> Derivs {
+    var result=geodesic_rhs(ray,m);
+    if gauged {
+        let k=m.inv*ray.p;
+        if abs(k.x)>1.0e-20 {
+            result.screen-=k*(result.screen.x/k.x);
+            result.screen.x=0.0;
+        }
+    }
+    return result;
+}
+
+fn step_ray_gauge(ray: Ray, h: f32, m: Metric, gauged: bool) -> RayStep {
+    if !ray_valid(ray,m) { return RayStep(ray,false); }
+    let k1 = ray_rhs(ray,m,gauged);
     let r2 = rk_state(ray,k1,0.5*h);
-    let k2 = geodesic_rhs(r2,scene_metric(r2.pos));
+    let m2 = scene_metric(r2.pos);
+    if !ray_valid(r2,m2) { return RayStep(ray,false); }
+    let k2 = ray_rhs(r2,m2,gauged);
     let r3 = rk_state(ray,k2,0.5*h);
-    let k3 = geodesic_rhs(r3,scene_metric(r3.pos));
+    let m3 = scene_metric(r3.pos);
+    if !ray_valid(r3,m3) { return RayStep(ray,false); }
+    let k3 = ray_rhs(r3,m3,gauged);
     let r4 = rk_state(ray,k3,h);
-    let k4 = geodesic_rhs(r4,scene_metric(r4.pos));
-    return rk_state(ray,Derivs(k1.pos+2.0*k2.pos+2.0*k3.pos+k4.pos,
+    let m4 = scene_metric(r4.pos);
+    if !ray_valid(r4,m4) { return RayStep(ray,false); }
+    let k4 = ray_rhs(r4,m4,gauged);
+    let next = rk_state(ray,Derivs(k1.pos+2.0*k2.pos+2.0*k3.pos+k4.pos,
         k1.p+2.0*k2.p+2.0*k3.p+k4.p,
         k1.screen+2.0*k2.screen+2.0*k3.screen+k4.screen),h/6.0);
+    return RayStep(next,ray_valid(next,scene_metric(next.pos)));
+}
+
+fn step_ray(ray: Ray, h: f32, m: Metric) -> RayStep {
+    return step_ray_gauge(ray,h,m,false);
+}
+
+fn relative_difference(a: vec4<f32>, b: vec4<f32>) -> f32 {
+    let d = abs(a-b)/max(vec4<f32>(1.0),max(abs(a),abs(b)));
+    return max(max(d.x,d.y),max(d.z,d.w));
+}
+
+struct AdaptiveStep { ray: Ray, h: f32, error: f32, accepted: bool }
+
+fn advance_ray_gauge(ray: Ray, requested_h: f32, m: Metric, gauged: bool) -> AdaptiveStep {
+    if !(requested_h > 0.0 && requested_h < 1.0e8) {
+        return AdaptiveStep(ray,0.0,1.0e30,false);
+    }
+    var h = requested_h;
+    for (var retry=0u; retry<12u; retry++) {
+        let coarse = step_ray_gauge(ray,h,m,gauged);
+        if coarse.valid {
+            let half = step_ray_gauge(ray,0.5*h,m,gauged);
+            if half.valid {
+                let fine = step_ray_gauge(half.ray,0.5*h,scene_metric(half.ray.pos),gauged);
+                if fine.valid {
+                    let error = max(relative_difference(vec4<f32>(coarse.ray.pos,0.0),vec4<f32>(fine.ray.pos,0.0)),
+                        max(relative_difference(coarse.ray.p,fine.ray.p),
+                            relative_difference(coarse.ray.screen,fine.ray.screen)))/15.0;
+                    let metric = scene_metric(fine.ray.pos);
+                    let null_error = abs(dot(fine.ray.p,metric.inv*fine.ray.p))
+                        /max(dot(fine.ray.p,fine.ray.p),1.0e-10);
+                    // shortcut: local step-doubling estimate; global certification needs truncation and roundoff bounds.
+                    if error <= STEP_TOLERANCE && null_error < 2.0e-4
+                        && any(fine.ray.pos != ray.pos) {
+                        return AdaptiveStep(fine.ray,h,error,true);
+                    }
+                }
+            }
+        }
+        h *= 0.5;
+    }
+    return AdaptiveStep(ray,0.0,1.0e30,false);
+}
+
+fn advance_ray(ray: Ray, requested_h: f32, m: Metric) -> AdaptiveStep {
+    return advance_ray_gauge(ray,requested_h,m,false);
 }
 
 // Gauge-fix the transported screen to the local Eulerian observer. Adding a
@@ -294,7 +381,7 @@ fn intersect_objects_segment(start: vec3<f32>, end: vec3<f32>) -> ObjectHit {
 
 // -- Disk shading ------------------------------------------------------------
 
-// Novikov-Thorne temperature profile: zero at ISCO, peaks near 1.36 r_isco,
+// Newtonian zero-torque temperature profile: zero at ISCO, peaks near 1.36 r_isco,
 // and falls as r^(-3/4) outward. Returns an unnormalised value; peak is ~0.488.
 fn nt_temp(r_disk: f32) -> f32 {
     let ratio = disk.isco_r / r_disk;
@@ -321,11 +408,11 @@ fn disk_edge_fade(r_disk: f32) -> f32 {
     return clamp(inner * outer, 0.0, 1.0);
 }
 
-// Model-dependent H/R at cylindrical radius r_xz.
-fn get_h_over_r(r_xz: f32) -> f32 {
+// Model-dependent H/R at the disk radial label.
+fn get_h_over_r(r_disk: f32) -> f32 {
     if disk.model == 1u {
-        // TruncHot: tanh transition — h_hot inside r_trunc, h_thin outside.
-        let safe_r  = max(r_xz,        SCHWARZSCHILD_RADIUS * 1.0e-3);
+        // TruncHot: tanh transition â€” h_hot inside r_trunc, h_thin outside.
+        let safe_r  = max(r_disk,      SCHWARZSCHILD_RADIUS * 1.0e-3);
         let safe_rt = max(disk.r_trunc, SCHWARZSCHILD_RADIUS * 1.0e-3);
         let t = clamp((log(safe_r) - log(safe_rt)) / 0.4, -10.0, 10.0);
         let w = 0.5 * (1.0 + tanh(t));   // 0 deep inside, 1 far outside
@@ -333,7 +420,7 @@ fn get_h_over_r(r_xz: f32) -> f32 {
     } else if disk.model == 2u {
         // Slim / super-Eddington: disk puffs up inward at r_trunc (used as r_puff).
         let r_puff = max(disk.r_trunc, SCHWARZSCHILD_RADIUS * 0.5);
-        let ratio  = r_xz / r_puff;
+        let ratio  = r_disk / r_puff;
         return disk.h_thin + (disk.h_hot - disk.h_thin) / (1.0 + ratio * ratio);
     }
     // ThinNT (0) or WarpedThin (3): constant H/R.
@@ -341,15 +428,15 @@ fn get_h_over_r(r_xz: f32) -> f32 {
 }
 
 // Midplane Y displacement for a warped disk; zero for all other models.
-// β(R): tilt 0 inside r_bp (aligned), tilt_deg outside. γ(R): azimuthal twist.
-fn disk_midplane_y(r_xz: f32, phi: f32) -> f32 {
+// Î²(R): tilt 0 inside r_bp (aligned), tilt_deg outside. Î³(R): azimuthal twist.
+fn disk_midplane_y(r_disk: f32, phi: f32) -> f32 {
     if disk.model != 3u { return 0.0; }
     let r_bp_safe = max(disk.r_bp, SCHWARZSCHILD_RADIUS * 0.1);
-    let ln_norm   = clamp(log(max(r_xz, SCHWARZSCHILD_RADIUS * 0.01) / r_bp_safe) / 0.5, -10.0, 10.0);
+    let ln_norm   = clamp(log(max(r_disk, SCHWARZSCHILD_RADIUS * 0.01) / r_bp_safe) / 0.5, -10.0, 10.0);
     let w     = 0.5 * (1.0 + tanh(ln_norm));   // 0 inside r_bp, 1 outside
     let beta  = disk.tilt_deg  * (PI / 180.0) * w;
-    let gamma = disk.twist_deg * (PI / 180.0) * log(1.0 + r_xz / r_bp_safe);
-    return r_xz * sin(beta) * sin(phi - gamma);
+    let gamma = disk.twist_deg * (PI / 180.0) * log(1.0 + r_disk / r_bp_safe);
+    return r_disk * sin(beta) * sin(phi - gamma);
 }
 
 // Sub-Keplerian factor: 1.0 for razor-thin, ~0.5 for thick hot flow.
@@ -398,7 +485,7 @@ fn sample_skybox(dir: vec3<f32>) -> vec3<f32> {
 
 // -- Debug heatmap -----------------------------------------------------------
 
-// Maps t ∈ [0, 1] to a black→red→yellow→white gradient.
+// Maps t âˆˆ [0, 1] to a blackâ†’redâ†’yellowâ†’white gradient.
 // t = 0 (few iterations) = black; t = 1 (10 000 iterations) = white.
 fn heatmap_color(t: f32) -> vec3<f32> {
     return vec3<f32>(
@@ -416,9 +503,14 @@ struct Plasma {
     energy: f32,
 }
 
+fn projected_evpa(bx: f32, by: f32) -> vec2<f32> {
+    // Clipping the norm here would amplify polarization when the frame drifts.
+    return vec2<f32>(by*by-bx*bx,-2.0*bx*by)/max(bx*bx+by*by,1.0e-12);
+}
+
 fn sample_plasma(ray: Ray, m: Metric) -> Plasma {
     var plasma: Plasma;
-    let r = length(ray.pos.xz);
+    let r = disk_radius(ray.pos,disk.spin,disk.binary_enabled!=0u);
     if r <= disk.r1 || r >= disk.r2 { return plasma; }
     let h_r = get_h_over_r(r);
     let height = max(h_r*r,1.0e-4);
@@ -453,7 +545,7 @@ fn sample_plasma(ray: Ray, m: Metric) -> Plasma {
     let bx = dot(b,m.g*e1); let by = dot(b,m.g*e2);
     let bparallel = -dot(b,m.g*k)/plasma.energy; // toward the observer
     let perpendicular2 = clamp(bx*bx+by*by,0.0,1.0);
-    let evpa = vec2<f32>(by*by-bx*bx,-2.0*bx*by)/max(perpendicular2,1.0e-12);
+    let evpa = projected_evpa(bx,by);
     var hot = 0.0;
     if disk.model == 1u {
         hot = 0.5*(1.0-tanh(clamp(log(r/max(disk.r_trunc,0.001))/0.4,-10.0,10.0)));
@@ -506,35 +598,26 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var transmission = 1.0;
     var foreground = faraday_rotation(vec3<f32>(0.0),0.0);
     var iterations = 0u;
+    var next_h = 1.0e8;
     for (var i=0u; i<cam.max_iter; i++) {
         iterations = i+1u;
         if metric.clearance < 0.002 || !metric.valid { break; }
         let velocity = (metric.inv*ray.p).yzw;
         // Geometry-limited steps also resolve the thinnest disk crossing.
         var distance = clamp(0.12*metric.clearance,0.0002,32.0);
-        let radius = length(ray.pos.xz);
+        let radius = disk_radius(ray.pos,disk.spin,disk.binary_enabled!=0u);
         let height = max(get_h_over_r(max(radius,disk.r1))*max(radius,disk.r1),0.001);
         if radius > disk.r1-distance && radius < disk.r2+distance {
             let mid = disk_midplane_y(max(radius,0.001),atan2(ray.pos.z,ray.pos.x));
             let to_disk = max(abs(ray.pos.y-mid)-4.0*height,0.0);
             distance = min(distance,max(0.25*height,0.5*to_disk));
         }
-        var h = distance/max(length(velocity),1.0e-6);
-        var next: Ray;
-        var next_metric: Metric;
-        var accepted = false;
-        for (var retry=0u; retry<6u; retry++) {
-            next = step_ray(ray,h,metric);
-            next_metric = scene_metric(next.pos);
-            let null_error = abs(dot(next.p,next_metric.inv*next.p))
-                /max(dot(next.p,next.p),1.0e-10);
-            if next_metric.valid && all(abs(next.pos)<vec3<f32>(1.0e8))
-                && all(abs(next.p)<vec4<f32>(1.0e8)) && null_error<2.0e-4 {
-                accepted = true; break;
-            }
-            h *= 0.5;
-        }
-        if !accepted { break; } // failed/incomplete rays never masquerade as escaped sky
+        let step = advance_ray(ray,min(distance/max(length(velocity),1.0e-6),next_h),metric);
+        if !step.accepted { break; } // unresolved rays never masquerade as escaped sky
+        let h = step.h;
+        let next = step.ray;
+        let next_metric = scene_metric(next.pos);
+        next_h = h*clamp(0.9*pow(STEP_TOLERANCE/max(step.error,1.0e-20),0.2),0.5,2.0);
         let hit = intersect_objects_segment(ray.pos,next.pos);
         if hit.hit {
             let intensity = dot(hit.color.rgb,vec3<f32>(0.2126,0.7152,0.0722));

@@ -17,7 +17,7 @@ use bevy::{
 
 use super::{AccumA, AccumB, DisplayImage, FrameParity, GeodesicImage, RenderFrameCount};
 
-// ── Blend uniform (matches BlendParams in accumulate.wgsl) ──────────────────
+// ── Blend uniform (matches BlendParams in accumulate.wesl) ──────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -81,7 +81,7 @@ pub fn init_accumulate_pipeline(
         label: Some(Cow::Borrowed("accumulate_pipeline")),
         layout: vec![layout.clone()],
         immediate_size: 0,
-        shader: asset_server.load("shaders/accumulate.wgsl"),
+        shader: asset_server.load("shaders/accumulate.wesl"),
         shader_defs: vec![],
         entry_point: Some(Cow::Borrowed("main")),
         zero_initialize_workgroup_memory: false,

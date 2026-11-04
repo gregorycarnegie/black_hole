@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased - 2026-11-04
+
+### Added
+
+- Lean 4 verification package, pinned Mathlib dependencies, axiom audit, independent kernel replay, and a GitHub Actions proof workflow. Exact-real results cover single-source Kerr vacuum curvature, metric derivatives, ISCO properties, camera frames, continuous transport, selected transfer models, and numerical bounds. Checked counterexamples document limits of binary superposition and exact discrete conservation.
+- Reproducible EHT snapshot acquisition/validation and pinned ipole reference workflows, with input hashes, physical conventions, measured results, and an explicit ledger of remaining proof obligations.
+- Optional WESL kernels for MKS snapshot interpolation, thermal synchrotron coefficients, polarized absorption/Faraday transfer, and a full 160x160 hybrid CPU/GPU image benchmark. Binary64 outer-ray transport is checked independently before handing off to the GPU.
+- Expanded numerical and shader regressions, including Schwarzschild trajectory refinement, adaptive-step rejection, local snapshot/transfer comparisons, and full-image diagnostics. Validation now includes 280 default Rust tests, seven Python tests, and separately enabled GPU checks.
+
+### Changed
+
+- Migrated production and test shaders from WGSL source files to WESL, updated Bevy asset paths, and added shared WESL compilation/validation helpers. Pinned verification files and WESL sources to LF endings for WSL scripts and stable provenance hashes.
+- Replaced null-residual-only step acceptance with RK4 step doubling over position, momentum, and transported screen, retaining null checks and rejecting invalid intermediate stages.
+- Updated Bevy to 0.20.1, proptest to 1.12.0, and rstest to 0.28.0; added WESL 0.6.0 for shader tests. Refreshed README shader references and the Bevy badge.
+
+### Verification limits
+
+- All 25,600 benchmark rays resolve, and the finest run's integrated intensity differs from the refined ipole reference by 0.077%. Its intensity image L2 error is 0.688%; the requested pixel-accuracy targets remain unmet, and refinement has not established convergence. The image comparison reports this failure explicitly.
+- The interactive renderer still uses prescribed plasma. Exact-real theorems and sampled GPU comparisons do not establish all-input floating-point correctness, compiler equivalence, global numerical error bounds, or an evolved relativistic binary solution.
+
 ## 0.4.0 - 2026-10-10
 
 ### Added

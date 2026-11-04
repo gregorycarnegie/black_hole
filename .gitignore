@@ -9,3 +9,9 @@
 
 ##### cargo-mutants
 mutants.out*/
+
+##### Lean verification
+/verification/.lake/
+
+##### Python verification
+__pycache__/

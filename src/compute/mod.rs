@@ -13,6 +13,8 @@ use bevy::{
 };
 
 mod pipeline;
+#[cfg(test)]
+mod verification;
 use pipeline::{dispatch_geodesic, init_geodesic_pipeline, prepare_bind_group};
 
 mod accumulate;
@@ -28,7 +30,7 @@ pub struct GeodesicComputePlugin;
 
 // ── Resources extracted from main world → render world ──────────────────────
 
-/// Raw frame written by geodesic.wgsl each tick.
+/// Raw frame written by geodesic.wesl each tick.
 #[derive(Resource, Clone, ExtractResource)]
 #[extract_app(RenderApp)]
 pub struct GeodesicImage(pub Handle<Image>);
@@ -73,7 +75,7 @@ pub struct RenderFrameCount(pub u32);
 #[extract_app(RenderApp)]
 pub struct FrameParity(pub bool);
 
-/// Camera data packed for the uniform buffer (matches Camera struct in geodesic.wgsl, 112 bytes).
+/// Camera data packed for the uniform buffer (matches Camera struct in geodesic.wesl, 112 bytes).
 #[derive(Resource, Clone, Default, ExtractResource)]
 #[extract_app(RenderApp)]
 pub struct CameraUniform {
@@ -1020,6 +1022,7 @@ mod tests {
                     synchronous_pipeline_compilation: true,
                     ..default()
                 })
+                .disable::<bevy::gilrs::GilrsPlugin>()
                 .disable::<WinitPlugin>()
                 .disable::<bevy::render::pipelined_rendering::PipelinedRenderingPlugin>(),
         )

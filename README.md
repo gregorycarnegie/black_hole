@@ -1,6 +1,6 @@
 [![Rust](https://img.shields.io/badge/Rust-2024-f74c00?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Bevy](https://img.shields.io/badge/Bevy-0.20.0-232326?logo=bevy&logoColor=white)](https://bevyengine.org/)
-![WGSL](https://img.shields.io/badge/WGSL-compute%20shader-005a9c)
+[![Bevy](https://img.shields.io/badge/Bevy-0.20.1-232326?logo=bevy&logoColor=white)](https://bevyengine.org/)
+![WESL](https://img.shields.io/badge/WESL-compute%20shader-005a9c)
 ![Status](https://img.shields.io/badge/status-experimental-yellow)
 
 # **black**_**hole**
@@ -74,9 +74,9 @@ cargo run --release
 
 ## How it works
 
-`src/compute/pipeline.rs` sets up a Bevy render graph node that dispatches `assets/shaders/geodesic.wgsl` — a WGSL compute shader — every frame. The shader receives the camera position, Kerr/accretion disk parameters, and scene objects via uniform buffers, then traces each pixel through curved spacetime, writing the result to a storage texture that is displayed as a fullscreen sprite.
+`src/compute/pipeline.rs` sets up a Bevy render graph node that dispatches `assets/shaders/geodesic.wesl` — a WESL compute shader — every frame. The shader receives the camera position, Kerr/accretion disk parameters, and scene objects via uniform buffers, then traces each pixel through curved spacetime, writing the result to a storage texture that is displayed as a fullscreen sprite.
 
-Both modes use the same past-directed null geodesic solver in Cartesian ingoing Kerr?Schild coordinates. The covariant metric is `g = ? + ? 2 H l l?`; sequential rank-one inversion retains the cross terms of the combined metric. Each RK4 step evolves position, covariant momentum, and a parallel-transported screen vector using analytic spatial metric derivatives. Geometry and disk thickness limit the step; a null-residual guard halves rejected steps. Horizon excision replaces the old enlarged shadow spheres. Rays that exhaust their iteration budget or fail numerical checks are dark, rather than incorrectly sampling the sky.
+Both modes use the same past-directed null geodesic solver in Cartesian ingoing Kerr?Schild coordinates. The covariant metric is `g = ? + ? 2 H l l?`; sequential rank-one inversion retains the cross terms of the combined metric. Each RK4 step evolves position, covariant momentum, and a parallel-transported screen vector using analytic spatial metric derivatives. Geometry and disk thickness limit the step; RK4 step doubling estimates position, momentum and screen errors; invalid stages or failed error/null checks trigger step halving. Horizon excision replaces the old enlarged shadow spheres. Rays that exhaust their iteration budget or fail numerical checks are dark, rather than incorrectly sampling the sky.
 
 A single isolated term is the Kerr metric. Multiple terms are an **approximate frozen spacetime**, not an exact double-Kerr vacuum solution: positions and spins are held fixed during each ray trace, and boosts, retarded time, radiation, and relativistic orbital evolution are absent. The construction is suited to separated visual binaries; it is not validated for merger or overlapping strong fields. The Majumdar?Papapetrou alternative describes charged, nonrotating extremal holes and would not preserve this app's spinning neutral-hole scene.
 
@@ -100,6 +100,8 @@ The library exposes `kerr_horizon_radius_rg` and `kerr_isco_radius_rg` for arbit
 
 The [ACES curve fit](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/) is a compact approximation, not a full ACES colour-management transform. Skybox filtering wraps longitude across the seam and clamps latitude at the poles before tone mapping.
 
-Run `cargo test` for unit, `rstest` case and `proptest` property tests (physics, camera, simulation, uniforms and UI), gravity timing checks at 30/60/120 rendering FPS, and WGSL parsing/validation. Run `cargo mutants -j6` for mutation testing; exclusions are documented in `.cargo/mutants.toml`. Run `cargo clippy --all-targets -- -D warnings` for lint checks.
+Run `cargo test` for unit, `rstest` case and `proptest` property tests (physics, camera, simulation, uniforms and UI), gravity timing checks at 30/60/120 rendering FPS, and WESL parsing/validation. Run `cargo mutants -j6` for mutation testing; exclusions are documented in `.cargo/mutants.toml`. Run `cargo clippy --all-targets -- -D warnings` for lint checks.
 
-Run `cargo test headless_render -- --ignored --nocapture` on a machine with a GPU to execute numerical checks **in the production WGSL** (metric inverse/derivatives, spin reversal, null initialization, Schwarzschild capture/escape, screen transport, and analytic Stokes/Faraday solutions), then render single/binary intensity and polarization scenes. Preview PNGs are saved under `target/render-smoke-*.png`. This small-resolution regression does not establish production-resolution performance or scientific accuracy.
+The [Lean 4 verification package](verification/README.md) checks Kerr metric derivatives, ISCO algebra and radial stability, camera frame identities, continuous transport, polarized cell transfer and error bounds, disk profiles, nine shared binary32 horizon executions, and selected RK4 error calculations. Run `lake build` inside `verification/`. The [results](verification/RESULTS.md) include GPU step-refinement measurements and counterexamples to exact binary vacuum curvature and Newtonian integrator energy conservation. The [remaining obligations](verification/OBLIGATIONS.md) distinguish proved formulas from source correspondence, numerical error bounds and physical calibration still required.
+
+Run `cargo test headless_render -- --ignored --nocapture` on a machine with a GPU to execute numerical checks **in the production WESL** (metric inverse/derivatives, spin reversal, null initialization, Schwarzschild capture/escape, screen transport, and analytic Stokes/Faraday solutions), then render single/binary intensity and polarization scenes. Preview PNGs are saved under `target/render-smoke-*.png`. This small-resolution regression does not establish production-resolution performance or scientific accuracy.

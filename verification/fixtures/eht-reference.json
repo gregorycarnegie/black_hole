@@ -1,0 +1,49 @@
+{
+  "generated_on": "2026-11-03",
+  "kind": "regenerated independent reference, not original 2023 image",
+  "solver": "AFD-Illinois/ipole",
+  "commit": "7f7a482cf91125aeeeb9c431485bba680e8941d7",
+  "source_url": "https://github.com/AFD-Illinois/ipole/tree/7f7a482cf91125aeeeb9c431485bba680e8941d7",
+  "input_sha256": "c2d1dfdc8c92320ec77d22953f55c2b5d71b685496f5199c73a1280f20a0d537",
+  "parameters_sha256": "741d4acd471eadc6e33c414fcfddd95ee6df48af1561daf0ea14096d4c8a612f",
+  "image_shape": [
+    160,
+    160,
+    4
+  ],
+  "image_units": "Jy per pixel after multiplying pol[...,:4] by header/scale",
+  "evpa_zero": "N",
+  "stokes_Jy": [
+    0.47976118576344184,
+    -0.006700681644500638,
+    -0.002915943556236394,
+    0.00310100947421721
+  ],
+  "net_linear_percent": 1.5231865217309046,
+  "net_circular_percent": 0.6463652263328863,
+  "unpolarized_flux_Jy": 0.5046674123064179,
+  "compiler": "GCC -std=gnu99 -O2 -fopenmp, Ubuntu 26.04 amd64",
+  "gsl": "2.8+dfsg-6",
+  "hdf5": "1.14.6+repack-2",
+  "threads": 4,
+  "repeat_run_max_abs_difference_Jy_per_pixel": 0.0,
+  "repeat_run_stokes_bitwise_equal": true,
+  "verified_header": {
+    "header/camera/nx": 160,
+    "header/camera/ny": 160,
+    "header/camera/rcam": 10000.0,
+    "header/camera/thetacam": 163.0,
+    "header/camera/phicam": 0.0,
+    "header/camera/fovx_dsource": 160.0,
+    "header/camera/fovy_dsource": 160.0,
+    "header/freqcgs": 230000000000.0,
+    "header/units/M_unit": 1.672e+26,
+    "header/electrons/rhigh": 3.0,
+    "header/electrons/rlow": 3.0,
+    "header/sigma_cut": 1.0,
+    "header/t": 4501.677840911209,
+    "fluid_header/geom/mks/a": 0.9375
+  },
+  "checked_in_parameters_sha256": "53235e26db0294f6a8b3e53bee5be61c4f9b9477657c2678ad431f74377c1508",
+  "parameter_file_normalization": "The original run used CRLF; the checked-in file uses LF with identical parameter names and values."
+}

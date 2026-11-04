@@ -1,0 +1,24 @@
+# Prather et al. 2023, section 3.3; pinned solver recorded in benchmark-data.md.
+dump target/eht-benchmark/sample_dump_SANE_a+0.94_MKS_0900.h5
+outfile target/eht-benchmark/ipole-reference-refined.h5
+nx 160
+ny 160
+rcam 1.e4
+thetacam 163
+phicam 0
+rotcam 0
+fovx_dsource 160
+fovy_dsource 160
+dsource 16.9e6
+freqcgs 230.e9
+MBH 6.2e9
+M_unit 1.672e26
+trat_small 3
+trat_large 3
+beta_crit 1
+sigma_cut 1
+qu_conv 0
+only_unpolarized 0
+quench_output 0
+add_ppm 0
+eps 0.0025

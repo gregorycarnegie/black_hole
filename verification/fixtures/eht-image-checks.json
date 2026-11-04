@@ -1,0 +1,228 @@
+{
+  "checked_on": "2026-11-04",
+  "solver_commit": "7f7a482cf91125aeeeb9c431485bba680e8941d7",
+  "reference_githash": "v1.5-92-g7f7a482",
+  "refined_parameter_sha256": "efd4e91cb8aafbbb3e7a373896820d391d3927a57f22d9eb42c644aa364001d9",
+  "refined_image_sha256": "1609f15bca2af3f2141ca282af53e7da5118a8a5a9788d871055b1e76593dc64",
+  "reference_shape": [
+    160,
+    160,
+    5
+  ],
+  "Jy_scale": 2.350438638182906,
+  "reports": [
+    {
+      "pixels": 25600,
+      "cell_fraction": 0.25,
+      "status_counts": {
+        "1": 990,
+        "2": 24610
+      },
+      "summed_stokes_Jy": [
+        0.47669843114786736,
+        -0.007647538832075321,
+        -0.0022400317631060974,
+        0.003189357076214266
+      ],
+      "reference_summed_stokes_Jy": [
+        0.4771235045298251,
+        -0.007651093213789127,
+        -0.0023100383971130577,
+        0.0031840018769117746
+      ],
+      "component_l2_error_over_reference_I_l2": [
+        0.007570274175626658,
+        0.00231933387373348,
+        0.003233128286417066,
+        0.0006760937609285045
+      ],
+      "max_absolute_error_Jy": [
+        7.18982157708473e-05,
+        1.2441944790675299e-05,
+        3.5445713562587216e-05,
+        6.49883906096008e-06
+      ],
+      "max_steps": 4115,
+      "max_null_residual": 1.669846460572444e-05,
+      "max_affine_length": 10113.5830078125,
+      "complete_image": true,
+      "scope": "empirical cross-code comparison; no universal accuracy claim",
+      "reference_file": "ipole-reference-refined.h5",
+      "reference_eps": 0.0025,
+      "fixed_reference_intensity_Jy": 0.00234942591874314,
+      "max_component_error_over_fixed_reference_I": [
+        0.030602461306509423,
+        0.00529573828713497,
+        0.015086967960900602,
+        0.002766139170047434
+      ],
+      "max_relative_I_error_above_floor": 0.6059449796766302,
+      "requested_numerical_targets_met": false,
+      "ipole_baseline_to_refined_l2_change_over_I_l2": [
+        0.059775894734429326,
+        0.03009894775737186,
+        0.030068571763782297,
+        0.00587442723634424
+      ],
+      "camera_and_outer_transport": {
+        "steps": 229,
+        "max_affine_length": 9886.969306908837,
+        "max_null": 5.004957837062562e-10,
+        "max_screen_norm_error": 2.504740859166077e-11,
+        "max_transversality": 2.837660662002861e-14,
+        "max_refinement_difference": 1.0676004080778512e-08,
+        "independent_ipole_max_error": {
+          "position": 2.542232518720766e-06,
+          "momentum_screen": 3.255683922454011e-08
+        }
+      }
+    },
+    {
+      "pixels": 25600,
+      "cell_fraction": 0.125,
+      "status_counts": {
+        "1": 990,
+        "2": 24610
+      },
+      "summed_stokes_Jy": [
+        0.4767361834082956,
+        -0.007646566969897118,
+        -0.0022432660005415345,
+        0.003187618721652714
+      ],
+      "reference_summed_stokes_Jy": [
+        0.4771235045298251,
+        -0.007651093213789127,
+        -0.0023100383971130577,
+        0.0031840018769117746
+      ],
+      "component_l2_error_over_reference_I_l2": [
+        0.007160050567708689,
+        0.002236814624703317,
+        0.0030772369258580904,
+        0.0006702309365412765
+      ],
+      "max_absolute_error_Jy": [
+        6.651226729008602e-05,
+        1.5204742312102573e-05,
+        3.386380396194191e-05,
+        6.2907921479295225e-06
+      ],
+      "max_steps": 8230,
+      "max_null_residual": 4.107341374037787e-05,
+      "max_affine_length": 10113.296875,
+      "complete_image": true,
+      "scope": "empirical cross-code comparison; no universal accuracy claim",
+      "reference_file": "ipole-reference-refined.h5",
+      "reference_eps": 0.0025,
+      "fixed_reference_intensity_Jy": 0.00234942591874314,
+      "max_component_error_over_fixed_reference_I": [
+        0.02831000831286808,
+        0.006471684078566977,
+        0.014413650454685479,
+        0.0026775869363418253
+      ],
+      "max_relative_I_error_above_floor": 0.41903908848950944,
+      "requested_numerical_targets_met": false,
+      "ipole_baseline_to_refined_l2_change_over_I_l2": [
+        0.059775894734429326,
+        0.03009894775737186,
+        0.030068571763782297,
+        0.00587442723634424
+      ],
+      "camera_and_outer_transport": {
+        "steps": 229,
+        "max_affine_length": 9886.969306908837,
+        "max_null": 5.004957837062562e-10,
+        "max_screen_norm_error": 2.504740859166077e-11,
+        "max_transversality": 2.837660662002861e-14,
+        "max_refinement_difference": 1.0676004080778512e-08,
+        "independent_ipole_max_error": {
+          "position": 2.542232518720766e-06,
+          "momentum_screen": 3.255683922454011e-08
+        }
+      }
+    },
+    {
+      "pixels": 25600,
+      "cell_fraction": 0.0625,
+      "status_counts": {
+        "1": 990,
+        "2": 24610
+      },
+      "summed_stokes_Jy": [
+        0.4767574909023001,
+        -0.00763989413495134,
+        -0.002257360993842308,
+        0.00318613285689939
+      ],
+      "reference_summed_stokes_Jy": [
+        0.4771235045298251,
+        -0.007651093213789127,
+        -0.0023100383971130577,
+        0.0031840018769117746
+      ],
+      "component_l2_error_over_reference_I_l2": [
+        0.006877527672686343,
+        0.0021607375867909936,
+        0.0028490045210628127,
+        0.0006655158952052681
+      ],
+      "max_absolute_error_Jy": [
+        6.20273606331415e-05,
+        1.4241812977611081e-05,
+        2.678097936666937e-05,
+        4.86721738941057e-06
+      ],
+      "max_steps": 16525,
+      "max_null_residual": 0.00012297485955059528,
+      "max_affine_length": 10113.6708984375,
+      "complete_image": true,
+      "scope": "empirical cross-code comparison; no universal accuracy claim",
+      "reference_file": "ipole-reference-refined.h5",
+      "reference_eps": 0.0025,
+      "fixed_reference_intensity_Jy": 0.00234942591874314,
+      "max_component_error_over_fixed_reference_I": [
+        0.026401071060935574,
+        0.006061826790959192,
+        0.011398946079983764,
+        0.0020716624221181483
+      ],
+      "max_relative_I_error_above_floor": 0.43944344334622487,
+      "requested_numerical_targets_met": false,
+      "ipole_baseline_to_refined_l2_change_over_I_l2": [
+        0.059775894734429326,
+        0.03009894775737186,
+        0.030068571763782297,
+        0.00587442723634424
+      ],
+      "camera_and_outer_transport": {
+        "steps": 229,
+        "max_affine_length": 9886.969306908837,
+        "max_null": 5.004957837062562e-10,
+        "max_screen_norm_error": 2.504740859166077e-11,
+        "max_transversality": 2.837660662002861e-14,
+        "max_refinement_difference": 1.0676004080778512e-08,
+        "independent_ipole_max_error": {
+          "position": 2.542232518720766e-06,
+          "momentum_screen": 3.255683922454011e-08
+        }
+      }
+    }
+  ],
+  "successive_gpu_component_l2_changes_over_reference_I_l2": [
+    [
+      0.0012585363225418073,
+      0.000856777279947731,
+      0.0008011695574059707,
+      0.00016049950226681962
+    ],
+    [
+      0.0017994792160906101,
+      0.0006011687812298955,
+      0.0007506429176044613,
+      0.00017346275300680485
+    ]
+  ],
+  "meaning": "Finite empirical checks; requested numerical targets are not met."
+}

@@ -1,0 +1,3 @@
+# Keep WSL scripts and verification provenance hashes stable across platforms.
+verification/** text eol=lf
+assets/shaders/*.wesl text eol=lf

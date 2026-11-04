@@ -1,0 +1,27 @@
+name: Lean verification
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  proofs:
+    runs-on: ubuntu-latest
+    env:
+      LEAN_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: verification
+          auto-config: "false"
+          build: "false"
+          test: "false"
+          lint: "false"
+          leanchecker: "false"
+      - name: Build, audit axioms and replay proofs
+        working-directory: verification
+        run: python3 check.py

@@ -5,7 +5,7 @@
 - [x] Add adaptive step size to geodesic integration (smaller steps near event horizon, larger far away)
 - [x] Use a shared multi-source metric for light paths (frozen superposed Kerr?Schild approximation; relativistic binary evolution remains future work)
 - [x] Fix `orbital_beta_kerr` retrograde denominator: formula uses `rho^(3/2) + |a|` for all spins; retrograde (spin < 0) needs `rho^(3/2) - |a|` (latent bug, no effect at KERR_SPIN = 0.82)
-- [x] Simplify near-horizon step size: `near_horizon_scale` floor of 0.1 is always overridden by the `clamp` minimum of 0.25 — dead code in `geodesic.wgsl` main loop
+- [x] Simplify near-horizon step size: `near_horizon_scale` floor of 0.1 is always overridden by the `clamp` minimum of 0.25 — dead code in `geodesic.wesl` main loop
 
 ## Relativistic Effects
 - [x] Kinematic Doppler shift (fully relativistic: transverse Doppler via γ term)
@@ -39,10 +39,10 @@
 - [x] Unconditional uniform buffer writes: `objects_buf` and `disk_buf` are written every frame; first gate `sync_objects_uniform` / `sync_disk_config_uniform` on source changes, then write GPU buffers only when extracted values actually change (`src/compute/mod.rs:323-334`, `src/compute/pipeline.rs:260-271`)
 - [x] Add a render-scale setting/preset; compute cost scales directly with traced pixel count, so this is likely the highest-impact runtime performance knob — press `[` / `]` to cycle 25 % → 50 % → 75 % → 100 %
 - [x] Handle window resize for compute/accum/display textures and recreate affected bind groups only when texture handles change (`sync_compute_textures` in `src/compute/mod.rs`)
-- [x] Add profiling/debug views before shader-limit tuning: on-screen FPS counter (`main.rs`) + GPU iteration-count heatmap toggle with H key (`geodesic.wgsl`, `src/camera.rs`)
-- [x] Geodesic loop runs up to 10,000 iterations; profile with the iteration heatmap before lowering or making it configurable, since this affects photon-ring / multiple-image fidelity (`geodesic.wgsl:540`)
-- [x] Micro-optimise Kerr helper paths: eliminate duplicate `metric_rho` calls in `orbital_kerr` and the redundant `kerr_lapse` / `spin_clamped` recomputation in `shade_disk` by returning an `OrbitalResult` struct (`geodesic.wgsl:437-446`)
-- [x] Investigate filterable skybox sampling or a preprocessed skybox format; escaped rays currently do four `textureLoad`s for manual bilinear sampling (`geodesic.wgsl:476-509`)
+- [x] Add profiling/debug views before shader-limit tuning: on-screen FPS counter (`main.rs`) + GPU iteration-count heatmap toggle with H key (`geodesic.wesl`, `src/camera.rs`)
+- [x] Geodesic loop runs up to 10,000 iterations; profile with the iteration heatmap before lowering or making it configurable, since this affects photon-ring / multiple-image fidelity (`geodesic.wesl:540`)
+- [x] Micro-optimise Kerr helper paths: eliminate duplicate `metric_rho` calls in `orbital_kerr` and the redundant `kerr_lapse` / `spin_clamped` recomputation in `shade_disk` by returning an `OrbitalResult` struct (`geodesic.wesl:437-446`)
+- [x] Investigate filterable skybox sampling or a preprocessed skybox format; escaped rays currently do four `textureLoad`s for manual bilinear sampling (`geodesic.wesl:476-509`)
 
 ## Visual Fidelity
 - [x] Improve accretion disk: add thickness / 3D volume instead of infinitesimally thin equatorial plane

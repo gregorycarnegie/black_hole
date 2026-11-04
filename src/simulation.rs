@@ -812,7 +812,7 @@ mod tests {
 
     // ── Disk models ──────────────────────────────────────────────────────────
 
-    /// `as_u32` is the `model` switch value in geodesic.wgsl.
+    /// `as_u32` is the `model` switch value in geodesic.wesl.
     #[rstest]
     #[case(DiskModel::ThinNt, 0)]
     #[case(DiskModel::TruncatedHotFlow, 1)]

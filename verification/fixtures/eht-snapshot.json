@@ -1,0 +1,43 @@
+{
+  "title": "GRMHD File for EHT Polarized Code Comparison",
+  "doi": "10.7910/DVN/XZECPF",
+  "dataset_version": "1.2",
+  "license": "CC0-1.0",
+  "file_id": 12137142,
+  "filename": "sample_dump_SANE_a+0.94_MKS_0900.h5",
+  "download_url": "https://dataverse.harvard.edu/api/access/datafile/12137142",
+  "bytes": 302010648,
+  "md5": "dc8cf9b45136cd9b28bdb8ed197cfd69",
+  "sha256": "c2d1dfdc8c92320ec77d22953f55c2b5d71b685496f5199c73a1280f20a0d537",
+  "nominal_paper_time": 4500,
+  "header": {
+    "time": 4501.677840911209,
+    "spin": 0.9375,
+    "grid": [
+      288,
+      128,
+      128
+    ],
+    "primitive_shape": [
+      288,
+      128,
+      128,
+      8
+    ],
+    "primitive_names": [
+      "RHO",
+      "UU",
+      "U1",
+      "U2",
+      "U3",
+      "B1",
+      "B2",
+      "B3"
+    ],
+    "metric": "MKS",
+    "adiabatic_index": 1.444444
+  },
+  "source_paper": "https://doi.org/10.3847/1538-4357/acc586",
+  "discovery_source": "https://github.com/black-hole-group/gpumonty/blob/21a00ce7e415241e9b6e498f44a7a0173be1c832/README.md",
+  "verified_on": "2026-11-03"
+}
