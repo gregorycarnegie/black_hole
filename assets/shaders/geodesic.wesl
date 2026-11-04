@@ -331,10 +331,28 @@ fn faraday_rotation(rho: vec3<f32>, ds: f32) -> mat3x3<f32> {
     return c*identity+s*cross_matrix+(1.0-c)*aa;
 }
 
+// phi(z) = (1 - exp(-z))/z for complex z = (re, im). The direct quotient
+// cancels catastrophically for small |z|; there an 11-term Horner series of
+// sum_k (-z)^k/(k+1)! has truncation error below 1.2e-12 (|z| < 1/2).
+fn transfer_phi(z: vec2<f32>) -> vec2<f32> {
+    if dot(z,z) < 0.25 {
+        let c = array<f32,11>(1.0, 0.5, 1.0/6.0, 1.0/24.0, 1.0/120.0, 1.0/720.0,
+            1.0/5040.0, 1.0/40320.0, 1.0/362880.0, 1.0/3628800.0, 1.0/39916800.0);
+        var acc = vec2<f32>(c[10],0.0);
+        for (var k=9; k>=0; k--) {
+            // acc = c[k] - z*acc
+            acc = vec2<f32>(c[k]-(z.x*acc.x-z.y*acc.y), -(z.x*acc.y+z.y*acc.x));
+        }
+        return acc;
+    }
+    let e = exp(-z.x);
+    let num = vec2<f32>(1.0-e*cos(z.y), e*sin(z.y)); // 1 - exp(-z)
+    return vec2<f32>(num.x*z.x+num.y*z.y, num.y*z.x-num.x*z.y)/dot(z,z);
+}
+
+// int_0^ds exp(-alpha s) ds.
 fn absorption_integral(alpha: f32, ds: f32) -> f32 {
-    let tau = alpha*ds;
-    if abs(tau) < 1.0e-3 { return ds*(1.0-0.5*tau+tau*tau/6.0); }
-    return (1.0-exp(-tau))/alpha;
+    return ds*transfer_phi(vec2<f32>(alpha*ds,0.0)).x;
 }
 
 fn polarized_cell(j: vec4<f32>, alpha: f32, rho: vec3<f32>, ds: f32) -> vec4<f32> {
@@ -344,11 +362,10 @@ fn polarized_cell(j: vec4<f32>, alpha: f32, rho: vec3<f32>, ds: f32) -> vec4<f32
     let axis = rho/w;
     let parallel = axis*dot(axis,j.yzw);
     let perpendicular = j.yzw-parallel;
-    let e = exp(-alpha*ds);
-    let angle = w*ds;
-    let den = alpha*alpha+w*w;
-    let ic = (alpha*(1.0-e*cos(angle))+w*e*sin(angle))/den;
-    let is = (w*(1.0-e*cos(angle))-alpha*e*sin(angle))/den;
+    // ic + i is = int_0^ds exp(-alpha s) exp(i w s) ds = ds phi((alpha - i w) ds).
+    let rotated = ds*transfer_phi(vec2<f32>(alpha*ds,-w*ds));
+    let ic = rotated.x;
+    let is = rotated.y;
     return vec4<f32>(j.x*integral,
         integral*parallel+ic*perpendicular+is*cross(axis,perpendicular));
 }
