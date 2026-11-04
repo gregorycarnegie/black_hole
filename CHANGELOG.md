@@ -9,6 +9,14 @@
 - Optional WESL kernels for MKS snapshot interpolation, thermal synchrotron coefficients, polarized absorption/Faraday transfer, and a full 160x160 hybrid CPU/GPU image benchmark. Binary64 outer-ray transport is checked independently before handing off to the GPU.
 - Expanded numerical and shader regressions, including Schwarzschild trajectory refinement, adaptive-step rejection, local snapshot/transfer comparisons, and full-image diagnostics. Validation now includes 280 default Rust tests, seven Python tests, and separately enabled GPU checks.
 
+- Lean proofs for binary32 horizon/ISCO error bounds, unit and timing consistency, the energy-drift counterexample, equatorial radial stability, the full polarized matrix-exponential cell, a reassociation-independent WGSL summation bound, the WGSL `kerr_radius` error bound and the stable Faraday-cell series. Exhaustive all-input binary32 tests for the horizon, ISCO and `cbrtf`. GPU tests (lavapipe-compatible) showing the adaptive controller misses the trajectory targets and misclassifies near-critical captured rays.
+
+### Fixed
+
+- `kerr_isco_radius_rg` lost up to 4731 binary32 units of relative accuracy near zero spin (about 2.8e-4 at |a| = 5e-4). It now uses a cancellation-free form of the Bardeen formula (maximum 17 units over all inputs).
+- `polarized_cell` cancelled catastrophically for small optical depth with Faraday rotation (e.g. sin-component integral 1.3e-3 instead of 5.0e-6). Both cell integrals and `absorption_integral` now use one complex `(1 - exp(-z))/z` with a series branch.
+- CI proof builds ran out of runner memory; the workflow now adds swap, logs memory, caches the project build and queues concurrent pushes.
+
 ### Changed
 
 - Migrated production and test shaders from WGSL source files to WESL, updated Bevy asset paths, and added shared WESL compilation/validation helpers. Pinned verification files and WESL sources to LF endings for WSL scripts and stable provenance hashes.
