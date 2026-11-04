@@ -24,6 +24,9 @@ mod controller;
 #[path = "common/sincos.rs"]
 mod sincos;
 
+#[path = "common/energy.rs"]
+mod energy;
+
 #[rstest]
 #[case::geodesic(include_str!("../assets/shaders/geodesic.wesl"))]
 #[case::relativity(common::GEODESIC_WITH_CHECKS)]
@@ -34,6 +37,7 @@ mod sincos;
 #[case::image(include_str!("image.wesl"))]
 #[case::controller(include_str!("controller.wesl"))]
 #[case::sincos(include_str!("sincos.wesl"))]
+#[case::energy(include_str!("energy.wesl"))]
 fn shader_validates(#[case] source: &str) {
     let source = common::compile_wesl(source);
     let module = naga::front::wgsl::parse_str(&source)
