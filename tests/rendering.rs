@@ -18,6 +18,9 @@ mod thermal;
 #[path = "common/image.rs"]
 mod image;
 
+#[path = "common/controller.rs"]
+mod controller;
+
 #[rstest]
 #[case::geodesic(include_str!("../assets/shaders/geodesic.wesl"))]
 #[case::relativity(common::GEODESIC_WITH_CHECKS)]
@@ -26,6 +29,7 @@ mod image;
 #[case::transfer(include_str!("transfer.wesl"))]
 #[case::thermal(include_str!("thermal.wesl"))]
 #[case::image(include_str!("image.wesl"))]
+#[case::controller(include_str!("controller.wesl"))]
 fn shader_validates(#[case] source: &str) {
     let source = common::compile_wesl(source);
     let module = naga::front::wgsl::parse_str(&source)
