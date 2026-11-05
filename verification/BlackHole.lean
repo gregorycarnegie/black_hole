@@ -62,6 +62,7 @@ public import BlackHole.WgslSum
 public import BlackHole.WgslKerrRadius
 public import BlackHole.TransferPhi
 public import BlackHole.WgslSinCos
+public import BlackHole.RK4Consistency
 public import BlackHole.RK4Order
 public import BlackHole.TaylorLine
 public import BlackHole.WgslTransferPhi
