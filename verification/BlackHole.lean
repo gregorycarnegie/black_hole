@@ -85,6 +85,8 @@ public import BlackHole.WgslCounterexamples
 public import BlackHole.WgslAtan2
 public import BlackHole.KernelFixture
 public import BlackHole.WgslSafe
+public import BlackHole.WgslSafeDomains
+public import BlackHole.WgslSafeNear
 public import Mathlib.Analysis.SpecialFunctions.Sqrt
 public import Mathlib.Analysis.SpecialFunctions.ExpDeriv
 public import Mathlib.Analysis.SpecialFunctions.Pow.Real

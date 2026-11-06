@@ -16,8 +16,8 @@ evaluated at the exact inputs `v` with input errors `E`. `Safe` collects the
 only conditions under which a finite bound can hold in general: each
 denominator's exact magnitude exceeds its own error bound, each square-root
 argument stays nonnegative after its error, and each branch value is farther
-from its threshold than its error so both evaluations take the same side.
-Floors and clamps need no condition because `max` and `min` are 1-Lipschitz.
+from its threshold than its error so both evaluations take the same side;
+only the conditions of that side are then required. Floors and clamps need no condition because `max` and `min` are 1-Lipschitz.
 
 `error` proves `|y - exact| ≤ bound` for every input and every admissible
 rounding whenever `Safe` holds. -/
@@ -179,7 +179,8 @@ def Safe (v E : ℕ → ℝ) : GExpr → Prop
   | sqrt a => Safe v E a ∧ 0 < exact v a ∧ bound v E a ≤ exact v a
   | max a b => Safe v E a ∧ Safe v E b
   | min a b => Safe v E a ∧ Safe v E b
-  | lt c t a b => Safe v E c ∧ Safe v E a ∧ Safe v E b ∧ bound v E c < |exact v c-(t : ℝ)|
+  | lt c t a b => Safe v E c ∧ (if exact v c < (t : ℝ) then Safe v E a else Safe v E b) ∧
+      bound v E c < |exact v c-(t : ℝ)|
   | abs a => Safe v E a
   | invsqrt a => Safe v E a ∧ bound v E a < exact v a
   | exp a => Safe v E a
@@ -189,7 +190,8 @@ def Safe (v E : ℕ → ℝ) : GExpr → Prop
   | inh f a => Safe v E a ∧ Safe (fun _ => exact v a) (fun _ => bound v E a) f
   | tanh f a => Safe v E a ∧ Safe (fun _ => exact v a) (fun _ => bound v E a) f ∧
       ∀ t, exact (fun _ => t) f = Real.tanh t
-  | lt2 a b x y => Safe v E a ∧ Safe v E b ∧ Safe v E x ∧ Safe v E y ∧
+  | lt2 a b x y => Safe v E a ∧ Safe v E b ∧
+      (if exact v a < exact v b then Safe v E x else Safe v E y) ∧
       bound v E a+bound v E b < |exact v a-exact v b|
   | sinS a => Safe v E a ∧ |exact v a|+bound v E a ≤ 2^18
   | cosS a => Safe v E a ∧ |exact v a|+bound v E a ≤ 2^18
@@ -455,7 +457,7 @@ theorem error : ∀ (e : GExpr) (v w E : ℕ → ℝ), (∀ i, |w i-v i| ≤ E i
     simp only [exact,bound]
     exact (min_lip _ _ _ _).trans (max_le_max ea eb)
   | lt c t a b, v, w, E, hw, y, hs, h => by
-    obtain ⟨sc,sa,sb,hsep⟩ := hs
+    obtain ⟨sc,sbr,hsep⟩ := hs
     obtain ⟨yc,hc,hbr⟩ := h
     have ec := error c v w E hw yc sc hc
     simp only [exact,bound]
@@ -465,7 +467,7 @@ theorem error : ∀ (e : GExpr) (v w E : ℕ → ℝ), (∀ i, |w i-v i| ≤ E i
         rw [abs_of_neg (by linarith)] at hsep
         linarith
       rcases hbr with ⟨-,hy⟩ | ⟨hn,-⟩
-      · simp only [hct,↓reduceIte]; exact error a v w E hw y sa hy
+      · simp only [hct,↓reduceIte] at sbr ⊢; exact error a v w E hw y sbr hy
       · exact absurd hyc hn
     · have hyc : ¬ yc < t := by
         have := (abs_le.mp ec).1
@@ -473,7 +475,7 @@ theorem error : ∀ (e : GExpr) (v w E : ℕ → ℝ), (∀ i, |w i-v i| ≤ E i
         intro h'; linarith
       rcases hbr with ⟨h',-⟩ | ⟨-,hy⟩
       · exact absurd h' hyc
-      · simp only [hct,↓reduceIte]; exact error b v w E hw y sb hy
+      · simp only [hct,↓reduceIte] at sbr ⊢; exact error b v w E hw y sbr hy
 
   | abs a, v, w, E, hw, y, hs, h => by
     obtain ⟨ya,ha,rfl⟩ := h
@@ -621,7 +623,7 @@ theorem error : ∀ (e : GExpr) (v w E : ℕ → ℝ), (∀ i, |w i-v i| ≤ E i
       exact hf.trans (le_max_right _ _)
 
   | lt2 a b x y, v, w, E, hw, r, hs, h => by
-    obtain ⟨sa,sb,sx,sy,hsep⟩ := hs
+    obtain ⟨sa,sb,sbr,hsep⟩ := hs
     obtain ⟨ya,yb,ha,hb,hbr⟩ := h
     have ea := error a v w E hw ya sa ha
     have eb := error b v w E hw yb sb hb
@@ -633,14 +635,14 @@ theorem error : ∀ (e : GExpr) (v w E : ℕ → ℝ), (∀ i, |w i-v i| ≤ E i
         rw [abs_of_neg (by linarith)] at hsep
         linarith
       rcases hbr with ⟨-,hr⟩ | ⟨hn,-⟩
-      · simp only [hab,↓reduceIte]; exact error x v w E hw r sx hr
+      · simp only [hab,↓reduceIte] at sbr ⊢; exact error x v w E hw r sbr hr
       · exact absurd hy hn
     · have hy : ¬ ya < yb := by
         rw [abs_of_nonneg (by linarith)] at hsep
         intro h'; linarith
       rcases hbr with ⟨h',-⟩ | ⟨-,hr⟩
       · exact absurd h' hy
-      · simp only [hab,↓reduceIte]; exact error y v w E hw r sy hr
+      · simp only [hab,↓reduceIte] at sbr ⊢; exact error y v w E hw r sbr hr
 
   | sinS a, v, w, E, hw, y, hs, h => by
     obtain ⟨ya,out,ha,hsc,rfl⟩ := h
