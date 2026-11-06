@@ -270,16 +270,23 @@ theorem transfer_phi_series_error (z : ℂ) (hz0 : z ≠ 0) (hz : ‖z‖ ≤ 50
 
 /-! ### Direct branch -/
 
-/-- WGSL `exp(-x)` for `x ≥ 0`: within `(3 + 2x)` ULP. -/
-def ExpW (x e : ℝ) : Prop := |e-Real.exp (-x)| ≤ 2*u*(3+2*x)*Real.exp (-x)+η
+/-- WGSL `exp(-x)` for `x ≥ 0`: within `(3 + 2x)` ULP, an ULP of `v` being
+`2u|v| + η` (`WgslExpr.ulp`). -/
+def ExpW (x e : ℝ) : Prop := |e-Real.exp (-x)| ≤ 2*u*(3+2*x)*Real.exp (-x)+(3+2*x)*η
 
-lemma exp_error_le (x e : ℝ) (hx : 0 ≤ x) (he : ExpW x e) : |e-Real.exp (-x)| ≤ 6*u+η := by
+lemma exp_error_le (x e : ℝ) (hx : 0 ≤ x) (hx1 : x ≤ 2^62) (he : ExpW x e) :
+    |e-Real.exp (-x)| ≤ 6*u+u/10^9 := by
   unfold ExpW at he
   have hu := u_pos
+  have hη := η_pos
   have h1 : (3+2*x)*Real.exp (-x) ≤ 3 := by
     have h := Real.add_one_le_exp x
     have hpos := Real.exp_pos x
     rw [Real.exp_neg, ← div_eq_mul_inv, div_le_iff₀ hpos]
+    linarith
+  have h2 : (3+2*x)*η ≤ u/10^9 := by
+    have : (3+2*x)*η ≤ (3+2*2^62)*η := by nlinarith
+    have : (3+2*2^62:ℝ)*η ≤ u/10^9 := by norm_num [u, η]
     linarith
   nlinarith
 
@@ -483,14 +490,14 @@ theorem direct_component (x y : ℝ) (hR : (4999/10000)^2 ≤ x^2+y^2)
         linarith
 
 /-- The direct branch's numerator `1 - exp(-z)` from WGSL `exp` and `sincos`. -/
-theorem direct_numerator (x y : ℝ) (hx : 0 ≤ x) (e c s ec nx ny σ : ℝ) (he : ExpW x e)
-    (hσ0 : 0 ≤ σ) (hσ3 : σ ≤ 3) (hc : |c-Real.cos y| ≤ σ) (hs : |s-Real.sin y| ≤ σ)
+theorem direct_numerator (x y : ℝ) (hx : 0 ≤ x) (hx1 : x ≤ 2^62) (e c s ec nx ny σ : ℝ) (he : ExpW x e)
+    (_hσ0 : 0 ≤ σ) (hσ3 : σ ≤ 3) (hc : |c-Real.cos y| ≤ σ) (hs : |s-Real.sin y| ≤ σ)
     (hec : Rnd (e*c) ec) (hnx : Rnd (1-ec) nx) (hny : Rnd (e*s) ny) :
     |nx-(1-Real.exp (-x)*Real.cos y)| ≤ σ+34*u ∧ |ny-Real.exp (-x)*Real.sin y| ≤ σ+34*u := by
   have hu := u_pos
   have hη := η_pos
   have hηu : η ≤ u/10^20 := by norm_num [u, η]
-  have hde := exp_error_le x e hx he
+  have hde := exp_error_le x e hx hx1 he
   set E := Real.exp (-x) with hE
   have hE0 : 0 < E := Real.exp_pos _
   have hE1 : E ≤ 1 := by rw [hE]; exact Real.exp_le_one_iff.mpr (by linarith)
@@ -498,23 +505,23 @@ theorem direct_numerator (x y : ℝ) (hx : 0 ≤ x) (e c s ec nx ny σ : ℝ) (h
   have hsin := Real.abs_sin_le_one y
   have hcb : |c| ≤ 1+σ := by have := abs_sub_abs_le_abs_sub c (Real.cos y); linarith
   have hsb : |s| ≤ 1+σ := by have := abs_sub_abs_le_abs_sub s (Real.sin y); linarith
-  have heb : |e| ≤ 1+6*u+η := by
+  have heb : |e| ≤ 1+6*u+u/10^9 := by
     have := abs_sub_abs_le_abs_sub e E; rw [abs_of_pos hE0] at this; linarith
   unfold Rnd at hec hnx hny
   -- |e c - E cos y| ≤ (6u+η)(1+σ) + σ.
-  have hprod : ∀ t T : ℝ, |t-T| ≤ σ → |t| ≤ 1+σ → |e*t-E*T| ≤ (6*u+η)*(1+σ)+σ := by
+  have hprod : ∀ t T : ℝ, |t-T| ≤ σ → |t| ≤ 1+σ → |e*t-E*T| ≤ (6*u+u/10^9)*(1+σ)+σ := by
     intro t T ht htb
     calc |e*t-E*T| = |(e-E)*t+E*(t-T)| := by ring_nf
       _ ≤ |(e-E)*t|+|E*(t-T)| := abs_add_le _ _
       _ = |e-E| *|t|+E*|t-T| := by rw [abs_mul, abs_mul, abs_of_pos hE0]
-      _ ≤ (6*u+η)*(1+σ)+1*σ := by
+      _ ≤ (6*u+u/10^9)*(1+σ)+1*σ := by
           gcongr
       _ = _ := by ring
-  have hbig : (6*u+η)*(1+σ) ≤ 24*u+u/1000 := by nlinarith
+  have hbig : (6*u+u/10^9)*(1+σ) ≤ 24*u+u/1000 := by nlinarith
   have hetb : ∀ t : ℝ, |t| ≤ 1+σ → u*|e*t| ≤ 4*u+u/1000 := by
     intro t ht
-    have : |e*t| ≤ (1+6*u+η)*(1+σ) := by rw [abs_mul]; exact mul_le_mul heb ht (abs_nonneg _) (by positivity)
-    have : (1+6*u+η)*(1+σ) ≤ 4+1/1000 := by nlinarith [show 6*u+η ≤ 1/10^6 by norm_num [u, η]]
+    have : |e*t| ≤ (1+6*u+u/10^9)*(1+σ) := by rw [abs_mul]; exact mul_le_mul heb ht (abs_nonneg _) (by positivity)
+    have : (1+6*u+u/10^9)*(1+σ) ≤ 4+1/1000 := by nlinarith [show 6*u+u/10^9 ≤ 1/10^6 by norm_num [u, η]]
     nlinarith
   have h1 := hprod c (Real.cos y) hc hcb
   have h2 := hprod s (Real.sin y) hs hsb

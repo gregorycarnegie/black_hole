@@ -6,6 +6,7 @@ public import BlackHole.WgslPlasma
 public import BlackHole.WgslAddKerr
 public import BlackHole.WgslAtan2Program
 public import BlackHole.WgslSinCosProgram
+public import BlackHole.WgslTransferProgram
 
 /-! Translation-validation fixture for the straight-line kernels (obligation
 F3).
@@ -156,7 +157,14 @@ def branching : List (String × WgslExpr.GExpr) :=
   slotProgram "atan2_arith" WgslAtan2Program.atan2Lets [WgslAtan2Program.atan2Out] ++
   slotProgram "kerr_radius" WgslKerrProgram.kerrLets [WgslKerrProgram.kerrOut] ++
   slotProgram "sincos" WgslSinCosProgram.sincosLets
-    [WgslSinCosProgram.sincosOut false, WgslSinCosProgram.sincosOut true]
+    [WgslSinCosProgram.sincosOut false, WgslSinCosProgram.sincosOut true] ++
+  slotProgram "transfer_phi" WgslTransferProgram.phiProgLets
+    [WgslTransferProgram.phiProgOut false, WgslTransferProgram.phiProgOut true] ++
+  slotProgram "faraday_rotation" WgslTransferProgram.faradayLets
+    ((List.finRange 3).flatMap fun col => (List.finRange 3).map fun row =>
+      WgslTransferProgram.faradayOut col row) ++
+  slotProgram "polarized_cell" WgslTransferProgram.cellLets
+    (List.ofFn WgslTransferProgram.cellOut)
 
 def gsexp : WgslExpr.GExpr → String
   | .input i => s!"(in {i})"

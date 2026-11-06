@@ -1553,6 +1553,34 @@ fn atan2_setup(s: &mut Store, _: &Ctx) -> Env {
     }
 }
 
+/// `transfer_phi(z)` with `z` inputs 0–1.
+fn transfer_phi_setup(s: &mut Store, _: &Ctx) -> Env {
+    Env {
+        args: vec![vector(s, 0, 2)],
+        opaque_calls: HashMap::from([("sincos", sincos as Primitive)]),
+        ..Env::default()
+    }
+}
+
+/// `faraday_rotation(rho, ds)` with `rho` inputs 0–2 and `ds` input 3.
+fn faraday_rotation_setup(s: &mut Store, _: &Ctx) -> Env {
+    Env {
+        args: vec![vector(s, 0, 3), scalar(s, 3)],
+        opaque_calls: HashMap::from([("sincos", sincos as Primitive)]),
+        ..Env::default()
+    }
+}
+
+/// `polarized_cell(j, alpha, rho, ds)` with `j` inputs 0–3, `alpha` 4,
+/// `rho` 5–7 and `ds` 8.
+fn polarized_cell_setup(s: &mut Store, _: &Ctx) -> Env {
+    Env {
+        args: vec![vector(s, 0, 4), scalar(s, 4), vector(s, 5, 3), scalar(s, 8)],
+        opaque_calls: HashMap::from([("sincos", sincos as Primitive)]),
+        ..Env::default()
+    }
+}
+
 type Setup = fn(&mut Store, &Ctx) -> Env;
 
 /// Where the compared IR comes from: naga's WGSL front end, or the SPIR-V
@@ -1605,6 +1633,9 @@ impl Stage {
 #[case::atan2_arith("atan2_arith", atan2_setup as Setup)]
 #[case::kerr_radius("kerr_radius", kerr_radius_setup as Setup)]
 #[case::sincos("sincos", sincos_setup as Setup)]
+#[case::transfer_phi("transfer_phi", transfer_phi_setup as Setup)]
+#[case::faraday_rotation("faraday_rotation", faraday_rotation_setup as Setup)]
+#[case::polarized_cell("polarized_cell", polarized_cell_setup as Setup)]
 fn naga_ir_matches_lean_model(
     #[case] model: &str,
     #[case] setup: Setup,
@@ -1663,6 +1694,12 @@ fn fixture_lists_the_checked_kernels() {
         ("spatial_unit", 3),
         ("spin_scale", 3),
         ("tonemap", 3),
+        ("transfer_phi", 2),
+        ("transfer_phi:let", 24),
+        ("faraday_rotation", 9),
+        ("faraday_rotation:let", 7),
+        ("polarized_cell", 4),
+        ("polarized_cell:let", 65),
     ];
     let mut expected = expected.map(|(n, c)| (n.to_string(), c)).to_vec();
     expected.sort();
