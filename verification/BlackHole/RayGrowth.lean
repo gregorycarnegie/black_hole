@@ -2,10 +2,13 @@ module
 
 public import BlackHole.KerrDerivativeBounds
 public import BlackHole.KerrSmoothness
+public import Mathlib.Analysis.ODE.Gronwall
 
 @[expose] public section
 noncomputable section
 namespace BlackHole.KerrField
+
+open Set
 
 private theorem product_bound (a b A B : ℝ) (ha : |a| ≤ A) (hb : |b| ≤ B)
     (hA : 0 ≤ A) : |a*b| ≤ A*B := by
@@ -74,5 +77,58 @@ theorem phase_rhs_screen_component_bound (a x : Cartesian.Space) (p screen : Fin
   rw [abs_neg]
   have h := sum_bound _ ((31104*P)*F) (fun c => product_bound _ _ _ _ (hc c) (hf c) (by positivity))
   nlinarith
+
+/-- Explicit maximum-norm growth bound for the complete phase field, suitable
+for checking clearance of all RK4 stages before taking a step. -/
+theorem phase_rhs_norm_bound (a x : Cartesian.Space) (p screen : Fin 4 → ℝ)
+    (P F : ℝ) (ha : dotProduct a a ≤ 1) (hr : 1 ≤ Cartesian.radius a x)
+    (hp : ∀ j, |p j| ≤ P) (hf : ∀ j, |screen j| ≤ F) :
+    ‖phaseRhs 1 a (x,p,screen)‖ ≤ max (12*P) (max (41472*P^2) (124416*P*F)) := by
+  rw [Prod.norm_def, Prod.norm_def]
+  apply max_le_max
+  · apply (pi_norm_le_iff_of_nonempty _).mpr
+    intro i
+    exact hamiltonian_tangent_component_bound a x p P hr hp i.succ
+  · apply max_le_max
+    · apply (pi_norm_le_iff_of_nonempty _).mpr
+      intro i
+      exact momentum_force_component_bound a x p P ha hr hp i
+    · apply (pi_norm_le_iff_of_nonempty _).mpr
+      intro i
+      exact phase_rhs_screen_component_bound a x p screen P F ha hr hp hf i
+
+/-- Exact parallel-screen transport grows at most exponentially while the ray
+stays in the normalized exterior and its momentum components stay bounded.
+This supplies a finite screen bound on each finite solution interval. -/
+theorem screen_growth_bound (a : Cartesian.Space) (curve : ℝ → Phase) (P t₀ T : ℝ)
+    (ha : dotProduct a a ≤ 1)
+    (hsol : ∀ t ∈ Icc t₀ T, HasDerivAt curve (phaseRhs 1 a (curve t)) t)
+    (hr : ∀ t ∈ Icc t₀ T, 1 ≤ Cartesian.radius a (curve t).1)
+    (hp : ∀ t ∈ Icc t₀ T, ∀ j, |(curve t).2.1 j| ≤ P) :
+    ∀ t ∈ Icc t₀ T, ‖(curve t).2.2‖ ≤
+      ‖(curve t₀).2.2‖*Real.exp ((124416*P)*(t-t₀)) := by
+  let screen : Phase →L[ℝ] (Fin 4 → ℝ) :=
+    (ContinuousLinearMap.snd ℝ (Fin 4 → ℝ) (Fin 4 → ℝ)).comp
+      (ContinuousLinearMap.snd ℝ Cartesian.Space ((Fin 4 → ℝ) × (Fin 4 → ℝ)))
+  have hs : ∀ t ∈ Icc t₀ T, HasDerivAt (fun u => (curve u).2.2)
+      (phaseRhs 1 a (curve t)).2.2 t :=
+    fun t ht => screen.hasFDerivAt.comp_hasDerivAt t (hsol t ht)
+  have hc : ContinuousOn (fun t => (curve t).2.2) (Icc t₀ T) :=
+    fun t ht => (hs t ht).continuousAt.continuousWithinAt
+  have hd : ∀ t ∈ Ico t₀ T, HasDerivWithinAt (fun u => (curve u).2.2)
+      (phaseRhs 1 a (curve t)).2.2 (Ici t) t :=
+    fun t ht => (hs t ⟨ht.1, ht.2.le⟩).hasDerivWithinAt
+  have hb : ∀ t ∈ Ico t₀ T, ‖(phaseRhs 1 a (curve t)).2.2‖ ≤
+      (124416*P)*‖(curve t).2.2‖+0 := by
+    intro t ht
+    rw [add_zero]
+    apply (pi_norm_le_iff_of_nonempty _).mpr
+    intro i
+    have hf (j : Fin 4) : |(curve t).2.2 j| ≤ ‖(curve t).2.2‖ := by
+      simpa only [Real.norm_eq_abs] using norm_le_pi_norm (curve t).2.2 j
+    exact phase_rhs_screen_component_bound a (curve t).1 (curve t).2.1 (curve t).2.2
+      P ‖(curve t).2.2‖ ha (hr t ⟨ht.1, ht.2.le⟩) (hp t ⟨ht.1, ht.2.le⟩) hf i
+  simpa only [gronwallBound_ε0] using
+    norm_le_gronwallBound_of_norm_deriv_right_le hc hd le_rfl hb
 
 end BlackHole.KerrField

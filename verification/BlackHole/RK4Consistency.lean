@@ -157,7 +157,8 @@ end Small
 /-! ### Local Taylor expansion -/
 
 /-- Derivatives along a line inside an open set where `f` is smooth. -/
-theorem line_iteratedDeriv_on {n : ℕ} {f : E → E} {B : Set E} (hB : IsOpen B)
+theorem line_iteratedDeriv_on {G : Type*} [NormedAddCommGroup G] [NormedSpace ℝ G]
+    {n : ℕ} {f : E → G} {B : Set E} (hB : IsOpen B)
     (hf : ContDiffOn ℝ n f B) (y w : E) {k : ℕ} (hk : k ≤ n) (t : ℝ) (ht : y+t • w ∈ B) :
     iteratedDeriv k (fun s : ℝ => f (y+s • w)) t =
       iteratedFDeriv ℝ k f (y+t • w) (fun _ => w) := by

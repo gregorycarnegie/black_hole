@@ -6,8 +6,8 @@ separate jobs because each phase can take several hours on a hosted runner.
 """
 
 import os
-import sys
 import subprocess
+import sys
 import time
 from pathlib import Path
 

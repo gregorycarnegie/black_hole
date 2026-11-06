@@ -453,3 +453,34 @@ reference provenance, all three runs and refinement differences. The default
 Rust checks passed 280 tests, the Python suite passed seven, all optional local
 GPU suites and the full image runs passed their stated checks, and formatting
 and Clippy passed. The interactive renderer's plasma prescriptions are unchanged.
+
+## Certified rays and WGSL kernel bounds (2026-11-06)
+
+**Certified rays (N2, F3).** `RayCertificate.certified_ray` states what an
+accepted certificate means for the exact Kerr ray from a camera: physical
+initial data, existence over the certified affine interval, uniqueness among
+solutions that stay where the equations are defined, the capture/escape
+verdict, and 10⁻⁶ bounds on an escaping ray's direction and redshift. Each
+step's residual is checked with interval jets, its Jacobian over the tube
+gives a Lipschitz bound, and a Grönwall end radius keeps errors growing
+linearly. `lake exe certify` runs this exact checker as compiled Lean. A ray
+from radius 1500 with spin (0.2, −0.7, 0.3) certifies as escaping in 14 steps
+and 27 s. A full escape from radius 100 with the same spin certifies in 1159
+steps (21 minutes of search plus a 14-minute trusted replay). At radius about
+1600 its final position is enclosed within ±2.1·10⁻⁵, which is 1.3·10⁻⁸
+relative, and its momentum within ±1.4·10⁻⁸.
+
+**WGSL kernels (F2).** `WgslPoly` and `WgslExpr` prove error bounds for every
+input and every admissible rounding under the WGSL accuracy table. They are
+applied to `geodesic_rhs`, the RK4 arithmetic, `add_kerr`, `screen_frame`,
+`sample_plasma` (disk models 0–2) and the display kernels. Two consequences
+of the specification are counterexamples rather than bounds:
+
+- `atan2(y, x)` is unconstrained for `y = 0` or `|x| < 2⁻¹²⁶`, and therefore
+  so is `acos(0)`. The skybox sample, the polarization hue and the warped
+  disk's height may take any value on those inputs (`WgslCounterexamples`).
+- `sqrt(x)` is inherited from `1.0/inverseSqrt(x)`, and `inverseSqrt(0)` is
+  infinite, which WGSL turns into an indeterminate value. A shader `sqrt(0)`
+  therefore has no defined result. The running bounds require square-root
+  arguments to stay positive by more than their error, which is exactly this
+  boundary.

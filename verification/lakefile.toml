@@ -18,3 +18,7 @@ extraDepTargets = ["horizonFixtures"]
 name = "horizonFixtures"
 path = "fixtures/horizon-binary32.csv"
 text = true
+
+[[lean_exe]]
+name = "certify"
+root = "Certify"
