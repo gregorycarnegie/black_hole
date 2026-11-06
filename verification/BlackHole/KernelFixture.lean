@@ -4,6 +4,7 @@ public import BlackHole.WgslGeodesic
 public import BlackHole.WgslAtan2
 public import BlackHole.WgslPlasma
 public import BlackHole.WgslAddKerr
+public import BlackHole.WgslAtan2Program
 
 /-! Translation-validation fixture for the straight-line kernels (obligation
 F3).
@@ -149,7 +150,8 @@ def branching : List (String × WgslExpr.GExpr) :=
   slotProgram "sample_plasma.0" (WgslPlasma.plasmaLets 0) plasmaOutputs ++
   slotProgram "sample_plasma.1" (WgslPlasma.plasmaLets 1) plasmaOutputs ++
   slotProgram "sample_plasma.2" (WgslPlasma.plasmaLets 2) plasmaOutputs ++
-  slotProgram "sample_plasma.3" (WgslPlasma.plasmaLets 3) plasmaOutputs
+  slotProgram "sample_plasma.3" (WgslPlasma.plasmaLets 3) plasmaOutputs ++
+  slotProgram "atan2_arith" WgslAtan2Program.atan2Lets [WgslAtan2Program.atan2Out]
 
 def gsexp : WgslExpr.GExpr → String
   | .input i => s!"(in {i})"

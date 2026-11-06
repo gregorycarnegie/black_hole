@@ -65,4 +65,15 @@ def expand : List GExpr → List GExpr → List GExpr
 /-- An output of a slot program, over the kernel inputs. -/
 def withLets (slots : List GExpr) (e : GExpr) : GExpr := subst (lookup (expand [] slots)) e
 
+/-- Kernel inputs extended by computed slot values. -/
+def env (w : ℕ → ℝ) (vals : List ℝ) (i : ℕ) : ℝ :=
+  if letBase ≤ i then vals.getD (i-letBase) (w i) else w i
+
+/-- A WGSL evaluation in which each `let` slot is computed once, as the naga
+IR computes it, and later slots read that value. This is narrower than the
+tree semantics of `withLets`, where each copy may round independently. -/
+def SlotsComputes (w : ℕ → ℝ) : List GExpr → List ℝ → List ℝ → Prop
+  | [], done, vals => vals = done
+  | e :: es, done, vals => ∃ y, Computes (env w done) e y ∧ SlotsComputes w es (done ++ [y]) vals
+
 end BlackHole.WgslLets

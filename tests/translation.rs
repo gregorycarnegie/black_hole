@@ -1342,6 +1342,14 @@ fn warped_setup(s: &mut Store, cx: &Ctx) -> Env {
     plasma_setup(s, cx, 3)
 }
 
+/// `atan2_arith(y, x)` with `y` input 0 and `x` input 1.
+fn atan2_setup(s: &mut Store, _: &Ctx) -> Env {
+    Env {
+        args: vec![scalar(s, 0), scalar(s, 1)],
+        ..Env::default()
+    }
+}
+
 type Setup = fn(&mut Store, &Ctx) -> Env;
 
 #[rstest::rstest]
@@ -1357,6 +1365,7 @@ type Setup = fn(&mut Store, &Ctx) -> Env;
 #[case::plasma_truncated("sample_plasma.1", truncated_setup as Setup)]
 #[case::plasma_slim("sample_plasma.2", slim_setup as Setup)]
 #[case::plasma_warped("sample_plasma.3", warped_setup as Setup)]
+#[case::atan2_arith("atan2_arith", atan2_setup as Setup)]
 fn naga_ir_matches_lean_model(#[case] model: &str, #[case] setup: Setup) {
     let name = model.split('.').next().unwrap();
     let source = common::compile_wesl(include_str!("../assets/shaders/geodesic.wesl"));
@@ -1385,6 +1394,8 @@ fn fixture_lists_the_checked_kernels() {
     counts.sort();
     let expected = [
         ("add_kerr", 81),
+        ("atan2_arith", 1),
+        ("atan2_arith:let", 11),
         ("atan_poly", 1),
         ("geodesic_rhs", 11),
         ("heatmap_color", 3),
