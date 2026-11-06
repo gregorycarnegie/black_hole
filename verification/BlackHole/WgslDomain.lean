@@ -1,6 +1,7 @@
 module
 
 public import BlackHole.WgslPlasma
+public import BlackHole.WgslReassoc
 public import Mathlib.Analysis.Complex.ExponentialBounds
 public import Mathlib.Analysis.SpecialFunctions.Log.Deriv
 
@@ -13,6 +14,11 @@ returns `some A`, then for every input in those boxes `Safe v E e` holds, the
 exact value lies in `[A.lo, A.hi]` and the running bound is at most `A.b`
 (`ev_sound`). It returns `none` when it cannot decide, so a domain theorem is
 proved by evaluating it once per box of a cover, in the kernel.
+
+At a sum the bound is also raised to cover every association of its chain
+(`WgslReassoc.sum_bound`), whose leaf data is carried across `let` slots, so
+success also implies `Safe` for every reassociation of the sums (`ev_robust`,
+`evLets_robust`), which WGSL permits.
 
 Arithmetic is exact rational arithmetic, with endpoints rounded outward to
 `2⁻¹⁶⁰` after each step. `sqrt`, `exp` and `log` use proved enclosures:
@@ -335,6 +341,16 @@ structure Av where
   lo : ℚ
   hi : ℚ
   b : ℚ
+  /-- Whether the value is a sum chain (`WgslReassoc`), with its number of
+  leaves and upper bounds on the sums of the leaf magnitudes and leaf bounds;
+  used to bound every reassociation of the chain. -/
+  sc : Bool
+  sn : ℕ
+  sm : ℚ
+  sb : ℚ
+
+/-- A value that is not a sum chain. -/
+abbrev Av.mk3 (lo hi b : ℚ) : Av := ⟨lo, hi, b, false, 1, 0, 0⟩
 
 def Av.H (A : Av) (x B : ℝ) : Prop := (A.lo : ℝ) ≤ x ∧ x ≤ A.hi ∧ 0 ≤ B ∧ B ≤ A.b
 
@@ -369,13 +385,16 @@ lemma mig_sign {A : Av} (h : 0 < mig A) : 0 < A.lo ∨ A.hi < 0 := by
   · exact Or.inr q
   · exact absurd h (lt_irrefl 0)
 
-def nrm (A : Av) : Av := ⟨rdn 160 A.lo, rup 160 A.hi, rup 160 A.b⟩
+def nrm (A : Av) : Av := Av.mk3 (rdn 160 A.lo) (rup 160 A.hi) (rup 160 A.b)
 
 lemma Av.H.nrm {A : Av} {x B : ℝ} (h : A.H x B) : (nrm A).H x B :=
   ⟨(rdn_le_real _ _).trans h.1, h.2.1.trans (le_rup_real _ _), h.2.2.1,
     h.2.2.2.trans (le_rup_real _ _)⟩
 
-def join (A B : Av) : Av := ⟨Min.min A.lo B.lo, Max.max A.hi B.hi, Max.max A.b B.b⟩
+/-- The same interval and bound, not a sum chain. -/
+abbrev Av.leaf (A : Av) : Av := Av.mk3 A.lo A.hi A.b
+
+def join (A B : Av) : Av := Av.mk3 (Min.min A.lo B.lo) (Max.max A.hi B.hi) (Max.max A.b B.b)
 
 lemma Av.H.join_l {A : Av} {x B : ℝ} (h : A.H x B) (C : Av) : (join A C).H x B := by
   obtain ⟨h1,h2,h3,h4⟩ := h
@@ -402,6 +421,25 @@ lemma qu_eq : (qu : ℝ) = u := by simp [qu, u]; norm_num
 lemma qU_eq : (qU : ℝ) = WgslPoly.U := by simp [qU, WgslPoly.U, u]; norm_num
 lemma qη_eq : (qη : ℝ) = η := by simp [qη, η]; norm_num
 lemma q2p126_eq : (q2p126 : ℝ) = 2^126 := by simp [q2p126]; norm_num
+
+/-! A value's sum-chain data: its own leaves if it is a chain, else itself as
+the only leaf. -/
+def sdn (A : Av) : ℕ := if A.sc then A.sn else 1
+def sdm (A : Av) : ℚ := if A.sc then A.sm else mag A
+def sdb (A : Av) : ℚ := if A.sc then A.sb else A.b
+
+/-- The bound `((1+U)ⁿ⁻¹ - 1) Σ|tᵢ| + (1+U)ⁿ⁻¹ Σ Bᵢ + (n-1)(1+U)ⁿ⁻¹ η` of every
+association of a chain (`WgslReassoc.sum_bound`). -/
+def chainB (n : ℕ) (sm sb : ℚ) : ℚ := ((1+qU)^(n-1)-1)*sm+(1+qU)^(n-1)*sb+(n-1)*(1+qU)^(n-1)*qη
+
+/-- A sum chain: `R`'s interval, its bound raised to cover every association. -/
+def chainAv (R : Av) (n : ℕ) (sm sb : ℚ) : Av :=
+  ⟨R.lo, R.hi, rup 160 (Max.max R.b (chainB n sm sb)), true, n, sm, sb⟩
+
+lemma Av.H.chain {R : Av} {x B : ℝ} (h : R.H x B) (n : ℕ) (sm sb : ℚ) : (chainAv R n sm sb).H x B :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.trans (by
+    simp only [chainAv]; exact (show ((R.b:ℚ):ℝ) ≤ ((Max.max R.b (chainB n sm sb) : ℚ) : ℝ) by
+      exact_mod_cast le_max_left _ _).trans (le_rup_real _ _))⟩
 
 /-! ### Interval products -/
 
@@ -434,49 +472,41 @@ lemma mul_mem {a b c d : ℚ} {x y : ℝ} (h1 : (a:ℝ) ≤ x) (h2 : x ≤ b) (h
 /-! ### Operations -/
 
 def addAv (A B : Av) : Av :=
-  ⟨A.lo+B.lo, A.hi+B.hi, A.b+B.b+qU*(mag A+mag B+A.b+B.b)+qη⟩
+  Av.mk3 (A.lo+B.lo) (A.hi+B.hi) (A.b+B.b+qU*(mag A+mag B+A.b+B.b)+qη)
 def subAv (A B : Av) : Av :=
-  ⟨A.lo-B.hi, A.hi-B.lo, A.b+B.b+qU*(mag A+mag B+A.b+B.b)+qη⟩
+  Av.mk3 (A.lo-B.hi) (A.hi-B.lo) (A.b+B.b+qU*(mag A+mag B+A.b+B.b)+qη)
 def mulB (A B : Av) : ℚ := mag A*B.b+mag B*A.b+A.b*B.b+qU*((mag A+A.b)*(mag B+B.b))+qη
-def mulAv (A B : Av) : Av := ⟨mulLo A.lo A.hi B.lo B.hi, mulHi A.lo A.hi B.lo B.hi, mulB A B⟩
+def mulAv (A B : Av) : Av := Av.mk3 (mulLo A.lo A.hi B.lo B.hi) (mulHi A.lo A.hi B.lo B.hi) (mulB A B)
 def sqAv (A : Av) : Av :=
-  ⟨if 0 ≤ A.lo then A.lo*A.lo else if A.hi ≤ 0 then A.hi*A.hi else 0,
-    Max.max (A.lo*A.lo) (A.hi*A.hi), mulB A A⟩
+  Av.mk3 (if 0 ≤ A.lo then A.lo*A.lo else if A.hi ≤ 0 then A.hi*A.hi else 0) (Max.max (A.lo*A.lo) (A.hi*A.hi)) (mulB A A)
 def divOk (B : Av) : Prop := B.b < mig B ∧ qη ≤ mig B-B.b ∧ mag B+B.b ≤ q2p126
 instance (B : Av) : Decidable (divOk B) := by unfold divOk; infer_instance
 def divAv (A B : Av) : Av :=
-  ⟨mulLo A.lo A.hi (1/B.hi) (1/B.lo), mulHi A.lo A.hi (1/B.hi) (1/B.lo),
-    (A.b+mag A/mig B*B.b)/(mig B-B.b)+qU*((mag A+A.b)/(mig B-B.b))+qη⟩
+  Av.mk3 (mulLo A.lo A.hi (1/B.hi) (1/B.lo)) (mulHi A.lo A.hi (1/B.hi) (1/B.lo)) ((A.b+mag A/mig B*B.b)/(mig B-B.b)+qU*((mag A+A.b)/(mig B-B.b))+qη)
 def sqrtOk (A : Av) : Prop := 0 < A.lo ∧ A.b ≤ A.lo ∧ 0 < sqLo A.lo
 instance (A : Av) : Decidable (sqrtOk A) := by unfold sqrtOk; infer_instance
 def sqrtAv (A : Av) : Av :=
-  ⟨sqLo A.lo, sqHi A.hi, A.b/sqLo A.lo+10*qu*sqHi (A.hi+A.b)+qη⟩
+  Av.mk3 (sqLo A.lo) (sqHi A.hi) (A.b/sqLo A.lo+10*qu*sqHi (A.hi+A.b)+qη)
 def invOk (A : Av) : Prop := A.b < A.lo ∧ 0 < sqLo (A.lo-A.b) ∧ 0 < sqLo A.lo
 instance (A : Av) : Decidable (invOk A) := by unfold invOk; infer_instance
 def invAv (A : Av) : Av :=
-  ⟨1/sqHi A.hi, 1/sqLo A.lo,
-    A.b/(sqLo (A.lo-A.b)*sqLo A.lo*(sqLo (A.lo-A.b)+sqLo A.lo))+4*qu/sqLo (A.lo-A.b)⟩
+  Av.mk3 (1/sqHi A.hi) (1/sqLo A.lo) (A.b/(sqLo (A.lo-A.b)*sqLo A.lo*(sqLo (A.lo-A.b)+sqLo A.lo))+4*qu/sqLo (A.lo-A.b))
 def absAv (A : Av) : Av :=
-  ⟨if 0 ≤ A.lo then A.lo else if A.hi ≤ 0 then -A.hi else 0, mag A, A.b⟩
+  Av.mk3 (if 0 ≤ A.lo then A.lo else if A.hi ≤ 0 then -A.hi else 0) (mag A) A.b
 /-- `exp` arguments are kept moderate so that the enclosures stay small. -/
 def expOk (A : Av) : Prop := -256 ≤ A.lo ∧ A.hi+A.b ≤ 256 ∧ A.b ≤ 256
 instance (A : Av) : Decidable (expOk A) := by unfold expOk; infer_instance
 def expAv (A : Av) : Av :=
-  ⟨expLo A.lo, expHi A.hi,
-    expHi A.hi*(expHi A.b-1)+(3+2*(mag A+A.b))*(2*qu*expHi (A.hi+A.b)+qη)⟩
+  Av.mk3 (expLo A.lo) (expHi A.hi) (expHi A.hi*(expHi A.b-1)+(3+2*(mag A+A.b))*(2*qu*expHi (A.hi+A.b)+qη))
 def exp2Av (A : Av) : Av :=
-  ⟨expLo (mulLo A.lo A.hi L2lo L2hi), expHi (mulHi A.lo A.hi L2lo L2hi),
-    expHi (mulHi A.lo A.hi L2lo L2hi)*(expHi (A.b*L2hi)-1)+
-      (3+2*(mag A+A.b))*(2*qu*expHi (mulHi A.lo (A.hi+A.b) L2lo L2hi)+qη)⟩
+  Av.mk3 (expLo (mulLo A.lo A.hi L2lo L2hi)) (expHi (mulHi A.lo A.hi L2lo L2hi)) (expHi (mulHi A.lo A.hi L2lo L2hi)*(expHi (A.b*L2hi)-1)+ (3+2*(mag A+A.b))*(2*qu*expHi (mulHi A.lo (A.hi+A.b) L2lo L2hi)+qη))
 def logAv (A : Av) : Av :=
-  ⟨logLo A.lo, logHi A.hi, A.b/(A.lo-A.b)+1/2097152+
-    3*(2*qu*(Max.max |logLo A.lo| |logHi A.hi|+A.b/(A.lo-A.b))+qη)⟩
+  Av.mk3 (logLo A.lo) (logHi A.hi) (A.b/(A.lo-A.b)+1/2097152+ 3*(2*qu*(Max.max |logLo A.lo| |logHi A.hi|+A.b/(A.lo-A.b))+qη))
 def log2Lo (A : Av) : ℚ := Min.min (logLo A.lo/L2lo) (logLo A.lo/L2hi)
 def log2Hi (A : Av) : ℚ := Max.max (logHi A.hi/L2lo) (logHi A.hi/L2hi)
 def log2Av (A : Av) : Av :=
-  ⟨log2Lo A, log2Hi A, A.b/((A.lo-A.b)*L2lo)+1/2097152+
-    3*(2*qu*(Max.max |log2Lo A| |log2Hi A|+A.b/((A.lo-A.b)*L2lo))+qη)⟩
-def trigAv (lo hi : ℚ) (A : Av) : Av := ⟨lo, hi, A.b+128*qu*(1+(mag A+A.b))⟩
+  Av.mk3 (log2Lo A) (log2Hi A) (A.b/((A.lo-A.b)*L2lo)+1/2097152+ 3*(2*qu*(Max.max |log2Lo A| |log2Hi A|+A.b/((A.lo-A.b)*L2lo))+qη))
+def trigAv (lo hi : ℚ) (A : Av) : Av := Av.mk3 lo hi (A.b+128*qu*(1+(mag A+A.b)))
 /-- `sin` on `[-1, 1]`, where it is increasing, from its Taylor bound. -/
 def sinLo (A : Av) : ℚ := if -1 ≤ A.lo ∧ A.hi ≤ 1 then A.lo-A.lo^3/6-|A.lo|^5/100 else -1
 def sinHi (A : Av) : ℚ := if -1 ≤ A.lo ∧ A.hi ≤ 1 then A.hi-A.hi^3/6+|A.hi|^5/100 else 1
@@ -484,47 +514,52 @@ def cosLo (A : Av) : ℚ := Max.max (-1) (1-mag A^2/2)
 /-- `tanh x = 1 - 2/(exp (2x) + 1)`, increasing. -/
 def tanhLo (x : ℚ) : ℚ := if -128 ≤ x ∧ x ≤ 128 then 1-2/(expLo (2*x)+1) else -1
 def tanhHi (x : ℚ) : ℚ := if -128 ≤ x ∧ x ≤ 128 then 1-2/(expHi (2*x)+1) else 1
-def scaleAv (k : ℤ) (A : Av) : Av := ⟨pow2 k*A.lo, pow2 k*A.hi, pow2 k*A.b+qη⟩
+def scaleAv (k : ℤ) (A : Av) : Av := Av.mk3 (pow2 k*A.lo) (pow2 k*A.hi) (pow2 k*A.b+qη)
 
 /-- Evaluates `g` on `2^n` equal pieces of `A`'s interval and joins the results. -/
 def bisect (g : Av → Option Av) : ℕ → Av → Option Av
   | 0, A => g A
   | n+1, A =>
-    (bisect g n ⟨A.lo, rdn 160 ((A.lo+A.hi)/2), A.b⟩).bind fun L =>
-      (bisect g n ⟨rdn 160 ((A.lo+A.hi)/2), A.hi, A.b⟩).bind fun R => some (join L R)
+    (bisect g n (Av.mk3 A.lo (rdn 160 ((A.lo+A.hi)/2)) A.b)).bind fun L =>
+      (bisect g n (Av.mk3 (rdn 160 ((A.lo+A.hi)/2)) A.hi A.b)).bind fun R => some (join L R)
 
 /-- The interval evaluator; the arguments of `inh` and `tanh` builtins are
 split into `2^d` pieces. -/
 def ev (d : ℕ) (env : ℕ → Option Av) : GExpr → Option Av
-  | .input i => env i
-  | .const c => some ⟨c, c, 0⟩
-  | .add a b => (ev d env a).bind fun A => (ev d env b).bind fun B => some (nrm (addAv A B))
-  | .sub a b => (ev d env a).bind fun A => (ev d env b).bind fun B => some (nrm (subAv A B))
+  | .input i => if i < WgslLets.letBase then (env i).map Av.leaf else env i
+  | .const c => some (Av.mk3 c c 0)
+  | .add a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
+      some (chainAv (nrm (addAv A B)) (sdn A+sdn B) (sdm A+sdm B) (sdb A+sdb B))
+  | .sub a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
+      some (chainAv (nrm (subAv A B)) (sdn A+sdn B) (sdm A+sdm B) (sdb A+sdb B))
   | .mul a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
       some (nrm (if a = b then sqAv A else mulAv A B))
-  | .neg a => (ev d env a).bind fun A => some ⟨-A.hi, -A.lo, A.b⟩
+  | .neg a => (ev d env a).bind fun A =>
+      some (chainAv (Av.mk3 (-A.hi) (-A.lo) A.b) (sdn A) (sdm A) (sdb A))
   | .div a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
       if divOk B then some (nrm (divAv A B)) else none
   | .sqrt a => (ev d env a).bind fun A => if sqrtOk A then some (nrm (sqrtAv A)) else none
   | .max a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
-      some ⟨Max.max A.lo B.lo, Max.max A.hi B.hi, Max.max A.b B.b⟩
+      some (Av.mk3 (Max.max A.lo B.lo) (Max.max A.hi B.hi) (Max.max A.b B.b))
   | .min a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
-      some ⟨Min.min A.lo B.lo, Min.min A.hi B.hi, Max.max A.b B.b⟩
+      some (Av.mk3 (Min.min A.lo B.lo) (Min.min A.hi B.hi) (Max.max A.b B.b))
   | .lt c t a b => (ev d env c).bind fun C =>
-      if C.hi+C.b < t then ev d env a else if t < C.lo-C.b then ev d env b else none
+      if C.hi+C.b < t then (ev d env a).map Av.leaf
+      else if t < C.lo-C.b then (ev d env b).map Av.leaf else none
   | .abs a => (ev d env a).bind fun A => some (absAv A)
   | .invsqrt a => (ev d env a).bind fun A => if invOk A then some (nrm (invAv A)) else none
   | .exp a => (ev d env a).bind fun A => if expOk A then some (nrm (expAv A)) else none
   | .exp2 a => (ev d env a).bind fun A => if expOk A then some (nrm (exp2Av A)) else none
   | .log a => (ev d env a).bind fun A => if A.b < A.lo then some (nrm (logAv A)) else none
   | .log2 a => (ev d env a).bind fun A => if A.b < A.lo then some (nrm (log2Av A)) else none
-  | .inh f a => (ev d env a).bind fun A => bisect (fun A' => ev d (fun _ => some A') f) d A
+  | .inh f a => (ev d env a).bind fun A =>
+      (bisect (fun A' => ev d (fun _ => some A'.leaf) f) d A).map Av.leaf
   | .tanh f a => if f = WgslPlasma.tanhInh then (ev d env a).bind fun A =>
-      (bisect (fun A' => ev d (fun _ => some A') f) d A).bind fun R =>
-        some (nrm ⟨tanhLo A.lo, tanhHi A.hi, Max.max (A.b+1/100000) R.b⟩) else none
+      (bisect (fun A' => ev d (fun _ => some A'.leaf) f) d A).bind fun R =>
+        some (nrm (Av.mk3 (tanhLo A.lo) (tanhHi A.hi) (Max.max (A.b+1/100000) R.b))) else none
   | .lt2 a b x y => (ev d env a).bind fun A => (ev d env b).bind fun B =>
-      if A.hi-B.lo+(A.b+B.b) < 0 then ev d env x
-      else if B.hi-A.lo+(A.b+B.b) < 0 then ev d env y else none
+      if A.hi-B.lo+(A.b+B.b) < 0 then (ev d env x).map Av.leaf
+      else if B.hi-A.lo+(A.b+B.b) < 0 then (ev d env y).map Av.leaf else none
   | .sinS a => (ev d env a).bind fun A =>
       if mag A+A.b ≤ 262144 then some (nrm (trigAv (sinLo A) (sinHi A) A)) else none
   | .cosS a => (ev d env a).bind fun A =>
@@ -605,7 +640,7 @@ lemma sq_H (hA : A.H x X) :
         exact mul_le_mul h h (abs_nonneg _) ((abs_nonneg _).trans h)
     linarith
 
-lemma neg_H (hA : A.H x X) : (⟨-A.hi, -A.lo, A.b⟩ : Av).H (-x) X := by
+lemma neg_H (hA : A.H x X) : (Av.mk3 (-A.hi) (-A.lo) A.b).H (-x) X := by
   obtain ⟨a1,a2,a3,a4⟩ := hA
   refine ⟨?_,?_,a3,a4⟩ <;> push_cast <;> linarith
 
@@ -726,7 +761,7 @@ lemma abs_H (hA : A.H x X) : (absAv A).H |x| X := by
   · simp
 
 lemma max_H (hA : A.H x X) (hB : B.H y Y) :
-    (⟨Max.max A.lo B.lo, Max.max A.hi B.hi, Max.max A.b B.b⟩ : Av).H (Max.max x y) (Max.max X Y) := by
+    (Av.mk3 (Max.max A.lo B.lo) (Max.max A.hi B.hi) (Max.max A.b B.b)).H (Max.max x y) (Max.max X Y) := by
   obtain ⟨a1,a2,a3,a4⟩ := hA; obtain ⟨b1,b2,b3,b4⟩ := hB
   refine ⟨?_,?_,le_max_of_le_left a3,?_⟩ <;> push_cast
   · exact max_le_max a1 b1
@@ -734,7 +769,7 @@ lemma max_H (hA : A.H x X) (hB : B.H y Y) :
   · exact max_le_max a4 b4
 
 lemma min_H (hA : A.H x X) (hB : B.H y Y) :
-    (⟨Min.min A.lo B.lo, Min.min A.hi B.hi, Max.max A.b B.b⟩ : Av).H (Min.min x y) (Max.max X Y) := by
+    (Av.mk3 (Min.min A.lo B.lo) (Min.min A.hi B.hi) (Max.max A.b B.b)).H (Min.min x y) (Max.max X Y) := by
   obtain ⟨a1,a2,a3,a4⟩ := hA; obtain ⟨b1,b2,b3,b4⟩ := hB
   refine ⟨?_,?_,le_max_of_le_left a3,?_⟩ <;> push_cast
   · exact min_le_min a1 b1
@@ -963,9 +998,9 @@ lemma bisect_sound (g : Av → Option Av) (x X y Y : ℝ) (S : Prop)
     obtain ⟨L, hL, R', hR, rfl⟩ := h
     obtain ⟨a1,a2,a3,a4⟩ := hA
     rcases le_total x ((rdn 160 ((A.lo+A.hi)/2) : ℚ) : ℝ) with hm | hm
-    · obtain ⟨h1,h2⟩ := bisect_sound g x X y Y S hg n ⟨A.lo, rdn 160 ((A.lo+A.hi)/2), A.b⟩ L ⟨a1,hm,a3,a4⟩ hL
+    · obtain ⟨h1,h2⟩ := bisect_sound g x X y Y S hg n (Av.mk3 A.lo (rdn 160 ((A.lo+A.hi)/2)) A.b) L ⟨a1,hm,a3,a4⟩ hL
       exact ⟨h1.join_l R',h2⟩
-    · obtain ⟨h1,h2⟩ := bisect_sound g x X y Y S hg n ⟨rdn 160 ((A.lo+A.hi)/2), A.hi, A.b⟩ R' ⟨hm,a2,a3,a4⟩ hR
+    · obtain ⟨h1,h2⟩ := bisect_sound g x X y Y S hg n (Av.mk3 (rdn 160 ((A.lo+A.hi)/2)) A.hi A.b) R' ⟨hm,a2,a3,a4⟩ hR
       exact ⟨h1.join_r L,h2⟩
 
 /-- Every input box contains its input and bounds its error. -/
@@ -976,7 +1011,13 @@ the exact value and running bound lie within the result. -/
 theorem ev_sound (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (v E : ℕ → ℝ) (R : Av),
     EnvH env v E → ev d env e = some R → R.H (e.exact v) (e.bound v E) ∧ e.Safe v E := by
   induction e with
-  | input i => intro env v E R henv h; exact ⟨henv i R h,trivial⟩
+  | input i =>
+    intro env v E R henv h
+    simp only [ev] at h
+    split_ifs at h
+    · obtain ⟨A, hA, rfl⟩ := Option.map_eq_some_iff.mp h
+      exact ⟨henv i A hA,trivial⟩
+    · exact ⟨henv i R h,trivial⟩
   | const c =>
     intro env v E R henv h
     simp only [ev, Option.some.injEq] at h; subst h
@@ -987,14 +1028,14 @@ theorem ev_sound (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (v E : �
     obtain ⟨A, ha, B, hb, rfl⟩ := h
     obtain ⟨hA, sa⟩ := iha env v E A henv ha
     obtain ⟨hB, sb⟩ := ihb env v E B henv hb
-    exact ⟨(add_H hA hB).nrm,sa,sb⟩
+    exact ⟨(add_H hA hB).nrm.chain _ _ _,sa,sb⟩
   | sub a b iha ihb =>
     intro env v E R henv h
     simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
     obtain ⟨A, ha, B, hb, rfl⟩ := h
     obtain ⟨hA, sa⟩ := iha env v E A henv ha
     obtain ⟨hB, sb⟩ := ihb env v E B henv hb
-    exact ⟨(sub_H hA hB).nrm,sa,sb⟩
+    exact ⟨(sub_H hA hB).nrm.chain _ _ _,sa,sb⟩
   | mul a b iha ihb =>
     intro env v E R henv h
     simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
@@ -1011,7 +1052,7 @@ theorem ev_sound (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (v E : �
     simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
     obtain ⟨A, ha, rfl⟩ := h
     obtain ⟨hA, sa⟩ := iha env v E A henv ha
-    exact ⟨neg_H hA,sa⟩
+    exact ⟨(neg_H hA).chain _ _ _,sa⟩
   | div a b iha ihb =>
     intro env v E R henv h
     simp only [ev, Option.bind_eq_some_iff] at h
@@ -1052,12 +1093,14 @@ theorem ev_sound (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (v E : �
     obtain ⟨hC, sc⟩ := ihc env v E C henv hc
     obtain ⟨c1,c2,c3,c4⟩ := hC
     split_ifs at h with p q
-    · obtain ⟨hA, sa⟩ := iha env v E R henv h
+    · obtain ⟨R', h', rfl⟩ := Option.map_eq_some_iff.mp h
+      obtain ⟨hA, sa⟩ := iha env v E R' henv h'
       have p' : (C.hi:ℝ)+C.b < t := by exact_mod_cast p
       have hlt : exact v c < (t:ℝ) := by linarith
       simp only [exact, bound, Safe, hlt, ↓reduceIte]
       exact ⟨hA,sc,sa,by rw [abs_of_neg (by linarith)]; linarith⟩
-    · obtain ⟨hB, sb⟩ := ihb env v E R henv h
+    · obtain ⟨R', h', rfl⟩ := Option.map_eq_some_iff.mp h
+      obtain ⟨hB, sb⟩ := ihb env v E R' henv h'
       have q' : (t:ℝ) < C.lo-C.b := by exact_mod_cast q
       have hlt : ¬ exact v c < (t:ℝ) := by linarith
       simp only [exact, bound, Safe, hlt, ↓reduceIte]
@@ -1115,10 +1158,11 @@ theorem ev_sound (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (v E : �
     intro env v E R henv h
     simp only [ev, Option.bind_eq_some_iff] at h
     obtain ⟨A, ha, h⟩ := h
+    obtain ⟨R', hb, rfl⟩ := Option.map_eq_some_iff.mp h
     obtain ⟨hA, sa⟩ := iha env v E A henv ha
     obtain ⟨hR, sf⟩ := bisect_sound _ _ _ _ _ _ (fun A' R' hA' h' =>
-      ihf (fun _ => some A') (fun _ => exact v a) (fun _ => bound v E a) R'
-        (fun _ A'' h'' => by simp only [Option.some.injEq] at h''; subst h''; exact hA') h') d A R hA h
+      ihf (fun _ => some A'.leaf) (fun _ => exact v a) (fun _ => bound v E a) R'
+        (fun _ A'' h'' => by simp only [Option.some.injEq] at h''; subst h''; exact hA') h') d A R' hA hb
     exact ⟨hR,sa,sf⟩
   | tanh f a ihf iha =>
     intro env v E R henv h
@@ -1128,7 +1172,7 @@ theorem ev_sound (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (v E : �
     obtain ⟨A, ha, R', hR', rfl⟩ := h
     obtain ⟨hA, sa⟩ := iha env v E A henv ha
     obtain ⟨hR, sf⟩ := bisect_sound _ _ _ _ _ _ (fun A' R'' hA' h' =>
-      ihf (fun _ => some A') (fun _ => exact v a) (fun _ => bound v E a) R''
+      ihf (fun _ => some A'.leaf) (fun _ => exact v a) (fun _ => bound v E a) R''
         (fun _ A'' h'' => by simp only [Option.some.injEq] at h''; subst h''; exact hA') h') d A R' hA hR'
     refine ⟨Av.H.nrm ⟨?_,?_,?_,?_⟩,sa,sf,by rw [hf]; exact WgslPlasma.tanhInh_exact⟩
     · exact tanhLo_le hA.1
@@ -1145,12 +1189,14 @@ theorem ev_sound (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (v E : �
     obtain ⟨a1,a2,a3,a4⟩ := hA
     obtain ⟨b1,b2,b3,b4⟩ := hB
     split_ifs at h with p q
-    · obtain ⟨hX, sx⟩ := ihx env v E R henv h
+    · obtain ⟨R', h', rfl⟩ := Option.map_eq_some_iff.mp h
+      obtain ⟨hX, sx⟩ := ihx env v E R' henv h'
       have p' : (A.hi:ℝ)-B.lo+(A.b+B.b) < 0 := by exact_mod_cast p
       have hlt : exact v a < exact v b := by linarith
       simp only [exact, bound, Safe, hlt, ↓reduceIte]
       exact ⟨hX,sa,sb,sx,by rw [abs_of_neg (by linarith)]; linarith⟩
-    · obtain ⟨hY, sy⟩ := ihy env v E R henv h
+    · obtain ⟨R', h', rfl⟩ := Option.map_eq_some_iff.mp h
+      obtain ⟨hY, sy⟩ := ihy env v E R' henv h'
       have q' : (B.hi:ℝ)-A.lo+(A.b+B.b) < 0 := by exact_mod_cast q
       have hlt : ¬ exact v a < exact v b := by linarith
       simp only [exact, bound, Safe, hlt, ↓reduceIte]
@@ -1313,7 +1359,7 @@ theorem evLetsAll_sound (d : ℕ) (env : ℕ → Option Av) (slots outs : List G
 
 /-- Input `i` within `w (1 + |ref i|)` of `ref i`, with error at most that. -/
 def nearEnv (ref : List ℚ) (w : ℚ) (i : ℕ) : Option Av :=
-  ref[i]?.map fun r => ⟨r-w*(1+|r|), r+w*(1+|r|), w*(1+|r|)⟩
+  ref[i]?.map fun r => Av.mk3 (r-w*(1+|r|)) (r+w*(1+|r|)) (w*(1+|r|))
 
 /-- Inputs and errors within the box `nearEnv ref w`. -/
 def Near (ref : List ℚ) (w : ℚ) (v E : ℕ → ℝ) : Prop :=
@@ -1333,5 +1379,613 @@ lemma nearEnv_H {ref : List ℚ} {w : ℚ} {v E : ℕ → ℝ} (h : Near ref w v
     obtain ⟨h1, h2, h3⟩ := h i hi
     have := abs_le.mp h1
     exact ⟨by push_cast; linarith, by push_cast; linarith, h2, by push_cast; linarith⟩
+
+/-! ### Every reassociation
+
+WGSL may evaluate each sum chain in any association (`WgslReassoc.RA`). The
+evaluator's bounds cover all of them: at a sum it takes the larger of the
+running bound and the chain bound of `WgslReassoc.sum_bound`, and it carries
+each chain's leaf data across `let` slots, where a chain may continue. -/
+
+section Robust
+open WgslReassoc WgslLets
+
+/-- `A` encloses every reassociation of `x`, which is `Safe`, and records
+`x`'s sum chain. -/
+def RH (v E : ℕ → ℝ) (A : Av) (x : GExpr) : Prop :=
+  (∀ x', RA x x' → x'.Safe v E ∧ A.H (x'.exact v) (x'.bound v E)) ∧
+  (A.sc = true ↔ IsSum x) ∧
+  (A.sc = true → (sumLeaves x).length = A.sn ∧ lmag v (sumLeaves x) ≤ A.sm ∧
+    ∃ bs : List ℝ, List.Forall₂ (fun p β => ∀ x', RA p.2 x' →
+      x'.Safe v E ∧ 0 ≤ x'.bound v E ∧ x'.bound v E ≤ β) (sumLeaves x) bs ∧ bs.sum ≤ A.sb)
+
+/-- The leaf condition of a chain. -/
+abbrev LeafP (v E : ℕ → ℝ) (p : Bool × GExpr) (β : ℝ) : Prop :=
+  ∀ x', RA p.2 x' → x'.Safe v E ∧ 0 ≤ x'.bound v E ∧ x'.bound v E ≤ β
+
+lemma RH.self {v E : ℕ → ℝ} {A : Av} {x : GExpr} (h : RH v E A x) :
+    x.Safe v E ∧ A.H (x.exact v) (x.bound v E) := h.1 x (RA.refl x)
+
+/-- A value's chain data, whether or not it is a chain. -/
+lemma RH.sd {v E : ℕ → ℝ} {A : Av} {x : GExpr} (h : RH v E A x) :
+    (sumLeaves x).length = sdn A ∧ lmag v (sumLeaves x) ≤ sdm A ∧
+      ∃ bs : List ℝ, List.Forall₂ (LeafP v E) (sumLeaves x) bs ∧ bs.sum ≤ sdb A := by
+  by_cases hs : A.sc = true
+  · obtain ⟨h1, h2, h3⟩ := h.2.2 hs
+    simp only [sdn, sdm, sdb, hs, ↓reduceIte]
+    exact ⟨h1, h2, h3⟩
+  · have hns : ¬ IsSum x := fun hx => hs (h.2.1.mpr hx)
+    simp only [sdn, sdm, sdb, hs, Bool.false_eq_true, ↓reduceIte, sumLeaves_of_not hns]
+    obtain ⟨-, hH⟩ := h.self
+    refine ⟨rfl, ?_, [A.b], List.Forall₂.cons ?_ List.Forall₂.nil, by simp⟩
+    · simp only [lmag, List.map_cons, List.map_nil, List.sum_cons, List.sum_nil, add_zero]
+      exact abs_le_mag hH
+    · intro x' hx'
+      obtain ⟨s', h1, h2, h3, h4⟩ := h.1 x' hx'
+      exact ⟨s', h3, h4⟩
+
+/-- The leaf bounds of a chain bound the leaf bounds of every reassociation. -/
+lemma chain_RH {v E : ℕ → ℝ} {R : Av} {x : GExpr} (hx : IsSum x) {n : ℕ} {sm sb : ℚ}
+    (hn : (sumLeaves x).length = n) (hm : lmag v (sumLeaves x) ≤ sm) {bs : List ℝ}
+    (hb : List.Forall₂ (LeafP v E) (sumLeaves x) bs) (hs : bs.sum ≤ sb)
+    (hlo : (R.lo : ℝ) ≤ x.exact v) (hhi : x.exact v ≤ R.hi) :
+    RH v E (chainAv R n sm sb) x := by
+  have hU := WgslPoly.U_pos; have hη := η_pos
+  refine ⟨fun x' hx' => ?_, by simp [chainAv, hx], fun _ => ⟨hn, hm, bs, hb, hs⟩⟩
+  obtain ⟨hx'', σ, hsg, hl⟩ := hx'.sum_inv hx
+  obtain ⟨hlen, hget⟩ := List.forall₂_iff_get.mp hb
+  -- each leaf of `x'` is a reassociation of a leaf of `x`
+  have leaf : ∀ j : Fin (sumLeaves x').length, ((sumLeaves x')[j]).2.Safe v E ∧
+      0 ≤ ((sumLeaves x')[j]).2.bound v E ∧
+      ((sumLeaves x')[j]).2.bound v E ≤ bs[(σ.symm j : ℕ)]'(hlen ▸ (σ.symm j).2) := by
+    intro j
+    have := hget (σ.symm j) (σ.symm j).2 (hlen ▸ (σ.symm j).2) _ (by simpa using hl (σ.symm j))
+    exact this
+  obtain ⟨s', b0, hbd⟩ := sum_bound v E x' fun p hp => by
+    obtain ⟨j, rfl⟩ := List.get_of_mem hp
+    exact ⟨(leaf j).1, (leaf j).2.1⟩
+  have hn' : (sumLeaves x').length = n := by rw [← hn, ← Fintype.card_fin (sumLeaves x').length,
+    ← Fintype.card_congr σ, Fintype.card_fin]
+  have hmag : lmag v (sumLeaves x') = lmag v (sumLeaves x) := by
+    simp only [lmag, list_sum_fin]
+    rw [← Equiv.sum_comp σ]
+    congr 1; ext i; rw [exact_RA v (hl i)]
+  have hbnd : lbnd v E (sumLeaves x') ≤ sb := by
+    simp only [lbnd, list_sum_fin]
+    rw [← Equiv.sum_comp σ]
+    calc ∑ i, ((sumLeaves x')[σ i]).2.bound v E
+        ≤ ∑ i : Fin (sumLeaves x).length, bs[(i : ℕ)]'(hlen ▸ i.2) := by
+          apply Finset.sum_le_sum; intro i _
+          have := (leaf (σ i)).2.2; simpa using this
+      _ = ∑ j : Fin bs.length, bs[(j : ℕ)] := Fintype.sum_equiv (finCongr hlen) _ _ (fun i => rfl)
+      _ = bs.sum := by simp
+      _ ≤ sb := hs
+  rw [hn'] at hbd
+  rw [hmag] at hbd
+  have hP : (1:ℝ) ≤ (1+WgslPoly.U)^(n-1) := one_le_pow₀ (by linarith)
+  have hM := lmag_nonneg v (sumLeaves x)
+  refine ⟨s', ?_, ?_, b0, ?_⟩
+  · rw [exact_RA v hx']; exact hlo
+  · rw [exact_RA v hx']; exact hhi
+  · simp only [chainAv]
+    refine le_trans ?_ (le_rup_real _ _)
+    push_cast
+    refine le_trans ?_ (le_max_right _ _)
+    simp only [chainB]; push_cast; rw [qU_eq, qη_eq]
+    have hsb : (lbnd v E (sumLeaves x') : ℝ) ≤ sb := hbnd
+    have hsm : lmag v (sumLeaves x) ≤ sm := hm
+    have e1 := mul_le_mul_of_nonneg_left hsb (by linarith : (0:ℝ) ≤ (1+WgslPoly.U)^(n-1))
+    have e2 := mul_le_mul_of_nonneg_left hsm (by linarith : (0:ℝ) ≤ (1+WgslPoly.U)^(n-1)-1)
+    nlinarith
+
+/-- Kernel inputs are boxes; inputs from `letBase` on are evaluated slots. -/
+def EnvR (env : ℕ → Option Av) (σ : ℕ → GExpr) (v E : ℕ → ℝ) : Prop :=
+  ∀ i A, env i = some A → (i < letBase → σ i = .input i ∧ A.H (v i) (E i)) ∧
+    (letBase ≤ i → RH v E A (σ i))
+
+lemma RH_leaf_input {v E : ℕ → ℝ} {A : Av} {i : ℕ} (h : A.H (v i) (E i)) :
+    RH v E A.leaf (.input i) := by
+  refine ⟨fun x' hx' => ?_, by simp [IsSum], fun h => by simp at h⟩
+  cases hx' with
+  | sum he => exact absurd he (by simp [IsSum])
+  | input => exact ⟨trivial, h⟩
+
+lemma subst_input : ∀ e : GExpr, subst GExpr.input e = e := by
+  intro e; induction e <;> simp_all [subst]
+
+/-- Programs whose root is not a sum chain: every reassociation keeps the root. -/
+lemma RH_of_root {v E : ℕ → ℝ} {R : Av} {x : GExpr} (hx : ¬ IsSum x) (hR : R.sc = false)
+    (h : ∀ x', RA x x' → x'.Safe v E ∧ R.H (x'.exact v) (x'.bound v E)) : RH v E R x :=
+  ⟨h, by simp [hR, hx], fun h' => by simp [hR] at h'⟩
+
+lemma sq_H' {A : Av} {x y X Y : ℝ} (hA : A.H x X) (hB : A.H y Y) (hxy : x = y) :
+    (sqAv A).H (x*y) (|x| * Y+|y| * X+X*Y+WgslPoly.U*((|x|+X)*(|y|+Y))+η) := by
+  subst hxy
+  have h := sq_H hA
+  exact ⟨h.1, h.2.1, mulB_nonneg hA hB, mulB_le hA hB⟩
+
+end Robust
+
+section Robust2
+open WgslReassoc WgslLets
+
+/-- Unpacks a non-chain node: every reassociation keeps the node. -/
+macro "root_tac" : tactic => `(tactic| (refine RH_of_root (by simp [IsSum, subst]) rfl ?_))
+
+/-- If the evaluator succeeds, every reassociation of the evaluated program
+(with slots substituted by `σ`) is `Safe` and enclosed by the result. -/
+theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : ℕ → GExpr) (v E : ℕ → ℝ)
+    (R : Av), EnvR env σ v E → ev d env e = some R → RH v E R (subst σ e) := by
+  induction e with
+  | input i =>
+    intro env σ v E R henv h
+    simp only [ev] at h
+    simp only [subst]
+    split_ifs at h with hi
+    · obtain ⟨A, hA, rfl⟩ := Option.map_eq_some_iff.mp h
+      obtain ⟨hσ, hH⟩ := (henv i A hA).1 hi
+      rw [hσ]; exact RH_leaf_input hH
+    · exact (henv i R h).2 (by omega)
+  | const c =>
+    intro env σ v E R henv h
+    simp only [ev, Option.some.injEq] at h; subst h
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | const => exact ⟨trivial, le_rfl, le_rfl, by simp [bound], by simp [bound]⟩
+  | add a b iha ihb =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
+    obtain ⟨A, ha, B, hb, rfl⟩ := h
+    have rA := iha env σ v E A henv ha
+    have rB := ihb env σ v E B henv hb
+    obtain ⟨na, ma, bsa, fa, sa⟩ := rA.sd
+    obtain ⟨nb, mb, bsb, fb, sb⟩ := rB.sd
+    have hR := (add_H rA.self.2 rB.self.2).nrm
+    refine chain_RH (by simp [IsSum, subst]) ?_ ?_ (List.rel_append fa fb) ?_ hR.1 hR.2.1
+    · simp [subst, sumLeaves, na, nb]
+    · simp only [subst, sumLeaves, lmag, List.map_append, List.sum_append] at ma mb ⊢
+      push_cast; linarith
+    · simp only [List.sum_append]; push_cast; linarith
+  | sub a b iha ihb =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
+    obtain ⟨A, ha, B, hb, rfl⟩ := h
+    have rA := iha env σ v E A henv ha
+    have rB := ihb env σ v E B henv hb
+    obtain ⟨na, ma, bsa, fa, sa⟩ := rA.sd
+    obtain ⟨nb, mb, bsb, fb, sb⟩ := rB.sd
+    have hR := (sub_H rA.self.2 rB.self.2).nrm
+    refine chain_RH (by simp [IsSum, subst]) ?_ ?_ (List.rel_append fa (List.forall₂_map_left_iff.mpr fb)) ?_ hR.1 hR.2.1
+    · simp [subst, sumLeaves, na, nb]
+    · simp only [subst, sumLeaves]
+      rw [show lmag v (sumLeaves (subst σ a) ++ (sumLeaves (subst σ b)).map fun p => (!p.1, p.2)) =
+        lmag v (sumLeaves (subst σ a))+lmag v (sumLeaves (subst σ b)) by
+          simp [lmag, Function.comp_def]]
+      push_cast; linarith
+    · simp only [List.sum_append]; push_cast; linarith
+  | neg a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
+    obtain ⟨A, ha, rfl⟩ := h
+    have rA := iha env σ v E A henv ha
+    obtain ⟨na, ma, bsa, fa, sa⟩ := rA.sd
+    have hR := neg_H rA.self.2
+    refine chain_RH (by simp [IsSum, subst]) ?_ ?_ (List.forall₂_map_left_iff.mpr fa) sa hR.1 hR.2.1
+    · simp [subst, sumLeaves, na]
+    · simp only [subst, sumLeaves, lmag_flip]; exact ma
+  | mul a b iha ihb =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
+    obtain ⟨A, ha, B, hb, rfl⟩ := h
+    have rA := iha env σ v E A henv ha
+    have rB := ihb env σ v E B henv hb
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | mul ha' hb' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s2, h2⟩ := rB.1 _ hb'
+      refine ⟨⟨s1, s2⟩, ?_⟩
+      split_ifs with hab
+      · subst hab
+        obtain rfl : B = A := by rw [ha] at hb; exact (Option.some.inj hb).symm
+        exact (sq_H' h1 h2 (by rw [exact_RA v ha', exact_RA v hb'])).nrm
+      · exact (mul_H h1 h2).nrm
+  | div a b iha ihb =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, B, hb, h⟩ := h
+    split_ifs at h with ok
+    simp only [Option.some.injEq] at h; subst h
+    have rA := iha env σ v E A henv ha
+    have rB := ihb env σ v E B henv hb
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | div ha' hb' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s2, h2⟩ := rB.1 _ hb'
+      obtain ⟨hR, c1, c2, c3⟩ := div_H h1 h2 ok
+      exact ⟨⟨s1, s2, c1, c2, c3⟩, hR.nrm⟩
+  | sqrt a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, h⟩ := h
+    split_ifs at h with ok
+    simp only [Option.some.injEq] at h; subst h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | sqrt ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨hR, c1, c2⟩ := sqrt_H h1 ok
+      exact ⟨⟨s1, c1, c2⟩, hR.nrm⟩
+  | max a b iha ihb =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
+    obtain ⟨A, ha, B, hb, rfl⟩ := h
+    have rA := iha env σ v E A henv ha
+    have rB := ihb env σ v E B henv hb
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | max ha' hb' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s2, h2⟩ := rB.1 _ hb'
+      exact ⟨⟨s1, s2⟩, max_H h1 h2⟩
+  | min a b iha ihb =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
+    obtain ⟨A, ha, B, hb, rfl⟩ := h
+    have rA := iha env σ v E A henv ha
+    have rB := ihb env σ v E B henv hb
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | min ha' hb' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s2, h2⟩ := rB.1 _ hb'
+      exact ⟨⟨s1, s2⟩, min_H h1 h2⟩
+  | lt c t a b ihc iha ihb =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨C, hc, h⟩ := h
+    have rC := ihc env σ v E C henv hc
+    split_ifs at h with p q
+    · obtain ⟨A, ha, rfl⟩ := Option.map_eq_some_iff.mp h
+      have rA := iha env σ v E A henv ha
+      have p' : (C.hi:ℝ)+C.b < t := by exact_mod_cast p
+      root_tac
+      intro x' hx'; simp only [subst] at hx'
+      cases hx' with
+      | sum he => exact absurd he (by simp [IsSum])
+      | lt t hc' ha' hb' =>
+        rename_i c' a' b'
+        obtain ⟨sc, c1, c2, c3, c4⟩ := rC.1 _ hc'
+        obtain ⟨sa, hA⟩ := rA.1 _ ha'
+        have hlt : exact v c' < (t:ℝ) := by linarith
+        simp only [exact, bound, Safe, hlt, ↓reduceIte]
+        exact ⟨⟨sc, sa, by rw [abs_of_neg (by linarith)]; linarith⟩, hA⟩
+    · obtain ⟨B, hb, rfl⟩ := Option.map_eq_some_iff.mp h
+      have rB := ihb env σ v E B henv hb
+      have q' : (t:ℝ) < C.lo-C.b := by exact_mod_cast q
+      root_tac
+      intro x' hx'; simp only [subst] at hx'
+      cases hx' with
+      | sum he => exact absurd he (by simp [IsSum])
+      | lt t hc' ha' hb' =>
+        rename_i c' a' b'
+        obtain ⟨sc, c1, c2, c3, c4⟩ := rC.1 _ hc'
+        obtain ⟨sb, hB⟩ := rB.1 _ hb'
+        have hlt : ¬ exact v c' < (t:ℝ) := by linarith
+        simp only [exact, bound, Safe, hlt, ↓reduceIte]
+        exact ⟨⟨sc, sb, by rw [abs_of_pos (by linarith)]; linarith⟩, hB⟩
+  | abs a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
+    obtain ⟨A, ha, rfl⟩ := h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | abs ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      exact ⟨s1, abs_H h1⟩
+  | invsqrt a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, h⟩ := h
+    split_ifs at h with ok
+    simp only [Option.some.injEq] at h; subst h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | invsqrt ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨hR, c1⟩ := inv_H h1 ok
+      exact ⟨⟨s1, c1⟩, hR.nrm⟩
+  | exp a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, h⟩ := h
+    split_ifs at h with ok
+    simp only [Option.some.injEq] at h; subst h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | exp ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      exact ⟨s1, (exp_H h1).nrm⟩
+  | exp2 a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, h⟩ := h
+    split_ifs at h with ok
+    simp only [Option.some.injEq] at h; subst h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | exp2 ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      exact ⟨s1, (exp2_H h1).nrm⟩
+  | log a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, h⟩ := h
+    split_ifs at h with ok
+    simp only [Option.some.injEq] at h; subst h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | log ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨hR, c1⟩ := log_H h1 ok
+      exact ⟨⟨s1, c1⟩, hR.nrm⟩
+  | log2 a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, h⟩ := h
+    split_ifs at h with ok
+    simp only [Option.some.injEq] at h; subst h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | log2 ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨hR, c1⟩ := log2_H h1 ok
+      exact ⟨⟨s1, c1⟩, hR.nrm⟩
+  | inh f a ihf iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, h⟩ := h
+    obtain ⟨R', hb, rfl⟩ := Option.map_eq_some_iff.mp h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | inh f ha' =>
+      rename_i a'
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨hR, sf⟩ := bisect_sound _ _ _ _ _ _ (fun A' R'' hA' h' => by
+        have := ihf (fun _ => some A'.leaf) GExpr.input (fun _ => exact v a') (fun _ => bound v E a') R''
+          (fun i A'' h'' => by
+            simp only [Option.some.injEq] at h''; subst h''
+            exact ⟨fun _ => ⟨rfl, hA'⟩, fun _ => RH_leaf_input hA'⟩) h'
+        rw [subst_input] at this
+        exact ⟨this.self.2, this.self.1⟩) d A R' h1 hb
+      exact ⟨⟨s1, sf⟩, hR⟩
+  | tanh f a ihf iha =>
+    intro env σ v E R henv h
+    simp only [ev] at h
+    split_ifs at h with hf
+    simp only [Option.bind_eq_some_iff, Option.some.injEq] at h
+    obtain ⟨A, ha, R', hR', rfl⟩ := h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | tanh f ha' =>
+      rename_i a'
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨hR, sf⟩ := bisect_sound _ _ _ _ _ _ (fun A' R'' hA' h' => by
+        have := ihf (fun _ => some A'.leaf) GExpr.input (fun _ => exact v a') (fun _ => bound v E a') R''
+          (fun i A'' h'' => by
+            simp only [Option.some.injEq] at h''; subst h''
+            exact ⟨fun _ => ⟨rfl, hA'⟩, fun _ => RH_leaf_input hA'⟩) h'
+        rw [subst_input] at this
+        exact ⟨this.self.2, this.self.1⟩) d A R' h1 hR'
+      refine ⟨⟨s1, sf, by rw [hf]; exact WgslPlasma.tanhInh_exact⟩, Av.H.nrm ⟨?_,?_,?_,?_⟩⟩
+      · exact tanhLo_le h1.1
+      · exact le_tanhHi h1.2.1
+      · exact le_max_of_le_left (by have := h1.2.2.1; positivity)
+      · simp only [bound]; push_cast
+        exact max_le_max (by have := h1.2.2.2; norm_num; linarith) hR.2.2.2
+  | lt2 a b x y iha ihb ihx ihy =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, B, hb, h⟩ := h
+    have rA := iha env σ v E A henv ha
+    have rB := ihb env σ v E B henv hb
+    split_ifs at h with p q
+    · obtain ⟨X, hx, rfl⟩ := Option.map_eq_some_iff.mp h
+      have rX := ihx env σ v E X henv hx
+      have p' : (A.hi:ℝ)-B.lo+(A.b+B.b) < 0 := by exact_mod_cast p
+      root_tac
+      intro x' hx'; simp only [subst] at hx'
+      cases hx' with
+      | sum he => exact absurd he (by simp [IsSum])
+      | lt2 ha' hb' hx' hy' =>
+        rename_i a' b' x'' y''
+        obtain ⟨sa, a1, a2, a3, a4⟩ := rA.1 _ ha'
+        obtain ⟨sb, b1, b2, b3, b4⟩ := rB.1 _ hb'
+        obtain ⟨sx, hX⟩ := rX.1 _ hx'
+        have hlt : exact v a' < exact v b' := by linarith
+        simp only [exact, bound, Safe, hlt, ↓reduceIte]
+        exact ⟨⟨sa, sb, sx, by rw [abs_of_neg (by linarith)]; linarith⟩, hX⟩
+    · obtain ⟨Y, hy, rfl⟩ := Option.map_eq_some_iff.mp h
+      have rY := ihy env σ v E Y henv hy
+      have q' : (B.hi:ℝ)-A.lo+(A.b+B.b) < 0 := by exact_mod_cast q
+      root_tac
+      intro x' hx'; simp only [subst] at hx'
+      cases hx' with
+      | sum he => exact absurd he (by simp [IsSum])
+      | lt2 ha' hb' hx' hy' =>
+        rename_i a' b' x'' y''
+        obtain ⟨sa, a1, a2, a3, a4⟩ := rA.1 _ ha'
+        obtain ⟨sb, b1, b2, b3, b4⟩ := rB.1 _ hb'
+        obtain ⟨sy, hY⟩ := rY.1 _ hy'
+        have hlt : ¬ exact v a' < exact v b' := by linarith
+        simp only [exact, bound, Safe, hlt, ↓reduceIte]
+        exact ⟨⟨sa, sb, sy, by rw [abs_of_pos (by linarith)]; linarith⟩, hY⟩
+  | sinS a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, h⟩ := h
+    split_ifs at h with ok
+    simp only [Option.some.injEq] at h; subst h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | sinS ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨hR, c1⟩ := trig_H h1 ok _ (sinLo_le h1) (le_sinHi h1)
+      exact ⟨⟨s1, c1⟩, hR.nrm⟩
+  | cosS a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff] at h
+    obtain ⟨A, ha, h⟩ := h
+    split_ifs at h with ok
+    simp only [Option.some.injEq] at h; subst h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | cosS ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨hR, c1⟩ := trig_H (hi := 1) h1 ok _ (cosLo_le h1)
+        (by simpa using Real.cos_le_one _)
+      exact ⟨⟨s1, c1⟩, hR.nrm⟩
+  | scale k a iha =>
+    intro env σ v E R henv h
+    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
+    obtain ⟨A, ha, rfl⟩ := h
+    have rA := iha env σ v E A henv ha
+    root_tac
+    intro x' hx'; simp only [subst] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [IsSum])
+    | scale k ha' =>
+      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      exact ⟨s1, (scale_H k h1).nrm⟩
+  | round a _ => intro env σ v E R henv h; simp [ev] at h
+  | qsel j k s c _ _ _ => intro env σ v E R henv h; simp [ev] at h
+
+end Robust2
+
+section Robust3
+open WgslReassoc WgslLets
+
+/-- Kernel boxes only: no entries from `letBase` on. -/
+def EnvLow (env : ℕ → Option Av) : Prop := ∀ i, letBase ≤ i → env i = none
+
+/-- For a box environment, every reassociation of a program on which the
+evaluator succeeds is `Safe` and enclosed. -/
+theorem ev_robust_box (d : ℕ) (env : ℕ → Option Av) (e : GExpr) (v E : ℕ → ℝ) (R : Av)
+    (henv : EnvH env v E) (hlow : EnvLow env) (h : ev d env e = some R) :
+    ∀ x', RA e x' → x'.Safe v E ∧ R.H (x'.exact v) (x'.bound v E) := by
+  have := ev_robust d e env GExpr.input v E R (fun i A hA =>
+    ⟨fun _ => ⟨rfl, henv i A hA⟩, fun hi => by rw [hlow i hi] at hA; exact absurd hA (by simp)⟩) h
+  rw [subst_input] at this
+  exact this.1
+
+/-- Evaluated slots enclose every reassociation of the expanded slots. -/
+def SlotsR (v E : ℕ → ℝ) (vals : List Av) (X : List GExpr) : Prop :=
+  vals.length = X.length ∧ ∀ j (hv : j < vals.length) (hX : j < X.length), RH v E vals[j] X[j]
+
+lemma slotEnv_R {env : ℕ → Option Av} {v E : ℕ → ℝ} (henv : EnvH env v E) {vals : List Av}
+    {X : List GExpr} (h : SlotsR v E vals X) : EnvR (slotEnv env vals) (lookup X) v E := by
+  intro i A hA
+  unfold slotEnv at hA
+  constructor
+  · intro hi
+    simp only [show ¬ letBase ≤ i by omega, ↓reduceIte] at hA
+    exact ⟨by simp [lookup, show ¬ letBase ≤ i by omega], henv i A hA⟩
+  · intro hi
+    simp only [hi, ↓reduceIte] at hA
+    obtain ⟨hlt, rfl⟩ := List.getElem?_eq_some_iff.mp hA
+    have hX : i-letBase < X.length := h.1 ▸ hlt
+    simp only [lookup, hi, ↓reduceIte]
+    rw [List.getD_eq_getElem?_getD, List.getElem?_eq_getElem hX, Option.getD_some]
+    exact h.2 _ hlt hX
+
+lemma evSlots_robust (d : ℕ) {env : ℕ → Option Av} {v E : ℕ → ℝ} (henv : EnvH env v E) :
+    ∀ (es : List GExpr) (done : List Av) (X : List GExpr) (vals : List Av), SlotsR v E done X →
+      evSlots d env es done = some vals → SlotsR v E vals (expand X es)
+  | [], done, X, vals, h, hs => by
+    simp only [evSlots, Option.some.injEq] at hs; subst hs; exact h
+  | e :: es, done, X, vals, h, hs => by
+    simp only [evSlots, Option.bind_eq_some_iff] at hs
+    obtain ⟨A, hA, hs⟩ := hs
+    apply evSlots_robust d henv es _ _ vals _ hs
+    have hR := ev_robust d e _ _ v E A (slotEnv_R henv h) hA
+    refine ⟨by simp [h.1], fun j hv hX => ?_⟩
+    rcases Nat.lt_or_ge j done.length with hj | hj
+    · have hjX : j < X.length := h.1 ▸ hj
+      rw [List.getElem_append_left hj, List.getElem_append_left hjX]
+      exact h.2 j hj hjX
+    · have e1 : j = done.length := by simp at hv; omega
+      subst e1
+      rw [List.getElem_append_right le_rfl, List.getElem_append_right (h.1 ▸ le_rfl)]
+      simp only [Nat.sub_self, List.getElem_cons_zero, h.1]
+      exact hR
+
+/-- If the slot evaluation succeeds, every reassociation of the expanded
+output, including chains that continue across `let` slots, is `Safe` and
+enclosed. -/
+theorem evLets_robust (d : ℕ) (env : ℕ → Option Av) (slots : List GExpr) (e : GExpr)
+    (v E : ℕ → ℝ) (R : Av) (henv : EnvH env v E) (h : evLets d env slots e = some R) :
+    ∀ x', RA (withLets slots e) x' → x'.Safe v E ∧ R.H (x'.exact v) (x'.bound v E) := by
+  simp only [evLets, Option.bind_eq_some_iff] at h
+  obtain ⟨vals, hv, hR⟩ := h
+  have hS := evSlots_robust d henv slots [] [] vals ⟨rfl, fun j hv _ => absurd hv (by simp)⟩ hv
+  exact (ev_robust d e _ _ v E R (slotEnv_R henv hS) hR).1
+
+theorem evLetsAll_robust (d : ℕ) (env : ℕ → Option Av) (slots outs : List GExpr)
+    (h : evLetsAll d env slots outs = true) (v E : ℕ → ℝ) (henv : EnvH env v E) :
+    ∀ e ∈ outs, ∀ x', RA (withLets slots e) x' → x'.Safe v E := by
+  intro e he
+  unfold evLetsAll at h
+  cases hs : evSlots d env slots [] with
+  | none => rw [hs] at h; exact absurd h (by simp)
+  | some vals =>
+    rw [hs, List.all_eq_true] at h
+    obtain ⟨R, hR⟩ := Option.isSome_iff_exists.mp (h e he)
+    exact fun x' hx' => (evLets_robust d env slots e v E R henv (by simp [evLets, hs, hR]) x' hx').1
+
+end Robust3
 
 end BlackHole.WgslDomain

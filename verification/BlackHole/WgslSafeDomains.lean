@@ -45,11 +45,11 @@ lemma all_range {p : ℕ → Bool} {n : ℕ} (h : (List.range n).all p = true) {
 def polBox (k : ℤ) (s : ℕ) : ℕ → Option Av :=
   let a := pow2 k
   let e := 2*a/1048576
-  let wide : Av := ⟨-2*a, 2*a, e⟩
-  let pos : Av := ⟨7/640*a, 2*a, e⟩
-  let neg : Av := ⟨-2*a, -(7/640*a), e⟩
+  let wide : Av := Av.mk3 (-2*a) (2*a) e
+  let pos : Av := Av.mk3 (7/640*a) (2*a) e
+  let neg : Av := Av.mk3 (-2*a) (-(7/640*a)) e
   fun i => match i with
-    | 0 => some ⟨a, 2*a, e⟩
+    | 0 => some (Av.mk3 a (2*a) e)
     | 1 => some (if s = 0 then pos else if s = 1 then neg else wide)
     | 2 => some (if s = 2 then pos else if s = 3 then neg else wide)
     | _ => none
@@ -60,14 +60,14 @@ theorem polBox_ok : ((List.range 53).all fun k => (List.range 4).all fun s =>
       (ev 0 (polBox ((k:ℤ)-26) s) (polarizationHue j)).isSome) = true := by
   decide +kernel
 
-/-- `polarization_color`'s hue view satisfies `Safe`, so its running bound
-holds, for every intensity in `[2⁻²⁶, 2²⁶]` (above the `10⁻⁸` cutoff), every
-`|Q|, |U| ≤ I` with linear polarization fraction at least `1/64`, and input
-errors up to `2⁻²⁰ I`. -/
+/-- Every reassociation of `polarization_color`'s hue view (`WgslReassoc.RA`)
+satisfies `Safe`, so its running bound holds, for every intensity in
+`[2⁻²⁶, 2²⁶]` (above the `10⁻⁸` cutoff), every `|Q|, |U| ≤ I` with linear
+polarization fraction at least `1/64`, and input errors up to `2⁻²⁰ I`. -/
 theorem polarization_safe (j : Fin 3) (v E : ℕ → ℝ) (hI : (2:ℝ)^(-26:ℤ) ≤ v 0)
     (hI' : v 0 ≤ (2:ℝ)^(26:ℤ)) (hQ : |v 1| ≤ v 0) (hU : |v 2| ≤ v 0)
     (hpol : (v 0/64)^2 ≤ v 1^2+v 2^2) (hE : ∀ i, i < 3 → 0 ≤ E i ∧ E i ≤ v 0/2^20) :
-    (polarizationHue j).Safe v E := by
+    ∀ x', WgslReassoc.RA (polarizationHue j) x' → x'.Safe v E := by
   have hI0 : 0 < v 0 := lt_of_lt_of_le (by positivity) hI
   obtain ⟨k, hk1, hk2⟩ := octave hI0
   obtain ⟨kl, kh⟩ := octave_range hk1 hk2 hI hI'
@@ -98,7 +98,12 @@ theorem polarization_safe (j : Fin 3) (v E : ℕ → ℝ) (hI : (2:ℝ)^(-26:ℤ
   have hj := hok' j (by fin_cases j <;> simp)
   rw [show (((k+26).toNat : ℕ) : ℤ)-26 = k by omega] at hj
   obtain ⟨R, hR⟩ := Option.isSome_iff_exists.mp hj
-  refine (ev_sound 0 _ _ v E R ?_ hR).2
+  intro x' hx'
+  refine (ev_robust_box 0 _ _ v E R ?_ ?_ hR x' hx').1
+  rotate_left
+  · intro i hi
+    obtain ⟨n, rfl⟩ : ∃ n, i = n+3 := ⟨i-3, by simp only [WgslLets.letBase] at hi; omega⟩
+    rfl
   have hpa : ((pow2 k : ℚ) : ℝ) = a := pow2_eq k
   have hb : ∀ i, i < 3 → 0 ≤ E i ∧ E i ≤ ((2*pow2 k/1048576 : ℚ) : ℝ) := by
     intro i hi
@@ -141,15 +146,17 @@ theorem polarization_safe (j : Fin 3) (v E : ℕ → ℝ) (hI : (2:ℝ)^(-26:ℤ
     · split_ifs <;> exact (hb 2 (by norm_num)).2
   | n+3 => simp [polBox] at hA
 
-/-- The running bound of `polarization_color`'s hue view holds on the domain of
-`polarization_safe`. -/
+/-- On the domain of `polarization_safe`, a WGSL evaluation of
+`polarization_color`'s hue view in any association `x'` of its sums is within
+the running bound of that association. -/
 theorem polarization_error_all (j : Fin 3) (v w E : ℕ → ℝ) (hw : ∀ i, |w i-v i| ≤ E i)
     (hI : (2:ℝ)^(-26:ℤ) ≤ v 0) (hI' : v 0 ≤ (2:ℝ)^(26:ℤ)) (hQ : |v 1| ≤ v 0) (hU : |v 2| ≤ v 0)
-    (hpol : (v 0/64)^2 ≤ v 1^2+v 2^2) (hE : ∀ i, i < 3 → E i ≤ v 0/2^20) (y : ℝ)
-    (hy : (polarizationHue j).Computes w y) :
-    |y-(polarizationHue j).exact v| ≤ (polarizationHue j).bound v E :=
-  polarization_hue_error j v w E hw y
-    (polarization_safe j v E hI hI' hQ hU hpol fun i hi => ⟨(abs_nonneg _).trans (hw i), hE i hi⟩) hy
+    (hpol : (v 0/64)^2 ≤ v 1^2+v 2^2) (hE : ∀ i, i < 3 → E i ≤ v 0/2^20) (x' : GExpr)
+    (hx' : WgslReassoc.RA (polarizationHue j) x') (y : ℝ) (hy : x'.Computes w y) :
+    |y-(polarizationHue j).exact v| ≤ x'.bound v E := by
+  rw [← WgslReassoc.exact_RA v hx']
+  exact error x' v w E hw y (polarization_safe j v E hI hI' hQ hU hpol
+    (fun i hi => ⟨(abs_nonneg _).trans (hw i), hE i hi⟩) x' hx') hy
 
 /-! ### Vectors by octave and slab -/
 
@@ -157,8 +164,8 @@ theorem polarization_error_all (j : Fin 3) (v w E : ℕ → ℝ) (hw : ∀ i, |w
 slab `2j` (`2j+1`) holds coordinate `j` in `[2^k, 2^(k+1)]`
 (`[-2^(k+1), -2^k]`); other slabs only bound it by `2^(k+1)`. -/
 def slabAv (k : ℤ) (s j : ℕ) (e : ℚ) : Av :=
-  if s = 2*j then ⟨pow2 k, 2*pow2 k, e⟩
-  else if s = 2*j+1 then ⟨-(2*pow2 k), -pow2 k, e⟩ else ⟨-(2*pow2 k), 2*pow2 k, e⟩
+  if s = 2*j then Av.mk3 (pow2 k) (2*pow2 k) e
+  else if s = 2*j+1 then Av.mk3 (-(2*pow2 k)) (-pow2 k) e else Av.mk3 (-(2*pow2 k)) (2*pow2 k) e
 
 /-- The largest absolute coordinate. -/
 def vmax (x : ℕ → ℝ) (o : ℕ) : ℝ := Max.max (Max.max |x o| |x (o+1)|) |x (o+2)|
@@ -220,7 +227,7 @@ lemma vec_cover (x : ℕ → ℝ) (o : ℕ) {lo hi : ℤ} (h1 : (2:ℝ)^lo ≤ v
 any mass and mass error up to `2⁶⁴`. -/
 def spinEnv (k : ℤ) (s : ℕ) : ℕ → Option Av := fun i =>
   if i < 3 then some (slabAv k s i (2*pow2 k/1048576))
-  else if i = 3 then some ⟨-18446744073709551616, 18446744073709551616, 18446744073709551616⟩
+  else if i = 3 then some (Av.mk3 (-18446744073709551616) 18446744073709551616 18446744073709551616)
   else none
 
 set_option maxRecDepth 100000 in
@@ -228,21 +235,36 @@ theorem spinEnv_ok : ((List.range 41).all fun k => (List.range 6).all fun s =>
       (ev 0 (spinEnv ((k:ℤ)-20) s) (WgslAddKerr.spinScale 0)).isSome) = true := by
   decide +kernel
 
-/-- `add_kerr`'s spin scaling `mass*spin/max(1, length(spin)/0.999)` satisfies
-`Safe` for every spin with `2⁻²⁰ ≤ max |spinᵢ| ≤ 2²⁰` and component errors up
+/-- Every reassociation of `add_kerr`'s spin scaling
+`mass*spin/max(1, length(spin)/0.999)` satisfies `Safe` for every spin with `2⁻²⁰ ≤ max |spinᵢ| ≤ 2²⁰` and component errors up
 to `2⁻²⁰ max |spinᵢ|`, and every mass and mass error up to `2⁶⁴`. A zero spin
 is excluded: WGSL leaves `sqrt(0) = 1/inverseSqrt(0)` unspecified. -/
 theorem spin_scale_safe (j : Fin 3) (v E : ℕ → ℝ) (h1 : (2:ℝ)^(-20:ℤ) ≤ vmax v 0)
     (h2 : vmax v 0 ≤ (2:ℝ)^(20:ℤ)) (hE : ∀ i, i < 3 → 0 ≤ E i ∧ E i ≤ vmax v 0/2^20)
     (hm : |v 3| ≤ 2^64) (hEm : 0 ≤ E 3 ∧ E 3 ≤ 2^64) :
-    (WgslAddKerr.spinScale j).Safe v E := by
+    ∀ x', WgslReassoc.RA (WgslAddKerr.spinScale j) x' → x'.Safe v E := by
   obtain ⟨k, s, kl, kh, hs, hsl, hb⟩ := vec_cover v 0 h1 h2
   have hj := all_range (all_range spinEnv_ok (k := (k+20).toNat) (by omega)) hs
   rw [show (((k+20).toNat : ℕ) : ℤ)-20 = k by omega] at hj
   obtain ⟨R, hR⟩ := Option.isSome_iff_exists.mp hj
   -- Only the divisor carries conditions, and it does not depend on `j`.
-  suffices h : (WgslAddKerr.spinScale 0).Safe v E from ⟨⟨trivial, trivial⟩, h.2⟩
-  refine (ev_sound 0 _ _ v E R ?_ hR).2
+  suffices h : ∀ x', WgslReassoc.RA (WgslAddKerr.spinScale 0) x' → x'.Safe v E by
+    intro x' hx'
+    simp only [WgslAddKerr.spinScale] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [WgslReassoc.IsSum])
+    | div hN hD =>
+      obtain ⟨-, sD, cD⟩ := h _ (WgslReassoc.RA.div (WgslReassoc.RA.refl _) hD)
+      refine ⟨?_, sD, cD⟩
+      cases hN with
+      | sum he => exact absurd he (by simp [WgslReassoc.IsSum])
+      | mul h3 hi => rw [h3.input_inv, hi.input_inv]; exact ⟨trivial, trivial⟩
+  intro x' hx'
+  refine (ev_robust_box 0 _ _ v E R ?_ ?_ hR x' hx').1
+  rotate_left
+  · intro i hi; simp only [spinEnv]
+    split_ifs
+    all_goals first | rfl | (exfalso; simp only [WgslLets.letBase] at hi; omega)
   intro i A hA
   unfold spinEnv at hA
   split_ifs at hA with p q <;> simp only [Option.some.injEq] at hA <;> subst hA
@@ -273,7 +295,7 @@ def gIdx : List ℕ := [5,6,7,9,10,11,13,14,15]
 errors up to `2⁻¹⁴`. -/
 def suEnv (k : ℤ) (s : ℕ) : ℕ → Option Av := fun i =>
   if 100 ≤ i ∧ i < 103 then some (slabAv k s (i-100) (2*pow2 k/1048576))
-  else if i ∈ gIdx then some ⟨-64, 64, 1/16384⟩ else none
+  else if i ∈ gIdx then some (Av.mk3 (-64) 64 (1/16384)) else none
 
 def qOk : Option Av → Bool
   | some A => decide (A.b < 1/32)
@@ -292,7 +314,8 @@ lemma suQ_exact (v : ℕ → ℝ) : suQ.exact v = (∑ i : Fin 3, v (100+i)*
   simp
   ring
 
-/-- `spatial_unit` satisfies `Safe`, so its running bound holds, for every
+/-- Every reassociation of `spatial_unit` satisfies `Safe`, so its running
+bound holds, for every
 vector with `2⁻²⁰ ≤ max |vᵢ| ≤ 2²⁰` and component errors up to
 `2⁻²⁰ max |vᵢ|`, and every spatial metric with entries in `[-64, 64]`,
 entry errors up to `2⁻¹⁴`, and quadratic form at least `max |vᵢ|²/32` at the
@@ -301,7 +324,7 @@ theorem spatial_unit_safe (i : Fin 3) (v E : ℕ → ℝ) (h1 : (2:ℝ)^(-20:ℤ
     (h2 : vmax v 100 ≤ (2:ℝ)^(20:ℤ)) (hE : ∀ j, j < 3 → 0 ≤ E (100+j) ∧ E (100+j) ≤ vmax v 100/2^20)
     (hg : ∀ n ∈ gIdx, |v n| ≤ 64 ∧ 0 ≤ E n ∧ E n ≤ 1/16384)
     (hpd : (vmax v 100)^2/32 ≤ ∑ i : Fin 3, v (100+i)*∑ j : Fin 3, v (4*(i.succ : ℕ)+j.succ)*v (100+j)) :
-    (WgslScreen.spatialUnit suVec i).Safe v E := by
+    ∀ x', WgslReassoc.RA (WgslScreen.spatialUnit suVec i) x' → x'.Safe v E := by
   obtain ⟨k, s, kl, kh, hs, hsl, hb⟩ := vec_cover v 100 h1 h2
   have hok := all_range (all_range suEnv_ok (k := (k+20).toNat) (by omega)) hs
   rw [show (((k+20).toNat : ℕ) : ℤ)-20 = k by omega, Bool.and_eq_true] at hok
@@ -320,14 +343,13 @@ theorem spatial_unit_safe (i : Fin 3) (v E : ℕ → ℝ) (h1 : (2:ℝ)^(-20:ℤ
     · obtain ⟨hv, e0, e1⟩ := hg n q
       have := abs_le.mp hv
       exact ⟨by push_cast; linarith, by push_cast; linarith, e0, by push_cast; linarith⟩
+  have hlow : EnvLow (suEnv k s) := by
+    intro n hn; simp only [suEnv]
+    split_ifs with p q
+    all_goals first | rfl | (exfalso; simp_all [gIdx, WgslLets.letBase]; omega)
   obtain ⟨R, hR⟩ := Option.isSome_iff_exists.mp hpre
-  obtain ⟨-, p1, pb, p4⟩ := ev_sound 0 _ _ v E R henv hR
+  have pre := ev_robust_box 0 _ _ v E R henv hlow hR
   have hm0 : 0 < vmax v 100 := lt_of_lt_of_le (by positivity) h1
-  have hneg : (neg suScale).exact v < ((0:ℚ):ℝ) := by
-    show -vmax v 100 < _; push_cast; linarith
-  -- The scaled component's conditions are those of `scale`, the same for every `i`.
-  simp only [hneg, ↓reduceIte] at pb
-  obtain ⟨-, p2⟩ := pb
   cases hQ : ev 0 (suEnv k s) suQ with
   | none => rw [hQ] at hq; simp [qOk] at hq
   | some A =>
@@ -335,15 +357,47 @@ theorem spatial_unit_safe (i : Fin 3) (v E : ℕ → ℝ) (h1 : (2:ℝ)^(-20:ℤ
     have hAb : (A.b : ℝ) < 1/32 := by
       have h' : A.b < 1/32 := of_decide_eq_true hq
       have := (Rat.cast_lt (K := ℝ)).mpr h'; push_cast at this; linarith
-    obtain ⟨⟨-,-,qb0,qb⟩, sq⟩ := ev_sound 0 _ _ v E A henv hQ
+    have qR := ev_robust_box 0 _ _ v E A henv hlow hQ
     have hqe : 1/32 ≤ suQ.exact v := by
       rw [suQ_exact, le_div_iff₀ (by positivity)]; linarith
-    refine ⟨p1, ?_, p4⟩
-    show if (neg suScale).exact v < ((0:ℚ):ℝ) then _ else _
-    simp only [hneg, ↓reduceIte]
-    refine ⟨⟨trivial, p2⟩, ⟨sq, trivial⟩, ?_⟩
-    show max (bound v E suQ) 0 < max (suQ.exact v) _
-    rw [max_eq_left qb0]
-    exact lt_of_lt_of_le (by linarith) (le_max_left _ _)
+    intro x' hx'
+    simp only [WgslScreen.spatialUnit] at hx'
+    cases hx' with
+    | sum he => exact absurd he (by simp [WgslReassoc.IsSum])
+    | lt t hc' ha' hb' =>
+      rename_i c' a' b'
+      -- The test and the scaled components' conditions come from `suPre 0`:
+      -- they are those of `scale`, the same for every `i`.
+      have hpre' := fun s' (hs' : WgslReassoc.RA (suScaled 0) s') =>
+        (pre _ (WgslReassoc.RA.lt 0 hc' hs' (WgslReassoc.RA.refl (suVec 0)))).1
+      obtain ⟨p1, -, p4⟩ := hpre' _ (WgslReassoc.RA.refl _)
+      have hneg : c'.exact v < ((0:ℚ):ℝ) := by
+        rw [WgslReassoc.exact_RA v hc']; show -vmax v 100 < _; push_cast; linarith
+      refine ⟨p1, ?_, p4⟩
+      simp only [hneg, ↓reduceIte]
+      cases ha' with
+      | sum he => exact absurd he (by simp [WgslReassoc.IsSum])
+      | mul hs hinv =>
+        cases hs with
+        | sum he => exact absurd he (by simp [WgslReassoc.IsSum])
+        | div hv hsc =>
+          have h2 := (hpre' _ (WgslReassoc.RA.div (WgslReassoc.RA.refl (suVec 0)) hsc)).2.1
+          simp only [hneg, ↓reduceIte] at h2
+          obtain ⟨-, s2, c2⟩ := h2
+          refine ⟨⟨by rw [hv.input_inv]; trivial, s2, c2⟩, ?_⟩
+          cases hinv with
+          | sum he => exact absurd he (by simp [WgslReassoc.IsSum])
+          | invsqrt hm =>
+            cases hm with
+            | sum he => exact absurd he (by simp [WgslReassoc.IsSum])
+            | max hq' hc'' =>
+              rename_i q' cc
+              change WgslReassoc.RA suQ q' at hq'
+              rw [hc''.const_inv]
+              obtain ⟨sq, -, -, qb0, qb⟩ := qR _ hq'
+              refine ⟨⟨sq, trivial⟩, ?_⟩
+              show max (bound v E q') 0 < max (q'.exact v) _
+              rw [max_eq_left qb0, WgslReassoc.exact_RA v hq']
+              exact lt_of_lt_of_le (by linarith) (le_max_left _ _)
 
 end BlackHole.WgslSafeDomains

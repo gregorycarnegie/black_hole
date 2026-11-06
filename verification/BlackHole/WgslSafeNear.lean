@@ -53,13 +53,15 @@ theorem plasma_near_ok : (([0,1,2,3] : List (Fin 4)).all fun m =>
     evLetsAll 3 (nearEnv kerrRef (1/16384)) (plasmaLets m) ((List.finRange 12).map plasmaOut)) = true := by
   decide +kernel
 
-/-- `sample_plasma` satisfies `Safe`, so its running bound holds, for all four
+/-- Every reassociation of `sample_plasma` satisfies `Safe`, so its running
+bound holds, for all four
 disk models and all twelve fields, at every input within `2⁻¹⁴ (1 + |ref|)`
 of `kerrRef` with errors up to that. -/
 theorem sample_plasma_safe_near (model : Fin 4) (o : Fin 12) (v E : ℕ → ℝ)
-    (h : Near kerrRef (1/16384) v E) : (plasma model o).Safe v E := by
+    (h : Near kerrRef (1/16384) v E) :
+    ∀ x', WgslReassoc.RA (plasma model o) x' → x'.Safe v E := by
   have hm := List.all_eq_true.mp plasma_near_ok model (by fin_cases model <;> simp)
-  exact evLetsAll_sound _ _ _ _ hm v E (nearEnv_H h) _
+  exact evLetsAll_robust _ _ _ _ hm v E (nearEnv_H h) _
     (List.mem_map.mpr ⟨o, List.mem_finRange o, rfl⟩)
 
 def frameOuts : List GExpr :=
@@ -71,11 +73,12 @@ theorem frame_near_ok :
     evLetsAll 0 (nearEnv (kerrRef.take 40) (1/1024)) WgslScreen.frameLets frameOuts = true := by
   decide +kernel
 
-/-- `screen_frame` satisfies `Safe` for every input within
+/-- Every reassociation of `screen_frame` satisfies `Safe` for every input within
 `2⁻¹⁰ (1 + |ref|)` of the first 40 entries of `kerrRef`, errors up to that. -/
 theorem screen_frame_safe_near (col i : Fin 3) (v E : ℕ → ℝ)
-    (h : Near (kerrRef.take 40) (1/1024) v E) : (WgslScreen.frame col i).Safe v E :=
-  evLetsAll_sound _ _ _ _ frame_near_ok v E (nearEnv_H h) _
+    (h : Near (kerrRef.take 40) (1/1024) v E) :
+    ∀ x', WgslReassoc.RA (WgslScreen.frame col i) x' → x'.Safe v E :=
+  evLetsAll_robust _ _ _ _ frame_near_ok v E (nearEnv_H h) _
     (by fin_cases col <;> fin_cases i <;> simp [frameOuts])
 
 def kerrOuts : List WgslAddKerr.Output :=
@@ -88,14 +91,20 @@ theorem kerr_near_ok : (kerrOuts.all fun o =>
     (ev 0 (nearEnv kerrSourceRef (1/128)) (WgslAddKerr.program o)).isSome) = true := by
   decide +kernel
 
-/-- Every `add_kerr` output (metric, inverse with its excision test,
-derivatives, clearance) satisfies `Safe` for every input within
+/-- Every reassociation of every `add_kerr` output (metric, inverse with its
+excision test, derivatives, clearance) satisfies `Safe` for every input within
 `2⁻⁷ (1 + |ref|)` of `kerrSourceRef`, errors up to that. -/
 theorem add_kerr_safe_near (o : WgslAddKerr.Output) (v E : ℕ → ℝ)
-    (h : Near kerrSourceRef (1/128) v E) : (WgslAddKerr.program o).Safe v E := by
+    (h : Near kerrSourceRef (1/128) v E) :
+    ∀ x', WgslReassoc.RA (WgslAddKerr.program o) x' → x'.Safe v E := by
   have ho : o ∈ kerrOuts := by
     cases o <;> simp [kerrOuts, List.mem_flatMap, List.mem_finRange]
   obtain ⟨R, hR⟩ := Option.isSome_iff_exists.mp (List.all_eq_true.mp kerr_near_ok o ho)
-  exact (ev_sound 0 _ _ v E R (nearEnv_H h) hR).2
+  have hlow : EnvLow (nearEnv kerrSourceRef (1/128)) := fun i hi => by
+    have : kerrSourceRef.length ≤ i := by
+      simp only [kerrSourceRef, minkowski, List.length_append, List.length_cons, List.length_nil,
+        List.length_replicate, WgslLets.letBase] at hi ⊢; omega
+    simp [nearEnv, List.getElem?_eq_none this]
+  exact fun x' hx' => (ev_robust_box 0 _ _ v E R (nearEnv_H h) hlow hR x' hx').1
 
 end BlackHole.WgslSafeNear

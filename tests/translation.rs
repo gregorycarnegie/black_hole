@@ -7,9 +7,10 @@
 //! Expressions are hash-consed into one store whose constructors normalize:
 //! sums are flattened and sorted, and the operands of products, `max` and `min`
 //! sorted. The `WgslPoly` bounds are unchanged by these and the `WgslExpr`
-//! bounds by the commutations; sum reassociation, which WGSL permits and naga
+//! bounds by the commutations. Sum reassociation, which WGSL permits and naga
 //! leaves to the backend for `dot` and matrix products, changes the `WgslExpr`
-//! running bounds (obligation F2).
+//! running bounds; `WgslReassoc` and the checked domains of obligation F2
+//! cover every sum reassociation.
 //! Two expressions agree exactly when they get the same node, so shared
 //! subexpressions are compared once; sharing is only a representation, and
 //! both sides denote trees. Constants are exact dyadic rationals. Branches
