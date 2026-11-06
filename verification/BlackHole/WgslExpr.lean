@@ -60,6 +60,10 @@ inductive GExpr
   /-- `sincos(a).x` and `sincos(a).y` of the shader's arithmetic `sincos`. -/
   | sinS (a : GExpr)
   | cosS (a : GExpr)
+  /-- `2^k * a`. The product is correctly rounded and `2^k a` is representable
+  unless it is subnormal, so the result is exact or within `η` (including a
+  flush to zero). -/
+  | scale (k : ℤ) (a : GExpr)
   deriving DecidableEq
 
 def exp2R (x : ℝ) : ℝ := Real.exp (x*Real.log 2)
@@ -112,6 +116,7 @@ def exact (v : ℕ → ℝ) : GExpr → ℝ
   | lt2 a b x y => if exact v a < exact v b then exact v x else exact v y
   | sinS a => Real.sin (exact v a)
   | cosS a => Real.cos (exact v a)
+  | scale k a => (2:ℝ)^k*exact v a
 
 /-- The running forward error bound at exact inputs `v` with input errors `E`. -/
 def bound (v E : ℕ → ℝ) : GExpr → ℝ
@@ -145,6 +150,7 @@ def bound (v E : ℕ → ℝ) : GExpr → ℝ
   | lt2 a b x y => if exact v a < exact v b then bound v E x else bound v E y
   | sinS a => bound v E a+128*u*(1+(|exact v a|+bound v E a))
   | cosS a => bound v E a+128*u*(1+(|exact v a|+bound v E a))
+  | scale k a => (2:ℝ)^k*bound v E a+η
 
 /-- Conditions under which the running bound is valid. -/
 def Safe (v E : ℕ → ℝ) : GExpr → Prop
@@ -173,6 +179,7 @@ def Safe (v E : ℕ → ℝ) : GExpr → Prop
       bound v E a+bound v E b < |exact v a-exact v b|
   | sinS a => Safe v E a ∧ |exact v a|+bound v E a ≤ 2^18
   | cosS a => Safe v E a ∧ |exact v a|+bound v E a ≤ 2^18
+  | scale _ a => Safe v E a
 
 /-- Some WGSL evaluation of the program from computed inputs `w` returns `y`. -/
 def Computes (w : ℕ → ℝ) : GExpr → ℝ → Prop
@@ -201,6 +208,7 @@ def Computes (w : ℕ → ℝ) : GExpr → ℝ → Prop
       ((ya < yb ∧ Computes w x r) ∨ (¬ ya < yb ∧ Computes w y r))
   | sinS a, y => ∃ ya out, Computes w a ya ∧ SinCosComputes ya out ∧ y = out.1
   | cosS a, y => ∃ ya out, Computes w a ya ∧ SinCosComputes ya out ∧ y = out.2
+  | scale k a, y => ∃ ya, Computes w a ya ∧ |y-(2:ℝ)^k*ya| ≤ η
 
 lemma max_lip (a b c d : ℝ) : |Max.max a b-Max.max c d| ≤ Max.max |a-c| |b-d| := by
   rcases le_total a b with h1 | h1 <;> rcases le_total c d with h2 | h2 <;>
@@ -642,6 +650,15 @@ theorem error : ∀ (e : GExpr) (v w E : ℕ → ℝ), (∀ i, |w i-v i| ≤ E i
     calc |out.2-Real.cos (exact v a)| ≤ |out.2-Real.cos ya|+|Real.cos ya-Real.cos (exact v a)| :=
           abs_sub_le _ _ _
       _ ≤ _ := by linarith
+  | scale k a, v, w, E, hw, y, hs, h => by
+    obtain ⟨ya,ha,hy⟩ := h
+    have ea := error a v w E hw ya hs ha
+    simp only [exact,bound]
+    have hk : 0 < (2:ℝ)^k := zpow_pos (by norm_num) k
+    calc |y-2^k*exact v a| ≤ |y-2^k*ya|+|2^k*ya-2^k*exact v a| := abs_sub_le _ _ _
+      _ = |y-2^k*ya|+2^k*|ya-exact v a| := by rw [← mul_sub,abs_mul,abs_of_pos hk]
+      _ ≤ η+2^k*bound v E a := by gcongr
+      _ = _ := by ring
 
 end GExpr
 

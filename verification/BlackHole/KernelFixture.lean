@@ -5,6 +5,7 @@ public import BlackHole.WgslAtan2
 public import BlackHole.WgslPlasma
 public import BlackHole.WgslAddKerr
 public import BlackHole.WgslAtan2Program
+public import BlackHole.WgslKerrProgram
 
 /-! Translation-validation fixture for the straight-line kernels (obligation
 F3).
@@ -105,8 +106,8 @@ theorem fixture_eq : fixture = kernels := by decide +kernel
 `fixtures/kernels-branching.sexp` uses the `GExpr` grammar: the operations
 above plus `(div a b)`, `(max a b)`, `(min a b)`, unary `(sqrt a)`, `(abs a)`,
 `(invsqrt a)`, `(exp a)`, `(exp2 a)`, `(log a)`, `(log2 a)`, `(sinS a)`,
-`(cosS a)`, `(inh f a)`, `(tanh f a)`, `(lt c num den a b)` and
-`(lt2 a b x y)`. -/
+`(cosS a)`, `(inh f a)`, `(tanh f a)`, `(lt c num den a b)`,
+`(lt2 a b x y)` and `(scale k a)` for `2^k * a`. -/
 
 /-- Matrix entries in WGSL storage order: column by column. -/
 def columns {α : Type} (f : Fin 4 → Fin 4 → α) : List α :=
@@ -151,7 +152,8 @@ def branching : List (String × WgslExpr.GExpr) :=
   slotProgram "sample_plasma.1" (WgslPlasma.plasmaLets 1) plasmaOutputs ++
   slotProgram "sample_plasma.2" (WgslPlasma.plasmaLets 2) plasmaOutputs ++
   slotProgram "sample_plasma.3" (WgslPlasma.plasmaLets 3) plasmaOutputs ++
-  slotProgram "atan2_arith" WgslAtan2Program.atan2Lets [WgslAtan2Program.atan2Out]
+  slotProgram "atan2_arith" WgslAtan2Program.atan2Lets [WgslAtan2Program.atan2Out] ++
+  slotProgram "kerr_radius" WgslKerrProgram.kerrLets [WgslKerrProgram.kerrOut]
 
 def gsexp : WgslExpr.GExpr → String
   | .input i => s!"(in {i})"
@@ -176,11 +178,21 @@ def gsexp : WgslExpr.GExpr → String
   | .tanh f a => s!"(tanh {gsexp f} {gsexp a})"
   | .lt c t a b => s!"(lt {gsexp c} {t.num} {t.den} {gsexp a} {gsexp b})"
   | .lt2 a b x y => s!"(lt2 {gsexp a} {gsexp b} {gsexp x} {gsexp y})"
+  | .scale k a => s!"(scale {k} {gsexp a})"
 
 def renderBranching : String :=
   String.intercalate "\n" (branching.map fun (n,e) => n ++ " " ++ gsexp e) ++ "\n"
 
 private meta def branchingText : String := include_str ".."/"fixtures"/"kernels-branching.sexp"
+
+private meta def intTerm (k : String) : Lean.MacroM Lean.Term := do
+  if k.startsWith "-" then
+    let some n := (k.drop 1).toString.toNat? | Lean.Macro.throwError s!"invalid integer {k}"
+    unless 0 < n do Lean.Macro.throwError "negative zero"
+    `(Int.negSucc $(Lean.quote (n-1)))
+  else
+    let some n := k.toNat? | Lean.Macro.throwError s!"invalid integer {k}"
+    `(Int.ofNat $(Lean.quote n))
 
 private meta partial def gparse : List String → Lean.MacroM (Lean.Term × List String)
   | "(" :: "in" :: i :: ")" :: rest => do
@@ -195,6 +207,10 @@ private meta partial def gparse : List String → Lean.MacroM (Lean.Term × List
     let (b, rest) ← gparse rest
     let ")" :: rest := rest | Lean.Macro.throwError "expected )"
     return (← `(WgslExpr.GExpr.lt $c $(← ratTerm n d) $a $b), rest)
+  | "(" :: "scale" :: k :: rest => do
+    let (a, rest) ← gparse rest
+    let ")" :: rest := rest | Lean.Macro.throwError "expected )"
+    return (← `(WgslExpr.GExpr.scale $(← intTerm k) $a), rest)
   | "(" :: op :: rest => do
     let mut args : Array Lean.Term := #[]
     let mut rest := rest

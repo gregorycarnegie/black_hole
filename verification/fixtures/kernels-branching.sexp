@@ -496,3 +496,8 @@ atan2_arith:let (lt2 (in 1000000) (in 1000001) (sub (c 13176795 8388608) (in 100
 atan2_arith:let (lt (in 1) 0 1 (sub (c 13176795 4194304) (in 1000008)) (in 1000008))
 atan2_arith:let (lt (in 0) 0 1 (neg (in 1000009)) (in 1000009))
 atan2_arith (lt (neg (in 1000002)) 0 1 (in 1000010) (c 0 1))
+kerr_radius:let (sub (add (add (mul (in 0) (in 0)) (mul (in 1) (in 1))) (mul (in 2) (in 2))) (add (add (mul (in 3) (in 3)) (mul (in 4) (in 4))) (mul (in 5) (in 5))))
+kerr_radius:let (add (add (mul (in 3) (in 0)) (mul (in 4) (in 1))) (mul (in 5) (in 2)))
+kerr_radius:let (sqrt (add (mul (in 1000000) (in 1000000)) (mul (scale 2 (in 1000001)) (in 1000001))))
+kerr_radius:let (lt (in 1000000) 0 1 (div (mul (scale 1 (in 1000001)) (in 1000001)) (max (sub (in 1000002) (in 1000000)) (c 1547425 154742504910672534362390528))) (scale -1 (add (in 1000000) (in 1000002))))
+kerr_radius (sqrt (max (in 1000003) (c 2305843 2305843009213693952)))

@@ -243,6 +243,12 @@ impl Parser<'_> {
                 let c = self.rational(s);
                 s.div(a, c)
             }
+            "scale" => {
+                let k: i32 = self.next().parse().unwrap();
+                let a = self.expr(s);
+                let c = s.dyadic(1, k);
+                s.mul(c, a)
+            }
             "lt" => {
                 let a = self.expr(s);
                 let t = self.rational(s);
@@ -1431,6 +1437,14 @@ fn warped_setup(s: &mut Store, cx: &Ctx) -> Env {
     plasma_setup(s, cx, 3)
 }
 
+/// `kerr_radius(x, a)` with `x` inputs 0–2 and `a` inputs 3–5.
+fn kerr_radius_setup(s: &mut Store, _: &Ctx) -> Env {
+    Env {
+        args: vec![vector(s, 0, 3), vector(s, 3, 3)],
+        ..Env::default()
+    }
+}
+
 /// `atan2_arith(y, x)` with `y` input 0 and `x` input 1.
 fn atan2_setup(s: &mut Store, _: &Ctx) -> Env {
     Env {
@@ -1489,6 +1503,7 @@ impl Stage {
 #[case::plasma_slim("sample_plasma.2", slim_setup as Setup)]
 #[case::plasma_warped("sample_plasma.3", warped_setup as Setup)]
 #[case::atan2_arith("atan2_arith", atan2_setup as Setup)]
+#[case::kerr_radius("kerr_radius", kerr_radius_setup as Setup)]
 fn naga_ir_matches_lean_model(
     #[case] model: &str,
     #[case] setup: Setup,
@@ -1529,6 +1544,8 @@ fn fixture_lists_the_checked_kernels() {
         ("atan_poly", 1),
         ("geodesic_rhs", 11),
         ("heatmap_color", 3),
+        ("kerr_radius", 1),
+        ("kerr_radius:let", 4),
         ("polarization_color", 3),
         ("sample_plasma.0", 12),
         ("sample_plasma.0:let", 78),
