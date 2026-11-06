@@ -61,4 +61,133 @@ theorem tonemap_error_all (v w E : ℕ → ℝ) (hw : ∀ k, |w k-v k| ≤ E k) 
     (hy : tonemap.Computes w y) : |y-tonemap.exact v| ≤ tonemap.bound v E :=
   tonemap_error v w E hw y (tonemap_safe v E ((abs_nonneg _).trans (hw 0)) hE) hy
 
+/-! ### Branch changes
+
+Exact evaluation is itself an admissible WGSL computation (`computes_exact`),
+so any bound that holds for every input within its error allowance is at
+least half the variation of the exact kernel over that box
+(`bound_ge_half_variation`). Near a branch threshold the variation includes
+the jump between the branches: at `polarization_color`'s intensity threshold
+no valid bound is smaller than half the hue it switches off
+(`polarization_branch_change`). The `Safe` conditions exclude exactly such
+neighbourhoods of thresholds, denominators and roots, and give the matching
+bounds elsewhere. -/
+
+/-- Programs without the hand-modeled `sincos` primitives or quadrant
+selection, whose exact evaluation is admissible. -/
+def Plain : GExpr → Prop
+  | .input _ => True
+  | .const _ => True
+  | .add a b => Plain a ∧ Plain b
+  | .sub a b => Plain a ∧ Plain b
+  | .mul a b => Plain a ∧ Plain b
+  | .div a b => Plain a ∧ Plain b
+  | .max a b => Plain a ∧ Plain b
+  | .min a b => Plain a ∧ Plain b
+  | .neg a => Plain a
+  | .sqrt a => Plain a
+  | .abs a => Plain a
+  | .invsqrt a => Plain a
+  | .exp a => Plain a
+  | .exp2 a => Plain a
+  | .log a => Plain a
+  | .log2 a => Plain a
+  | .scale _ a => Plain a
+  | .round a => Plain a
+  | .inh f a => Plain f ∧ Plain a
+  | .tanh _ a => Plain a
+  | .lt c _ a b => Plain c ∧ Plain a ∧ Plain b
+  | .lt2 a b x y => Plain a ∧ Plain b ∧ Plain x ∧ Plain y
+  | .sinS _ => False
+  | .cosS _ => False
+  | .qsel _ _ _ _ => False
+
+lemma rnd_self (x : ℝ) : Rnd x x := by
+  unfold Rnd; have := η_pos; have := u_pos; simp; positivity
+
+lemma ulp_nonneg (z : ℝ) : 0 ≤ ulp z := by unfold ulp; have := η_pos; have := u_pos; positivity
+
+/-- Exact evaluation is an admissible WGSL computation. -/
+theorem computes_exact (w : ℕ → ℝ) : ∀ e : GExpr, Plain e → e.Computes w (e.exact w)
+  | .input _, _ => rfl
+  | .const _, _ => rfl
+  | .add a b, ⟨ha,hb⟩ => ⟨_,_,computes_exact w a ha,computes_exact w b hb,rnd_self _⟩
+  | .sub a b, ⟨ha,hb⟩ => ⟨_,_,computes_exact w a ha,computes_exact w b hb,rnd_self _⟩
+  | .mul a b, ⟨ha,hb⟩ => ⟨_,_,computes_exact w a ha,computes_exact w b hb,rnd_self _⟩
+  | .div a b, ⟨ha,hb⟩ => ⟨_,_,computes_exact w a ha,computes_exact w b hb,fun _ => by
+      unfold Wgsl.Div; have := η_pos; have := u_pos; simp only [exact,sub_self,abs_zero]; positivity⟩
+  | .max a b, ⟨ha,hb⟩ => ⟨_,_,computes_exact w a ha,computes_exact w b hb,rfl⟩
+  | .min a b, ⟨ha,hb⟩ => ⟨_,_,computes_exact w a ha,computes_exact w b hb,rfl⟩
+  | .neg a, ha => ⟨_,computes_exact w a ha,rfl⟩
+  | .sqrt a, ha => ⟨_,computes_exact w a ha,by
+      have := η_pos; have := u_pos; simp only [exact,sub_self,abs_zero]; positivity⟩
+  | .abs a, ha => ⟨_,computes_exact w a ha,rfl⟩
+  | .invsqrt a, ha => ⟨_,computes_exact w a ha,by
+      unfold InvSqrt; have := u_pos; simp only [exact,sub_self,abs_zero]; positivity⟩
+  | .exp a, ha => ⟨_,computes_exact w a ha,by
+      simp only [exact,sub_self,abs_zero]; have := ulp_nonneg (Real.exp (exact w a)); positivity⟩
+  | .exp2 a, ha => ⟨_,computes_exact w a ha,by
+      simp only [exact,sub_self,abs_zero]; have := ulp_nonneg (exp2R (exact w a)); positivity⟩
+  | .log a, ha => ⟨_,computes_exact w a ha,by
+      simp only [exact,sub_self,abs_zero]; have := ulp_nonneg (Real.log (exact w a)); positivity⟩
+  | .log2 a, ha => ⟨_,computes_exact w a ha,by
+      simp only [exact,sub_self,abs_zero]; have := ulp_nonneg (log2R (exact w a)); positivity⟩
+  | .scale k a, ha => ⟨_,computes_exact w a ha,by
+      have := η_pos; simp only [exact,sub_self,abs_zero]; positivity⟩
+  | .round a, ha => ⟨_,computes_exact w a ha,⟨_,rfl⟩,by
+      rw [abs_sub_comm]; exact abs_sub_round _⟩
+  | .inh f a, ⟨hf,ha⟩ => ⟨_,computes_exact w a ha,computes_exact _ f hf⟩
+  | .tanh f a, ha => ⟨_,computes_exact w a ha,Or.inl (by simp [exact])⟩
+  | .lt c t a b, ⟨hc,ha,hb⟩ => by
+    refine ⟨_,computes_exact w c hc,?_⟩
+    by_cases h : exact w c < (t : ℝ)
+    · exact Or.inl ⟨h,by simpa only [exact,h,↓reduceIte] using computes_exact w a ha⟩
+    · exact Or.inr ⟨h,by simpa only [exact,h,↓reduceIte] using computes_exact w b hb⟩
+  | .lt2 a b x y, ⟨ha,hb,hx,hy⟩ => by
+    refine ⟨_,_,computes_exact w a ha,computes_exact w b hb,?_⟩
+    by_cases h : exact w a < exact w b
+    · exact Or.inl ⟨h,by simpa only [exact,h,↓reduceIte] using computes_exact w x hx⟩
+    · exact Or.inr ⟨h,by simpa only [exact,h,↓reduceIte] using computes_exact w y hy⟩
+
+/-- A bound valid for every input within its error allowance is at least half
+the variation of the exact kernel between any two such inputs. -/
+theorem bound_ge_half_variation (e : GExpr) (he : Plain e) (v E : ℕ → ℝ) (B : ℝ)
+    (hB : ∀ w : ℕ → ℝ, (∀ i, |w i-v i| ≤ E i) → ∀ y, e.Computes w y → |y-e.exact v| ≤ B)
+    (w₁ w₂ : ℕ → ℝ) (h₁ : ∀ i, |w₁ i-v i| ≤ E i) (h₂ : ∀ i, |w₂ i-v i| ≤ E i) :
+    |e.exact w₁-e.exact w₂| ≤ 2*B := by
+  have a := hB w₁ h₁ _ (computes_exact w₁ e he)
+  have b := hB w₂ h₂ _ (computes_exact w₂ e he)
+  have := abs_sub_le (e.exact w₁) (e.exact v) (e.exact w₂)
+  rw [abs_sub_comm (e.exact v)] at this
+  linarith
+
+theorem polarization_plain (k : Fin 3) : Plain (polarizationHue k) := by
+  fin_cases k <;> simp [Plain,polarizationHue,clamp,c]
+
+/-- Near `polarization_color`'s intensity threshold `I = 10⁻⁸`, no bound valid
+for every admissible input is smaller than half the hue at an intensity just
+above the threshold: the hue view switches between that hue and zero. -/
+theorem polarization_branch_change (k : Fin 3) (v E : ℕ → ℝ) (hE : ∀ i, 0 ≤ E i)
+    (hnear : |v 0-(L1em8 : ℝ)| < E 0) (B : ℝ)
+    (hB : ∀ w : ℕ → ℝ, (∀ i, |w i-v i| ≤ E i) → ∀ y, (polarizationHue k).Computes w y →
+      |y-(polarizationHue k).exact v| ≤ B) :
+    |(polarizationHue k).exact (Function.update v 0 (v 0+E 0))| ≤ 2*B := by
+  have adm (d : ℝ) (hd : |d| ≤ E 0) : ∀ i, |Function.update v 0 (v 0+d) i-v i| ≤ E i := by
+    intro i
+    by_cases hi : i = 0
+    · subst hi; simpa using hd
+    · simp [Function.update_of_ne hi,hE i]
+  have h0 := abs_lt.mp hnear
+  have hE0 : 0 < E 0 := lt_of_le_of_lt (abs_nonneg _) hnear
+  have hv := bound_ge_half_variation _ (polarization_plain k) v E B hB _ _
+    (adm (E 0) (by rw [abs_of_pos hE0])) (adm (-E 0) (by rw [abs_neg,abs_of_pos hE0]))
+  have hz : (polarizationHue k).exact (Function.update v 0 (v 0+-E 0)) = 0 := by
+    have : ¬ -(v 0+-E 0) < -(L1em8 : ℝ) := by linarith
+    simp only [polarizationHue,exact,Function.update_self]
+    push_cast at this ⊢
+    simp only [this,↓reduceIte]
+    show ((0:ℚ):ℝ) = 0
+    simp
+  rwa [hz,sub_zero] at hv
+
 end BlackHole.WgslSafe
