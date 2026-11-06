@@ -297,12 +297,52 @@ fn lean(s: &mut Store, fixture: &Fixture, name: &str, rename: &dyn Fn(u32) -> u3
 fn compare(s: &Store, computed: &[Id], lean: &[Id], name: &str) {
     assert_eq!(computed.len(), lean.len(), "{name}: output count");
     for (i, (&a, &b)) in computed.iter().zip(lean).enumerate() {
-        assert!(
-            a == b,
-            "naga IR differs from the Lean model at {name}.{i}:\n  naga: {}\n  lean: {}",
-            s.show(a, 4),
-            s.show(b, 4)
-        );
+        if a != b {
+            let (x, y) = first_difference(s, a, b);
+            panic!(
+                "naga IR differs from the Lean model at {name}.{i}:\n  naga: {}\n  lean: {}",
+                s.show(x, 5),
+                s.show(y, 5)
+            );
+        }
+    }
+}
+
+/// The innermost pair of differing nodes along matching structure.
+fn first_difference(s: &Store, a: Id, b: Id) -> (Id, Id) {
+    let kids = |t: Id| -> Option<(std::mem::Discriminant<Node>, String, Vec<Id>)> {
+        let n = &s.nodes[t as usize];
+        let (name, cs) = match n {
+            Node::Add(cs) | Node::Mul(cs) => (String::new(), cs.clone()),
+            Node::F(f, cs) => (f.clone(), cs.clone()),
+            Node::Sel(cs) => (String::new(), cs.to_vec()),
+            Node::Sub(x, y) | Node::Div(x, y) => (String::new(), vec![*x, *y]),
+            Node::Neg(x) => (String::new(), vec![*x]),
+            _ => return None,
+        };
+        Some((std::mem::discriminant(n), name, cs))
+    };
+    match (kids(a), kids(b)) {
+        (Some((ka, na, ca)), Some((kb, nb, cb)))
+            if ka == kb && na == nb && ca.len() == cb.len() =>
+        {
+            let sorted = matches!(s.nodes[a as usize], Node::Add(_) | Node::Mul(_))
+                || na == "max"
+                || na == "min";
+            let pair = if sorted {
+                // Operands are sorted by node, so pair what the two sides do not share.
+                let only_a: Vec<Id> = ca.iter().copied().filter(|x| !cb.contains(x)).collect();
+                let only_b: Vec<Id> = cb.iter().copied().filter(|y| !ca.contains(y)).collect();
+                only_a.first().copied().zip(only_b.first().copied())
+            } else {
+                ca.into_iter().zip(cb).find(|(x, y)| x != y)
+            };
+            match pair {
+                Some((x, y)) => first_difference(s, x, y),
+                None => (a, b),
+            }
+        }
+        _ => (a, b),
     }
 }
 
@@ -362,6 +402,8 @@ enum Value {
     /// Structs and arrays.
     Struct(Vec<Value>),
     Int(i64),
+    /// Integer vectors, such as the loop counter naga's SPIR-V writer adds.
+    Ints(Vec<i64>),
     Bool(Cond),
     /// A flag the Lean models do not track (`Metric.valid`).
     Unknown,
@@ -394,8 +436,8 @@ impl Value {
             Value::Vector(v) => out.extend(v),
             Value::Matrix(cols) => cols.into_iter().for_each(|c| out.extend(c)),
             Value::Struct(fields) => fields.into_iter().for_each(|f| f.flatten(out)),
-            Value::Bool(_) | Value::Unknown => {}
-            Value::Int(i) => panic!("integer output {i}"),
+            // Flags, including booleans the SPIR-V reader stores as integers.
+            Value::Bool(_) | Value::Unknown | Value::Int(_) | Value::Ints(_) => {}
         }
     }
     fn get(&self, path: &[usize]) -> Value {
@@ -406,6 +448,7 @@ impl Value {
             Value::Struct(f) => f[i].get(rest),
             Value::Matrix(m) => Value::Vector(m[i].clone()).get(rest),
             Value::Vector(v) if rest.is_empty() => Value::Scalar(v[i]),
+            Value::Ints(v) if rest.is_empty() => Value::Int(v[i]),
             v => panic!("path {path:?} into {v:?}"),
         }
     }
@@ -425,6 +468,7 @@ impl Value {
                 m[i] = c;
             }
             Value::Vector(v) if rest.is_empty() => v[i] = new.scalar(),
+            Value::Ints(v) if rest.is_empty() => v[i] = new.int(),
             v => panic!("path {path:?} into {v:?}"),
         }
     }
@@ -440,6 +484,13 @@ fn select_value(s: &mut Store, cond: &Cond, a: Value, b: Value) -> Value {
     };
     match (a, b) {
         (a, b) if a == b => a,
+        (a, b) if matches!(cond, Cond::Const(_)) => {
+            if *cond == Cond::Const(true) {
+                a
+            } else {
+                b
+            }
+        }
         (Scalar(x), Scalar(y)) => Scalar(select(s, cond, x, y)),
         (Vector(x), Vector(y)) => Vector(pick(s, x, y)),
         (Matrix(x), Matrix(y)) => {
@@ -469,6 +520,9 @@ fn zero(s: &mut Store, module: &Module, ty: Handle<naga::Type>) -> Value {
             ScalarKind::Bool => Value::Bool(Cond::Const(false)),
             _ => Value::Int(0),
         },
+        TypeInner::Vector { size, scalar } if scalar.kind != ScalarKind::Float => {
+            Value::Ints(vec![0; *size as usize])
+        }
         TypeInner::Vector { size, .. } => Value::Vector(vec![z; *size as usize]),
         TypeInner::Matrix { columns, rows, .. } => {
             Value::Matrix(vec![vec![z; *rows as usize]; *columns as usize])
@@ -513,8 +567,16 @@ fn binary(s: &mut Store, op: BinaryOperator, a: Value, b: Value) -> Value {
         (B::Add, Int(x), Int(y)) => Int(x + y),
         (B::Subtract, Int(x), Int(y)) => Int(x - y),
         (B::Less, Int(x), Int(y)) => Bool(Cond::Const(x < y)),
+        (B::LessEqual, Int(x), Int(y)) => Bool(Cond::Const(x <= y)),
+        (B::Greater, Int(x), Int(y)) => Bool(Cond::Const(x > y)),
+        (B::GreaterEqual, Int(x), Int(y)) => Bool(Cond::Const(x >= y)),
         (B::Equal, Int(x), Int(y)) => Bool(Cond::Const(x == y)),
         (B::NotEqual, Int(x), Int(y)) => Bool(Cond::Const(x != y)),
+        // Lane-wise integer equality, as 0/1 lanes for `all`/`any`.
+        (B::Equal, Ints(x), Ints(y)) => {
+            Ints(x.iter().zip(&y).map(|(a, b)| i64::from(a == b)).collect())
+        }
+        (B::Subtract, Ints(x), Ints(y)) => Ints(x.iter().zip(&y).map(|(a, b)| a - b).collect()),
         (B::LogicalAnd | B::LogicalOr, Unknown, _) | (B::LogicalAnd | B::LogicalOr, _, Unknown) => {
             Unknown
         }
@@ -554,6 +616,11 @@ fn binary(s: &mut Store, op: BinaryOperator, a: Value, b: Value) -> Value {
                     x.into_iter()
                         .zip(y)
                         .map(|(a, b)| a.into_iter().zip(b).map(|(x, y)| node(s, x, y)).collect())
+                        .collect(),
+                ),
+                (Matrix(m), Scalar(k)) => Matrix(
+                    m.into_iter()
+                        .map(|c| c.into_iter().map(|y| node(s, y, k)).collect())
                         .collect(),
                 ),
                 (Scalar(k), Matrix(m)) => Matrix(
@@ -690,6 +757,9 @@ fn common(
         Expression::Compose { ty, components } => {
             let parts: Vec<Value> = components.iter().map(|c| sub(s, *c)).collect();
             match &module.types[*ty].inner {
+                TypeInner::Vector { scalar, .. } if scalar.kind != ScalarKind::Float => {
+                    Value::Ints(parts.into_iter().map(Value::int).collect())
+                }
                 TypeInner::Vector { .. } => {
                     let mut v = Vec::new();
                     parts.into_iter().for_each(|p| p.flatten(&mut v));
@@ -762,6 +832,16 @@ fn common(
                 .collect();
             math(s, *fun, args)
         }
+        // `all`/`any` only feed flags here; a branch on them that changed a
+        // computed value would fail as an untracked-flag branch.
+        Expression::Relational { fun, argument } => match sub(s, *argument) {
+            Value::Bool(Cond::Const(b)) => Value::Bool(Cond::Const(b)),
+            Value::Ints(lanes) => Value::Bool(Cond::Const(match fun {
+                naga::RelationalFunction::All => lanes.iter().all(|&l| l != 0),
+                _ => lanes.iter().any(|&l| l != 0),
+            })),
+            _ => Value::Unknown,
+        },
         Expression::Select {
             condition,
             accept,
@@ -792,9 +872,9 @@ struct Env {
     globals: HashMap<String, Value>,
     /// Calls whose results the Lean model reads as inputs or primitives.
     opaque_calls: HashMap<&'static str, Primitive>,
-    /// `let` values the Lean model reads as inputs: the computed value must
-    /// equal the expected expressions, and is then replaced.
-    lets: HashMap<&'static str, (Vec<Id>, Value)>,
+    /// Values the Lean model reads as inputs: a computed value equal to the
+    /// expected expressions is replaced, and each must be found.
+    lets: Vec<(Vec<Id>, Value, std::cell::Cell<bool>)>,
     /// Values the model assumes positive; the other branch is outside it.
     positive: Vec<Id>,
 }
@@ -875,13 +955,15 @@ impl<'a> Frame<'a> {
         // A loop re-emits its body's expressions; each iteration recomputes them.
         self.emitted.remove(&h);
         let mut v = self.eval(s, h);
-        let name = self.func.named_expressions.get(&h).map(String::as_str);
-        let check = name.filter(|_| self.top).and_then(|n| self.env.lets.get(n));
-        if let Some((expected, replacement)) = check {
+        if self.top && matches!(v, Value::Vector(_) | Value::Scalar(_)) {
             let mut computed = Vec::new();
-            v.flatten(&mut computed);
-            compare(s, &computed, expected, name.unwrap());
-            v = replacement.clone();
+            v.clone().flatten(&mut computed);
+            if let Some((_, replacement, found)) =
+                self.env.lets.iter().find(|(e, _, _)| *e == computed)
+            {
+                found.set(true);
+                v = replacement.clone();
+            }
         }
         self.emitted.insert(h, v);
     }
@@ -955,7 +1037,7 @@ impl<'a> Frame<'a> {
         let (fa, fb) = (self.straight(s, accept), other.straight(s, reject));
         assert!(
             matches!((fa, fb), (Flow::Next, Flow::Next)),
-            "loop exit inside a branch on a computed value"
+            "loop exit inside a branch on {c:?}"
         );
         for (l, v) in std::mem::take(&mut self.locals) {
             let w = other.locals.remove(&l).unwrap();
@@ -1153,7 +1235,14 @@ fn global_record(
         .iter()
         .find(|(_, g)| g.name.as_deref() == Some(name))
         .unwrap_or_else(|| panic!("no global {name}"));
-    (name.to_string(), record(s, module, var.ty, fields))
+    // naga's SPIR-V writer wraps a uniform struct in a one-member block.
+    let value = match &module.types[var.ty].inner {
+        TypeInner::Struct { members, .. } if members.len() == 1 && members[0].name.is_none() => {
+            Value::Struct(vec![record(s, module, members[0].ty, fields)])
+        }
+        _ => record(s, module, var.ty, fields),
+    };
+    (name.to_string(), value)
 }
 
 fn function<'m>(module: &'m Module, name: &str) -> &'m naga::Function {
@@ -1258,7 +1347,7 @@ fn add_kerr_setup(s: &mut Store, cx: &Ctx) -> Env {
             "kerr_radius",
             (|s: &mut Store, _| scalar(s, 7)) as Primitive,
         )]),
-        lets: HashMap::from([("a", (spin_scale, a))]),
+        lets: vec![(spin_scale, a, Default::default())],
         positive: vec![mass],
         ..Env::default()
     }
@@ -1352,6 +1441,40 @@ fn atan2_setup(s: &mut Store, _: &Ctx) -> Env {
 
 type Setup = fn(&mut Store, &Ctx) -> Env;
 
+/// Where the compared IR comes from: naga's WGSL front end, or the SPIR-V
+/// that naga's backend writes from it, read back by naga's SPIR-V front end.
+/// The second checks the SPIR-V backend for these kernels, trusting only the
+/// independent SPIR-V reader.
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    Wgsl,
+    Spirv,
+}
+
+impl Stage {
+    fn module(self) -> Module {
+        let source = common::compile_wesl(include_str!("../assets/shaders/geodesic.wesl"));
+        let module = naga::front::wgsl::parse_str(&source).expect("geodesic.wesl parses");
+        if let Stage::Wgsl = self {
+            return module;
+        }
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("geodesic.wesl validates");
+        let options = naga::back::spv::Options {
+            flags: naga::back::spv::WriterFlags::DEBUG,
+            ..Default::default()
+        };
+        let words = naga::back::spv::write_vec(&module, &info, &options, None).expect("SPIR-V");
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        naga::front::spv::parse_u8_slice(&bytes, &naga::front::spv::Options::default())
+            .expect("naga reads its SPIR-V")
+    }
+}
+
 #[rstest::rstest]
 #[case::geodesic_rhs("geodesic_rhs", geodesic_rhs_setup as Setup)]
 #[case::atan_poly("atan_poly", scalar_setup as Setup)]
@@ -1366,10 +1489,13 @@ type Setup = fn(&mut Store, &Ctx) -> Env;
 #[case::plasma_slim("sample_plasma.2", slim_setup as Setup)]
 #[case::plasma_warped("sample_plasma.3", warped_setup as Setup)]
 #[case::atan2_arith("atan2_arith", atan2_setup as Setup)]
-fn naga_ir_matches_lean_model(#[case] model: &str, #[case] setup: Setup) {
+fn naga_ir_matches_lean_model(
+    #[case] model: &str,
+    #[case] setup: Setup,
+    #[values(Stage::Wgsl, Stage::Spirv)] stage: Stage,
+) {
     let name = model.split('.').next().unwrap();
-    let source = common::compile_wesl(include_str!("../assets/shaders/geodesic.wesl"));
-    let module = naga::front::wgsl::parse_str(&source).expect("geodesic.wesl parses");
+    let module = stage.module();
     let func = function(&module, name);
     let fixture = fixture();
     let cx = Ctx {
@@ -1381,6 +1507,10 @@ fn naga_ir_matches_lean_model(#[case] model: &str, #[case] setup: Setup) {
     let env = setup(&mut s, &cx);
     let mut out = Vec::new();
     run(&mut s, &module, func, env.args.clone(), &env, true).flatten(&mut out);
+    assert!(
+        env.lets.iter().all(|(_, _, found)| found.get()),
+        "{model}: a value the model reads as an input was not computed"
+    );
     let expected = lean(&mut s, &fixture, model, &|i| i);
     compare(&s, &out, &expected, model);
 }

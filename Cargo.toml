@@ -12,7 +12,7 @@ num-bigint = "0.5.1"
 num-rational = "0.4.2"
 mutants = "0.0.4"
 # Reuse Bevy's WESL compiler and shader validator for offline regression checks.
-naga = { version = "30.0.1", features = ["wgsl-in"] }
+naga = { version = "30.0.1", features = ["wgsl-in", "spv-in", "spv-out"] }
 proptest = "1.12.0"
 rstest = "0.28.0"
 wesl = "0.6.0"

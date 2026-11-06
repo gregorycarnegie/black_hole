@@ -4,6 +4,7 @@
 
 ### Added
 
+- The translation-validation test also checks naga's SPIR-V backend for every compared kernel, by reading the written SPIR-V back with naga's SPIR-V front end. A GPU test checks the proved `geodesic_rhs` error bound on the driver, with exact values taken from the Lean fixture.
 - Unconditional WGSL error bounds for `heatmap_color` (every input) and `tonemap` (input error at most 1/10): their safety conditions are now proved instead of assumed.
 - Translation validation of the naga front end for `geodesic_rhs`, `atan_poly`, `tonemap`, `heatmap_color`, the polarization hue, `spatial_unit`, `screen_frame`, `sample_plasma` (all disk models), `atan2_arith` (linked to its 128u bound) and `add_kerr`: a Rust test symbolically executes naga's IR, including branches and loops, and compares it with fixtures that Lean proves equal to the modeled kernels. It corrected two models: `geodesic_rhs` had `-0.5*(m.inv*x)` where the shader computes `(-0.5*m.inv)*x`, `heatmap_color` channel 0 subtracted zero, and `add_kerr` associated `2h·ell_i·ell_j` differently from `outer`.
 - Skybox, polarization hue and warped-disk shading no longer call `atan2`, `acos` or `cos`, whose WGSL accuracy is unspecified on inputs these paths reach. The skybox uses an arithmetic `atan2_arith` with a proved 128u bound and a GPU accuracy test.
