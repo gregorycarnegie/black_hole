@@ -3,7 +3,6 @@ module
 public import BlackHole.WgslGeodesic
 public import BlackHole.WgslAtan2
 public import BlackHole.WgslPlasma
-public import BlackHole.WgslScreen
 public import BlackHole.WgslAddKerr
 
 /-! Translation-validation fixture for the straight-line kernels (obligation
@@ -118,6 +117,15 @@ def addKerrOutputs : List WgslAddKerr.Output :=
   columns .metric ++ columns .inverse ++
     (List.finRange 3).flatMap (fun e => columns (.derivative e)) ++ [.clearance]
 
+/-- A model written with `let` slots (`WgslLets`): its slots under
+`name:let`, then its outputs under `name`. -/
+def slotProgram (name : String) (slots outputs : List WgslExpr.GExpr) :
+    List (String × WgslExpr.GExpr) :=
+  slots.map (fun e => (name ++ ":let", e)) ++ outputs.map fun e => (name, e)
+
+/-- The twelve `Plasma` fields over the plasma slots. -/
+def plasmaOutputs : List WgslExpr.GExpr := List.ofFn WgslPlasma.plasmaOut
+
 open WgslExpr in
 /-- The branching kernel outputs the fixture records, in order. `tonemap` is
 recorded once per channel; `spatial_unit` reads `v` from inputs 100–102. -/
@@ -134,7 +142,14 @@ def branching : List (String × WgslExpr.GExpr) :=
     ("spatial_unit", WgslScreen.spatialUnit (fun j => GExpr.input (100+j)) 2),
     ("spin_scale", WgslAddKerr.spinScale 0), ("spin_scale", WgslAddKerr.spinScale 1),
     ("spin_scale", WgslAddKerr.spinScale 2)] ++
-  addKerrOutputs.map fun o => ("add_kerr", WgslAddKerr.program o)
+  addKerrOutputs.map (fun o => ("add_kerr", WgslAddKerr.program o)) ++
+  slotProgram "screen_frame" WgslScreen.frameLets
+    ((List.finRange 3).flatMap fun col => (List.finRange 3).map fun i =>
+      WgslLets.ref (WgslScreen.frameSlot col i)) ++
+  slotProgram "sample_plasma.0" (WgslPlasma.plasmaLets 0) plasmaOutputs ++
+  slotProgram "sample_plasma.1" (WgslPlasma.plasmaLets 1) plasmaOutputs ++
+  slotProgram "sample_plasma.2" (WgslPlasma.plasmaLets 2) plasmaOutputs ++
+  slotProgram "sample_plasma.3" (WgslPlasma.plasmaLets 3) plasmaOutputs
 
 def gsexp : WgslExpr.GExpr → String
   | .input i => s!"(in {i})"

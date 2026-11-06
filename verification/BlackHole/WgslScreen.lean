@@ -1,6 +1,6 @@
 module
 
-public import BlackHole.WgslExpr
+public import BlackHole.WgslLets
 
 /-! All-input WGSL error bounds for `spatial_unit` and `screen_frame` in
 `geodesic.wesl` (obligation F2).
@@ -34,7 +34,7 @@ their own errors, and that the inverse-square-root argument stays positive. -/
 noncomputable section
 
 namespace BlackHole.WgslScreen
-open Wgsl WgslExpr GExpr
+open Wgsl WgslExpr GExpr WgslLets
 
 def f32_1em20 : ℚ := 1547425/154742504910672534362390528
 
@@ -60,19 +60,32 @@ def spatialUnit (v : Fin 3 → GExpr) (i : Fin 3) : GExpr :=
 
 def k (i : Fin 4) : GExpr := sum4 fun j => mul (inv i j) (p j)
 def shift (i : Fin 3) : GExpr := div (neg (inv i.succ 0)) (inv 0 0)
-def nVec : Fin 3 → GExpr := spatialUnit fun i => add (k i.succ) (mul (shift i) (k 0))
 def fVec (i : Fin 3) : GExpr := sub (scr i.succ) (mul (k i.succ) (div (scr 0) (k 0)))
-def e1 : Fin 3 → GExpr :=
-  spatialUnit fun i => sub (fVec i) (mul (nVec i) (dot3 nVec (gammaMul fVec)))
 def cross (u v : Fin 3 → GExpr) : Fin 3 → GExpr :=
   ![sub (mul (u 1) (v 2)) (mul (u 2) (v 1)),
     sub (mul (u 2) (v 0)) (mul (u 0) (v 2)),
     sub (mul (u 0) (v 1)) (mul (u 1) (v 0))]
-def e2 : Fin 3 → GExpr := spatialUnit (cross (gammaMul nVec) (gammaMul e1))
+
+/-- Three consecutive `let` slots from `k` on, as a vector. -/
+def refs (k : ℕ) (i : Fin 3) : GExpr := ref (k+i)
+
+/-- `screen_frame` as `let` slots (`WgslLets`): the argument of `n` 0–2, `n`
+3–5, `f` 6–8, the argument of `e1` 9–11, `e1` 12–14, the argument of `e2`
+15–17 and `e2` 18–20. -/
+def frameLets : List GExpr :=
+  List.ofFn (fun i : Fin 3 => add (k i.succ) (mul (shift i) (k 0))) ++
+  List.ofFn (spatialUnit (refs 0)) ++
+  List.ofFn fVec ++
+  List.ofFn (fun i : Fin 3 => sub (refs 6 i) (mul (refs 3 i) (dot3 (refs 3) (gammaMul (refs 6))))) ++
+  List.ofFn (spatialUnit (refs 9)) ++
+  List.ofFn (cross (gammaMul (refs 3)) (gammaMul (refs 12))) ++
+  List.ofFn (spatialUnit (refs 15))
+
+/-- The slot holding frame column `col` (`e1`, `e2`, `n`), component `i`. -/
+def frameSlot (col i : Fin 3) : ℕ := (if col = 0 then 12 else if col = 1 then 18 else 3)+i
 
 /-- The three frame columns `e1`, `e2`, `n`. -/
-def frame (col : Fin 3) (i : Fin 3) : GExpr :=
-  if col = 0 then e1 i else if col = 1 then e2 i else nVec i
+def frame (col : Fin 3) (i : Fin 3) : GExpr := withLets frameLets (ref (frameSlot col i))
 
 theorem screen_frame_error (v w E : ℕ → ℝ) (hw : ∀ i, |w i-v i| ≤ E i) (col i : Fin 3) (y : ℝ)
     (hs : (frame col i).Safe v E) (hy : (frame col i).Computes w y) :

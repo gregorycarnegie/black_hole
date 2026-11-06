@@ -30,7 +30,7 @@ for the warped model `r_bp` 53, `tilt_deg` 54, `twist_deg` 55. -/
 noncomputable section
 
 namespace BlackHole.WgslPlasma
-open Wgsl WgslExpr GExpr WgslScreen
+open Wgsl WgslExpr GExpr WgslScreen WgslLets
 
 /-! ### Literals (binary32 values) -/
 
@@ -174,70 +174,110 @@ def hotEmissivity (r : GExpr) : GExpr :=
 /-- The twelve `Plasma` fields: rgb 0–2, j 3–6, alpha 7, rho 8–10, energy 11. -/
 def mid (model : Fin 4) (r : GExpr) : GExpr := if model = 3 then midplane r else c 0
 
-def body (model : Fin 4) (o : Fin 12) : GExpr :=
-  let r := diskRadius
-  let hr := hOverR model r
-  let height := max (mul hr r) (c L1em4)
-  let z := div (sub (pos 1) (mid model r)) height
-  let density := div (mul (mul (c L0_4) (exp (mul (mul (c (-1/2)) z) z))) (edgeFade r)) height
-  let kk : Fin 4 → GExpr := k
-  let omega := div (sub (c 1) (mul (c (1/2)) (clamp (mul hr (c 2)) (c 0) (c 1))))
-    (max (add (pow r (3/2)) spin) (c L1em3))
+/-- Slot `n` of the plasma program, after the 21 `screen_frame` slots. -/
+def P (n : ℕ) : GExpr := ref (21+n)
+def Pv (n : ℕ) (i : Fin 4) : GExpr := P (n+i)
+
+/-- `sample_plasma` as `let` slots (`WgslLets`) after `frameLets`: `r` 0,
+`h_r` 1, `height` 2, `z` 3, `density` 4, `omega` 5, the initial fluid 6–9,
+`norm` 10, `lapse` 11, `fluid` 12–15, `energy` 16, `redshift` 17,
+`freq_ratio` 18, `e1` 19–22, `e2` 23–26, `b` before and after normalization
+27–30 and 31–34, `bx` 35, `by` 36, `bparallel` 37, `perpendicular2` 38, the
+`evpa` denominator 39 and components 40–41, `hot` 42, `thermal` 43–45, `synch`
+46–48, `boost` 49, `rgb` 50–52, `intensity` 53, `synch_i` 54, `rotation` 55
+and `conversion` 56. -/
+def plasmaLets (model : Fin 4) : List GExpr :=
+  let r := P 0
+  let hr := P 1
+  let height := P 2
+  let z := P 3
+  let density := P 4
+  let omega := P 5
+  let fluid0 := Pv 6
+  let norm := P 10
+  let lapse := P 11
+  let fluid := Pv 12
+  let energy := P 16
+  let redshift := P 17
+  let freqRatio := P 18
   let tangent : Fin 3 → GExpr := ![pos 2,c 0,neg (pos 0)]
-  let fluid0 : Fin 4 → GExpr := ![c 1,mul omega (tangent 0),mul omega (tangent 1),mul omega (tangent 2)]
-  let norm := dot4 fluid0 (gMul fluid0)
-  let lapse := invsqrt (neg (inv 0 0))
-  let fluid : Fin 4 → GExpr := fun i =>
-    lt norm (-L1em4) (mul (fluid0 i) (invsqrt (neg norm))) (mul (neg lapse) (inv i 0))
-  let energy := max (dot4 p fluid) (c L1em5)
-  let redshift := clamp (div (c 1) energy) (c L0_01) (c 20)
-  let freqRatio := div (c 230) (max (div freq redshift) (c 1))
-  let e1v : Fin 4 → GExpr := Fin.cases (c 0) (frame 0)
-  let e2v : Fin 4 → GExpr := Fin.cases (c 0) (frame 1)
-  let e1 : Fin 4 → GExpr := fun i => sub (e1v i) (mul (kk i) (div (dot4 e1v (gMul fluid)) energy))
-  let e2 : Fin 4 → GExpr := fun i => sub (e2v i) (mul (kk i) (div (dot4 e2v (gMul fluid)) energy))
+  let e1v : Fin 4 → GExpr := Fin.cases (c 0) (fun i => ref (frameSlot 0 i))
+  let e2v : Fin 4 → GExpr := Fin.cases (c 0) (fun i => ref (frameSlot 1 i))
   let b0 : Fin 4 → GExpr := Fin.cases (c 0) (normalize tangent)
-  let b1 : Fin 4 → GExpr := fun i => add (b0 i) (mul (fluid i) (dot4 b0 (gMul fluid)))
-  let b : Fin 4 → GExpr := fun i => mul (b1 i) (invsqrt (max (dot4 b1 (gMul b1)) (c L1em12)))
-  let bx := dot4 b (gMul e1)
-  let by' := dot4 b (gMul e2)
-  let bpar := div (neg (dot4 b (gMul kk))) energy
-  let perp2 := clamp (add (mul bx bx) (mul by' by')) (c 0) (c 1)
-  let evpaDen := max (add (mul bx bx) (mul by' by')) (c L1em12)
-  let evpa : Fin 2 → GExpr := ![div (sub (mul by' by') (mul bx bx)) evpaDen,
-    div (mul (mul (c (-2)) bx) by') evpaDen]
-  let hot := if model = 1 then
+  let b1 := Pv 27
+  let b := Pv 31
+  let bx := P 35
+  let by' := P 36
+  let bpar := P 37
+  let perp2 := P 38
+  let evpaDen := P 39
+  let hot := P 42
+  let synch : Fin 3 → GExpr := fun i => P (46+i)
+  let boost := P 49
+  let rgb : Fin 3 → GExpr := fun i => P (50+i)
+  let tint : Fin 3 → ℚ := ![1,L0_65,L0_3]
+  let lum : Fin 3 → ℚ := ![L0_2126,L0_7152,L0_0722]
+  frameLets ++
+  [diskRadius,
+    hOverR model r,
+    max (mul hr r) (c L1em4),
+    div (sub (pos 1) (mid model r)) height,
+    div (mul (mul (c L0_4) (exp (mul (mul (c (-1/2)) z) z))) (edgeFade r)) height,
+    div (sub (c 1) (mul (c (1/2)) (clamp (mul hr (c 2)) (c 0) (c 1))))
+      (max (add (pow r (3/2)) spin) (c L1em3)),
+    c 1, mul omega (tangent 0), mul omega (tangent 1), mul omega (tangent 2),
+    dot4 fluid0 (gMul fluid0),
+    invsqrt (neg (inv 0 0))] ++
+  List.ofFn (fun i : Fin 4 =>
+    lt norm (-L1em4) (mul (fluid0 i) (invsqrt (neg norm))) (mul (neg lapse) (inv i 0))) ++
+  [max (dot4 p fluid) (c L1em5),
+    clamp (div (c 1) energy) (c L0_01) (c 20),
+    div (c 230) (max (div freq redshift) (c 1))] ++
+  List.ofFn (fun i : Fin 4 => sub (e1v i) (mul (k i) (div (dot4 e1v (gMul fluid)) energy))) ++
+  List.ofFn (fun i : Fin 4 => sub (e2v i) (mul (k i) (div (dot4 e2v (gMul fluid)) energy))) ++
+  List.ofFn (fun i : Fin 4 => add (b0 i) (mul (fluid i) (dot4 b0 (gMul fluid)))) ++
+  List.ofFn (fun i : Fin 4 => mul (b1 i) (invsqrt (max (dot4 b1 (gMul b1)) (c L1em12)))) ++
+  [dot4 b (gMul (Pv 19)),
+    dot4 b (gMul (Pv 23)),
+    div (neg (dot4 b (gMul k))) energy,
+    clamp (add (mul bx bx) (mul by' by')) (c 0) (c 1),
+    max (add (mul bx bx) (mul by' by')) (c L1em12),
+    div (sub (mul by' by') (mul bx bx)) evpaDen,
+    div (mul (mul (c (-2)) bx) by') evpaDen,
+    if model = 1 then
       mul (c (1/2)) (sub (c 1) (tanhW (clamp (div (log (div r (max rTrunc (c L1em3)))) (c L0_4))
         (c (-10)) (c 10))))
-    else c 0
-  let thermal : Fin 3 → GExpr := fun i => mul (sub (c 1) hot) (blackbody (div (ntTemp r) (c L0_488)) i)
-  let tint : Fin 3 → ℚ := ![1,L0_65,L0_3]
-  let synch : Fin 3 → GExpr := fun i =>
-    mul (mul (mul (mul hot (hotEmissivity r)) perp2) freqRatio) (c (tint i))
-  let boost := mul (mul redshift redshift) redshift
-  let rgb : Fin 3 → GExpr := fun i => mul (mul density boost) (add (thermal i) (synch i))
-  let lum : Fin 3 → ℚ := ![L0_2126,L0_7152,L0_0722]
-  let intensity := dot3 rgb (fun i => c (lum i))
-  let synchI := mul (mul density boost) (dot3 synch (fun i => c (lum i)))
-  let rotation := mul (mul (mul (mul (mul (c 2) faraday) density) bpar) freqRatio) freqRatio
-  let conv := mul (mul (mul conversion density) perp2) (pow freqRatio 3)
+    else c 0] ++
+  List.ofFn (fun i : Fin 3 => mul (sub (c 1) hot) (blackbody (div (ntTemp r) (c L0_488)) i)) ++
+  List.ofFn (fun i : Fin 3 =>
+    mul (mul (mul (mul hot (hotEmissivity r)) perp2) freqRatio) (c (tint i))) ++
+  [mul (mul redshift redshift) redshift] ++
+  List.ofFn (fun i : Fin 3 => mul (mul density boost) (add (P (43+i)) (synch i))) ++
+  [dot3 rgb (fun i => c (lum i)),
+    mul (mul density boost) (dot3 synch (fun i => c (lum i))),
+    mul (mul (mul (mul (mul (c 2) faraday) density) bpar) freqRatio) freqRatio,
+    mul (mul (mul conversion density) perp2) (pow freqRatio 3)]
+
+/-- The twelve `Plasma` fields over the slots: rgb 0–2, j 3–6, alpha 7, rho
+8–10, energy 11. -/
+def bodyOut (o : Fin 12) : GExpr :=
   match o with
-  | 0 => rgb 0 | 1 => rgb 1 | 2 => rgb 2
-  | 3 => intensity
-  | 4 => mul (mul (c (3/4)) synchI) (evpa 0)
-  | 5 => mul (mul (c (3/4)) synchI) (evpa 1)
+  | 0 => P 50 | 1 => P 51 | 2 => P 52
+  | 3 => P 53
+  | 4 => mul (mul (c (3/4)) (P 54)) (P 40)
+  | 5 => mul (mul (c (3/4)) (P 54)) (P 41)
   | 6 => c 0
-  | 7 => mul (c L0_7) density
-  | 8 => mul conv (evpa 0)
-  | 9 => mul conv (evpa 1)
-  | 10 => rotation
-  | 11 => energy
+  | 7 => mul (c L0_7) (P 4)
+  | 8 => mul (P 56) (P 40)
+  | 9 => mul (P 56) (P 41)
+  | 10 => P 55
+  | 11 => P 16
 
 /-- The early returns: outside `(r1, r2)` or with `|z| ≥ 4`, every field is zero. -/
-def plasma (model : Fin 4) (o : Fin 12) : GExpr :=
-  let r := diskRadius
-  let z := div (sub (pos 1) (mid model r)) (max (mul (hOverR model r) r) (c L1em4))
-  lt2 r1 r (lt2 r r2 (lt (abs z) 4 (body model o) (c 0)) (c 0)) (c 0)
+def plasmaOut (o : Fin 12) : GExpr :=
+  lt2 r1 (P 0) (lt2 (P 0) r2 (lt (abs (P 3)) 4 (bodyOut o) (c 0)) (c 0)) (c 0)
+
+def plasma (model : Fin 4) (o : Fin 12) : GExpr := withLets (plasmaLets model) (plasmaOut o)
 
 theorem sample_plasma_error (model : Fin 4) (v w E : ℕ → ℝ) (hw : ∀ i, |w i-v i| ≤ E i)
     (o : Fin 12) (y : ℝ) (hs : (plasma model o).Safe v E) (hy : (plasma model o).Computes w y) :
