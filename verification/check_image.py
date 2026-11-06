@@ -1,9 +1,9 @@
 """Prepare matched camera rays and compare the GPU image to the pinned ipole image."""
 
 import argparse
-import json
 import hashlib
 import inspect
+import json
 from pathlib import Path
 
 import h5py

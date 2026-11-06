@@ -16,9 +16,9 @@ directly. The `atan2` argument of `disk_midplane_y` is computed but unused
 for these models.
 
 The warped model (3) uses `atan2(pos.z, pos.x)`. WGSL defines `atan2(y, x)`
-only for `|x| ∈ [2⁻¹²⁶, 2¹²⁶]` and normal `y`, so for `pos.z = 0` or tiny
-`pos.x` its value is unconstrained and no all-input bound can hold
-(`WgslCounterexamples`).
+only for `|x| ∈ [2⁻¹²⁶, 2¹²⁶]` and normal `y`. For `pos.z = 0` or tiny
+`pos.x`, a conforming result can be far from the exact angle, so the
+unchanged warped model has no useful bound there (`WgslCounterexamples`).
 
 Inputs: `g` 0–15, `inv` 16–31, `p` 32–35, screen 36–39, `pos` 40–42, disk
 `r1` 43, `r2` 44, `h_thin` 45, `h_hot` 46, `spin` 47, `isco_r` 48, `r_trunc`

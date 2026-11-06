@@ -1,7 +1,6 @@
 import unittest
 
 import numpy as np
-
 from outer_ray import geometry
 
 

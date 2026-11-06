@@ -473,12 +473,18 @@ relative, and its momentum within ±1.4·10⁻⁸.
 **WGSL kernels (F2).** `WgslPoly` and `WgslExpr` prove error bounds for every
 input and every admissible rounding under the WGSL accuracy table. They are
 applied to `geodesic_rhs`, the RK4 arithmetic, `add_kerr`, `screen_frame`,
-`sample_plasma` (disk models 0–2) and the display kernels. Two consequences
-of the specification are counterexamples rather than bounds:
+`sample_plasma` (disk models 0–2) and the display kernels. Most of
+these bounds hold under explicit `Safe` hypotheses and are running
+expressions rather than domain-wide constants. Two consequences of the
+specification limit what can be proved for the code as written:
 
-- `atan2(y, x)` is unconstrained for `y = 0` or `|x| < 2⁻¹²⁶`, and therefore
-  so is `acos(0)`. The skybox sample, the polarization hue and the warped
-  disk's height may take any value on those inputs (`WgslCounterexamples`).
+- WGSL does not specify `atan2(y, x)` accuracy for `y = 0` or
+  `|x| < 2⁻¹²⁶`. A conforming implementation may return binary32 angles at
+  least 2 away there, and `acos(0)` at least 1.4 from `π/2` with every
+  inherited intermediate accurate (`WgslCounterexamples`). The unchanged
+  skybox, polarization hue and warped-disk paths therefore have no useful
+  bound on every conforming implementation; explicit handling of these inputs
+  would fix this.
 - `sqrt(x)` is inherited from `1.0/inverseSqrt(x)`, and `inverseSqrt(0)` is
   infinite, which WGSL turns into an indeterminate value. A shader `sqrt(0)`
   therefore has no defined result. The running bounds require square-root
