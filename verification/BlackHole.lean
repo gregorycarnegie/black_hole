@@ -78,6 +78,7 @@ public import BlackHole.RayCertificate
 public import BlackHole.RK4Order
 public import BlackHole.TaylorLine
 public import BlackHole.WgslTransferPhi
+public import BlackHole.WgslTransferCell
 public import BlackHole.WgslGeodesic
 public import BlackHole.WgslAddKerr
 public import BlackHole.WgslPlasma
