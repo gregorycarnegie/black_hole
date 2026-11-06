@@ -65,6 +65,7 @@ struct Objects {
 
 // -- Constants ---------------------------------------------------------------
 const PI: f32 = 3.141592653589793;
+const SQRT3_2: f32 = 0.8660254037844386;
 const SCHWARZSCHILD_RADIUS: f32 = 2.0;
 const ESCAPE_R: f32 = 1600.0;
 const STEP_TOLERANCE: f32 = 5.0e-8;
@@ -473,14 +474,20 @@ fn get_h_over_r(r_disk: f32) -> f32 {
 
 // Midplane Y displacement for a warped disk; zero for all other models.
 // Î²(R): tilt 0 inside r_bp (aligned), tilt_deg outside. Î³(R): azimuthal twist.
-fn disk_midplane_y(r_disk: f32, phi: f32) -> f32 {
+fn disk_midplane_y(r_disk: f32, horizontal: vec2<f32>) -> f32 {
     if disk.model != 3u { return 0.0; }
     let r_bp_safe = max(disk.r_bp, SCHWARZSCHILD_RADIUS * 0.1);
     let ln_norm   = clamp(log(max(r_disk, SCHWARZSCHILD_RADIUS * 0.01) / r_bp_safe) / 0.5, -10.0, 10.0);
     let w     = 0.5 * (1.0 + tanh(ln_norm));   // 0 inside r_bp, 1 outside
     let beta  = disk.tilt_deg  * (PI / 180.0) * w;
     let gamma = disk.twist_deg * (PI / 180.0) * log(1.0 + r_disk / r_bp_safe);
-    return r_disk * sincos(beta).x * sincos(phi - gamma).x;
+    // sin(phi - gamma) for phi = atan2(z, x), without atan2: WGSL leaves atan2
+    // unspecified at z = 0. The axis (and its sqrt(0)) is handled explicitly.
+    let rho2 = dot(horizontal, horizontal);
+    if rho2 == 0.0 { return 0.0; }
+    let g = sincos(gamma);
+    let s = (horizontal.y * g.y - horizontal.x * g.x) / sqrt(rho2);
+    return r_disk * sincos(beta).x * s;
 }
 
 // Sub-Keplerian factor: 1.0 for razor-thin, ~0.5 for thick hot flow.
@@ -507,12 +514,44 @@ fn tonemap(hdr: vec3<f32>) -> vec3<f32> {
         vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// atan2 from correctly rounded arithmetic and 2.5-ULP division only. WGSL
+// leaves builtin atan2 unspecified for y = 0 or |x| < 2^-126, and acos
+// inherits that gap. Octant reduction to t = min/max in [0, 1], then
+// atan(t) = pi/4 + atan((t-1)/(t+1)) above tan(pi/8), so the odd Taylor
+// polynomial (degree 25) sees |u| <= tan(pi/8): truncation < 2e-12.
+// WgslAtan2.atan2_arith_error bounds the result under the WGSL model.
+const TAN_PI_8: f32 = 0.41421356237309503;
+fn atan_poly(u: f32) -> f32 {
+    let u2 = u*u;
+    return u*(1.0+u2*(-1.0/3.0+u2*(1.0/5.0+u2*(-1.0/7.0+u2*(1.0/9.0+u2*(-1.0/11.0
+        +u2*(1.0/13.0+u2*(-1.0/15.0+u2*(1.0/17.0+u2*(-1.0/19.0+u2*(1.0/21.0
+        +u2*(-1.0/23.0+u2*(1.0/25.0)))))))))))));
+}
+fn atan2_arith(y: f32, x: f32) -> f32 {
+    let ax = abs(x);
+    let ay = abs(y);
+    let hi = max(ax, ay);
+    if hi == 0.0 { return 0.0; }
+    let t = min(ax, ay) / hi;
+    var a = atan_poly(t);
+    if t > TAN_PI_8 { a = 0.25*PI + atan_poly((t-1.0)/(t+1.0)); }
+    if ay > ax { a = 0.5*PI - a; }
+    if x < 0.0 { a = PI - a; }
+    if y < 0.0 { a = -a; }
+    return a;
+}
+
 // Linear HDR bilinear sample: wrap longitude, clamp latitude at the poles.
 // Manual filtering also works with non-filterable rgba32float skyboxes.
 fn sample_skybox(dir: vec3<f32>) -> vec3<f32> {
     let dims = vec2<i32>(textureDimensions(skybox));
-    let uv = vec2<f32>(atan2(dir.z, dir.x) / (2.0 * PI) + 0.5,
-                       acos(clamp(dir.y, -1.0, 1.0)) / PI);
+    // Polar angle as atan2(|dir.xz|, dir.y): relative accuracy at the poles,
+    // where acos(dir.y) loses it. WGSL leaves sqrt(0) indeterminate.
+    let rho2 = dot(dir.xz, dir.xz);
+    var rho = 0.0;
+    if rho2 > 0.0 { rho = sqrt(rho2); }
+    let uv = vec2<f32>(atan2_arith(dir.z, dir.x) / (2.0 * PI) + 0.5,
+                       atan2_arith(rho, dir.y) / PI);
     let texel = uv * vec2<f32>(dims) - vec2<f32>(0.5);
     let base = vec2<i32>(floor(texel));
     let weight = fract(texel);
@@ -558,7 +597,7 @@ fn sample_plasma(ray: Ray, m: Metric) -> Plasma {
     if r <= disk.r1 || r >= disk.r2 { return plasma; }
     let h_r = get_h_over_r(r);
     let height = max(h_r*r,1.0e-4);
-    let z = (ray.pos.y-disk_midplane_y(r,atan2(ray.pos.z,ray.pos.x)))/height;
+    let z = (ray.pos.y-disk_midplane_y(r,ray.pos.xz))/height;
     if abs(z) >= 4.0 { return plasma; }
     let density = 0.4*exp(-0.5*z*z)*disk_edge_fade(r)/height;
     let k = m.inv*ray.p;
@@ -614,9 +653,14 @@ fn polarization_color(stokes: vec4<f32>) -> vec3<f32> {
     let pol = clamp(stokes.yzw/stokes.x,vec3<f32>(-1.0),vec3<f32>(1.0));
     if cam.polarization_view == 1u { return vec3<f32>(clamp(length(pol.xy),0.0,1.0)); }
     if cam.polarization_view == 2u {
-        let angle = atan2(pol.y,pol.x);
-        let hue = 0.5+0.5*cos(angle+vec3<f32>(0.0,-2.0*PI/3.0,2.0*PI/3.0));
-        return hue*clamp(length(pol.xy),0.0,1.0);
+        // cos(atan2(y,x)+c) = (x cos c - y sin c)/|pol.xy| for c = 0, -2pi/3, 2pi/3,
+        // without atan2 (unspecified at y = 0) or cos (specified only on [-pi, pi]).
+        let rho2 = dot(pol.xy,pol.xy);
+        if rho2 == 0.0 { return vec3<f32>(0.0); }
+        let rho = sqrt(rho2);
+        let unit = pol.xy/rho;
+        let hue = 0.5+0.5*vec3<f32>(unit.x,-0.5*unit.x+SQRT3_2*unit.y,-0.5*unit.x-SQRT3_2*unit.y);
+        return hue*clamp(rho,0.0,1.0);
     }
     var signed = pol.z;
     if cam.polarization_view == 3u { signed = pol.x; }
@@ -652,7 +696,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let radius = disk_radius(ray.pos,disk.spin,disk.binary_enabled!=0u);
         let height = max(get_h_over_r(max(radius,disk.r1))*max(radius,disk.r1),0.001);
         if radius > disk.r1-distance && radius < disk.r2+distance {
-            let mid = disk_midplane_y(max(radius,0.001),atan2(ray.pos.z,ray.pos.x));
+            let mid = disk_midplane_y(max(radius,0.001),ray.pos.xz);
             let to_disk = max(abs(ray.pos.y-mid)-4.0*height,0.0);
             distance = min(distance,max(0.25*height,0.5*to_disk));
         }

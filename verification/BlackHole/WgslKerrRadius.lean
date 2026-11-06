@@ -50,6 +50,9 @@ def Rnd (x y : ℝ) : Prop := |y-x| ≤ u*|x|+η
 def Rnd2 (x y : ℝ) : Prop := |y-x| ≤ (2*u+u^2)*|x|+3*η
 /-- WGSL division, 2.5 ULP. -/
 def Div (n d y : ℝ) : Prop := |y-n/d| ≤ 5*u*|n/d|+η
+/-- WGSL specifies the 2.5 ULP division only for `|d| ∈ [2⁻¹²⁶, 2¹²⁶]`; outside
+that range the result is unconstrained. -/
+def DivSpec (n d y : ℝ) : Prop := (1/2^126 ≤ |d| ∧ |d| ≤ 2^126) → Div n d y
 /-- WGSL `inverseSqrt`, 2 ULP. -/
 def InvSqrt (x y : ℝ) : Prop := |y-1/Real.sqrt x| ≤ 4*u*(1/Real.sqrt x)
 
@@ -137,6 +140,7 @@ set_option maxHeartbeats 20000000 in
 theorem kerr_radius_error (X A P S T : ℝ) (hX : 0 ≤ X) (hA : 0 ≤ A)
     (hCS : P^2 ≤ X*A) (hPS : |P| ≤ S) (hS : S ≤ (X+A)/2)
     (hT : T = ((X-A)+Real.sqrt ((X-A)^2+4*P^2))/2) (haT : A ≤ T) (hTmin : 1/2^36 ≤ T)
+    (hTmax : T ≤ 2^120)
     (q p qq fp s root : ℝ)
     (hq : |q-(X-A)| ≤ ((1+u)^6-1)*(X+A)+11*(1+u)^6*η)
     (hp : |p-P| ≤ ((1+u)^3-1)*S+5*(1+u)^3*η)
@@ -144,8 +148,8 @@ theorem kerr_radius_error (X A P S T : ℝ) (hX : 0 ≤ X) (hA : 0 ≤ A)
     (hroot : |root-Real.sqrt s| ≤ 10*u*Real.sqrt s+η)
     (r2 r : ℝ)
     (hbranch : (0 ≤ q ∧ ∃ sA, Rnd (q+root) sA ∧ Rnd (sA/2) r2) ∨
-      (q < 0 ∧ ∃ num den, Rnd2 (2*p*p) num ∧ Rnd (root-q) den ∧ Div num (max den (1/10^20)) r2))
-    (hr : |r-Real.sqrt (max r2 (1/10^12))| ≤ 10*u*Real.sqrt (max r2 (1/10^12))+η) :
+      (q < 0 ∧ ∃ num den, Rnd2 (2*p*p) num ∧ Rnd (root-q) den ∧ DivSpec num (max den (1547425/154742504910672534362390528:ℝ)) r2))
+    (hr : |r-Real.sqrt (max r2 (2305843/2305843009213693952:ℝ))| ≤ 10*u*Real.sqrt (max r2 (2305843/2305843009213693952:ℝ))+η) :
     |r-Real.sqrt T| ≤ 160*u*Real.sqrt T := by
   have hu := u_pos
   have hη := η_pos
@@ -333,7 +337,6 @@ theorem kerr_radius_error (X A P S T : ℝ) (hX : 0 ≤ X) (hA : 0 ≤ A)
         _ ≤ _ := by linarith
     · unfold Rnd2 at hnum
       unfold Rnd at hden
-      unfold Div at hdiv
       -- q < 0 forces Q < 19uT, hence P² ≥ T(T - 19uT).
       have hQs : Q ≤ 19*u*T := by
         have := le_abs_self (q-Q); have := neg_abs_le (q-Q); linarith
@@ -382,14 +385,21 @@ theorem kerr_radius_error (X A P S T : ℝ) (hX : 0 ≤ X) (hA : 0 ≤ A)
         calc |den-(D-Q)| = |(den-(root-q))+(root-q-(D-Q))| := by ring_nf
           _ ≤ _ := abs_add_le _ _
           _ ≤ _ := by linarith
-      have hden_pos : 1/10^20 ≤ den := by
+      have hden_pos : (1547425/154742504910672534362390528:ℝ) ≤ den := by
         have := neg_abs_le (den-(D-Q))
         have : 2*(T-19*u*T)-227*u*T ≥ T := by linarith [huT]
-        have : (1:ℝ)/10^20 ≤ T := le_trans (by norm_num) hTmin
+        have : (1547425/154742504910672534362390528:ℝ) ≤ T := le_trans (by norm_num) hTmin
         linarith
       rw [max_eq_left hden_pos] at hdiv
       have hden_low : T ≤ den := by
         have := neg_abs_le (den-(D-Q)); linarith [huT]
+      have hden_hi : den ≤ 2^126 := by
+        have := le_abs_self (den-(D-Q))
+        have : D-Q ≤ 4*T := by linarith
+        linarith [huT]
+      have hdiv := hdiv ⟨by rw [abs_of_pos (lt_of_lt_of_le hT0 hden_low)]; linarith,
+        by rw [abs_of_pos (lt_of_lt_of_le hT0 hden_low)]; exact hden_hi⟩
+      unfold Div at hdiv
       -- Exact T = 2P²/(D-Q).
       have hTexact : T = 2*P^2/(D-Q) := by
         rw [eq_div_iff (by linarith), hDQ]; nlinarith
@@ -434,11 +444,11 @@ theorem kerr_radius_error (X A P S T : ℝ) (hX : 0 ≤ X) (hA : 0 ≤ A)
         _ ≤ _ := abs_add_le _ _
         _ ≤ _ := by linarith
   -- The floor is inactive and the final square root.
-  have hr2low : 1/10^12 ≤ r2 := by
+  have hr2low : (2305843/2305843009213693952:ℝ) ≤ r2 := by
     have := neg_abs_le (r2-T)
     have : 140*u*T ≤ T/1000 := by rw [u]; linarith
-    have : (1:ℝ)/10^12 ≤ T*(999/1000) := by
-      have : (1:ℝ)/10^12 ≤ 1/2^36*(999/1000) := by norm_num
+    have : (2305843/2305843009213693952:ℝ) ≤ T*(999/1000) := by
+      have : (2305843/2305843009213693952:ℝ) ≤ 1/2^36*(999/1000) := by norm_num
       nlinarith
     linarith
   rw [max_eq_left hr2low] at hr

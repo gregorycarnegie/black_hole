@@ -23,6 +23,8 @@ mod controller;
 
 #[path = "common/sincos.rs"]
 mod sincos;
+#[path = "common/atan2.rs"]
+mod atan2;
 
 #[path = "common/energy.rs"]
 mod energy;
@@ -37,6 +39,7 @@ mod energy;
 #[case::image(include_str!("image.wesl"))]
 #[case::controller(include_str!("controller.wesl"))]
 #[case::sincos(include_str!("sincos.wesl"))]
+#[case::atan2(include_str!("atan2.wesl"))]
 #[case::energy(include_str!("energy.wesl"))]
 fn shader_validates(#[case] source: &str) {
     let source = common::compile_wesl(source);

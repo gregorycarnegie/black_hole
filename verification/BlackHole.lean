@@ -82,6 +82,7 @@ public import BlackHole.WgslGeodesic
 public import BlackHole.WgslAddKerr
 public import BlackHole.WgslPlasma
 public import BlackHole.WgslCounterexamples
+public import BlackHole.WgslAtan2
 public import Mathlib.Analysis.SpecialFunctions.Sqrt
 public import Mathlib.Analysis.SpecialFunctions.ExpDeriv
 public import Mathlib.Analysis.SpecialFunctions.Pow.Real

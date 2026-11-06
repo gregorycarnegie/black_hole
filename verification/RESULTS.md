@@ -481,10 +481,14 @@ specification limit what can be proved for the code as written:
 - WGSL does not specify `atan2(y, x)` accuracy for `y = 0` or
   `|x| < 2⁻¹²⁶`. A conforming implementation may return binary32 angles at
   least 2 away there, and `acos(0)` at least 1.4 from `π/2` with every
-  inherited intermediate accurate (`WgslCounterexamples`). The unchanged
-  skybox, polarization hue and warped-disk paths therefore have no useful
-  bound on every conforming implementation; explicit handling of these inputs
-  would fix this.
+  inherited intermediate accurate (`WgslCounterexamples`). The skybox,
+  polarization hue and warped-disk paths used these builtins. They now use
+  an arithmetic `atan2_arith`, proved within 128u (measured 4.7u on
+  lavapipe), or angle-free identities.
+- WGSL specifies division only for divisors in `[2⁻¹²⁶, 2¹²⁶]`. The
+  `atan2_arith` measurement found lavapipe returning `t = 0` for
+  `3·10³⁸/3·10³⁸`. The error frameworks now constrain division only inside
+  that range.
 - `sqrt(x)` is inherited from `1.0/inverseSqrt(x)`, and `inverseSqrt(0)` is
   infinite, which WGSL turns into an indeterminate value. A shader `sqrt(0)`
   therefore has no defined result. The running bounds require square-root

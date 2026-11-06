@@ -111,7 +111,17 @@ def Computes (w : ℕ → ℝ) : PExpr → ℝ → Prop
   | sub a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya-yb) y
   | mul a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya*yb) y
   | neg a, y => ∃ ya, Computes w a ya ∧ y = -ya
-  | divc a c, y => ∃ ya, Computes w a ya ∧ Div ya c y
+  | divc a c, y => ∃ ya, Computes w a ya ∧ DivSpec ya c y
+
+/-- Every constant divisor lies in WGSL's specified division range. -/
+def DivcOk : PExpr → Prop
+  | input _ => True
+  | const _ => True
+  | add a b => DivcOk a ∧ DivcOk b
+  | sub a b => DivcOk a ∧ DivcOk b
+  | mul a b => DivcOk a ∧ DivcOk b
+  | neg a => DivcOk a
+  | divc a c => DivcOk a ∧ 1/2^126 ≤ |c| ∧ |c| ≤ 2^126
 
 lemma ηU_nonneg : 0 ≤ η/U := div_nonneg η_pos.le U_pos.le
 
@@ -120,18 +130,18 @@ lemma rnd_le {x y : ℝ} (h : Rnd x y) : |y-x| ≤ U*|x|+η := by
 
 theorem error (v w α : ℕ → ℝ) (k : ℕ → ℕ)
     (hα : ∀ i, |v i| ≤ α i) (hw : ∀ i, |w i-v i| ≤ Γ (k i)*α i) :
-    ∀ (e : PExpr) (y : ℝ), Computes w e y →
+    ∀ (e : PExpr) (y : ℝ), DivcOk e → Computes w e y →
       |exact v e| ≤ absEval α e ∧ |y-exact v e| ≤ Γ (ops k e)*absEval α e
-  | input i, y, h => by
+  | input i, y, hc, h => by
     simp only [Computes] at h; subst h
     exact ⟨hα i,hw i⟩
-  | const c, y, h => by
+  | const c, y, hc, h => by
     simp only [Computes] at h; subst h
     simp [exact,absEval,ops,Γ]
-  | add a b, y, h => by
+  | add a b, y, hc, h => by
     obtain ⟨ya,yb,ha,hb,hy⟩ := h
-    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya ha
-    obtain ⟨eb,rb⟩ := error v w α k hα hw b yb hb
+    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya hc.1 ha
+    obtain ⟨eb,rb⟩ := error v w α k hα hw b yb hc.2 hb
     simp only [exact,absEval,ops]
     have hU := U_pos; have hη := η_pos
     set Aa := absEval α a; set Ab := absEval α b
@@ -158,10 +168,10 @@ theorem error (v w α : ℕ → ℝ) (k : ℕ → ℕ)
           rw [show ya+yb-(exact v a+exact v b) = (ya-exact v a)+(yb-exact v b) by ring] at *
           linarith
       _ ≤ ((1+U)*Γ n+U)*(Aa+Ab+η/U) := by nlinarith [ηU_nonneg]
-  | sub a b, y, h => by
+  | sub a b, y, hc, h => by
     obtain ⟨ya,yb,ha,hb,hy⟩ := h
-    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya ha
-    obtain ⟨eb,rb⟩ := error v w α k hα hw b yb hb
+    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya hc.1 ha
+    obtain ⟨eb,rb⟩ := error v w α k hα hw b yb hc.2 hb
     simp only [exact,absEval,ops]
     have hU := U_pos; have hη := η_pos
     set Aa := absEval α a; set Ab := absEval α b
@@ -188,10 +198,10 @@ theorem error (v w α : ℕ → ℝ) (k : ℕ → ℕ)
           rw [show ya-yb-(exact v a-exact v b) = (ya-exact v a)-(yb-exact v b) by ring] at *
           linarith
       _ ≤ ((1+U)*Γ n+U)*(Aa+Ab+η/U) := by nlinarith [ηU_nonneg]
-  | mul a b, y, h => by
+  | mul a b, y, hc, h => by
     obtain ⟨ya,yb,ha,hb,hy⟩ := h
-    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya ha
-    obtain ⟨eb,rb⟩ := error v w α k hα hw b yb hb
+    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya hc.1 ha
+    obtain ⟨eb,rb⟩ := error v w α k hα hw b yb hc.2 hb
     simp only [exact,absEval,ops]
     have hU := U_pos; have hη := η_pos
     set Aa := absEval α a; set Ab := absEval α b
@@ -225,16 +235,16 @@ theorem error (v w α : ℕ → ℝ) (k : ℕ → ℕ)
           have hAA : 0 ≤ Aa*Ab := mul_nonneg hAa hAb
           rw [show (1+ga)*(1+gb) = 1+Γ n from hcomb] at hprod hyy
           nlinarith [ηU_nonneg]
-  | neg a, y, h => by
+  | neg a, y, hc, h => by
     obtain ⟨ya,ha,rfl⟩ := h
-    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya ha
+    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya hc ha
     simp only [exact,absEval,ops,abs_neg]
     refine ⟨ea,?_⟩
     rw [show -ya- -exact v a = -(ya-exact v a) by ring,abs_neg]
     exact ra
-  | divc a c, y, h => by
+  | divc a c, y, hc, h => by
     obtain ⟨ya,ha,hy⟩ := h
-    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya ha
+    obtain ⟨ea,ra⟩ := error v w α k hα hw a ya hc.1 ha
     simp only [exact,absEval,ops]
     have hU := U_pos; have hη := η_pos
     set Aa := absEval α a
@@ -242,19 +252,8 @@ theorem error (v w α : ℕ → ℝ) (k : ℕ → ℕ)
     have hAa : 0 ≤ Aa := (abs_nonneg _).trans ea
     have hga := Γ_nonneg (ops k a)
     have hηU : U*(η/U) = η := by field_simp
-    by_cases hc : c = 0
-    · subst hc
-      simp only [div_zero,abs_zero] at hy ⊢
-      unfold Wgsl.Div at hy
-      simp only [div_zero,sub_zero,abs_zero,mul_zero,zero_add] at hy
-      refine ⟨by positivity,?_⟩
-      rw [Γ_succ]
-      have h1 : 0 ≤ (1+U)*Γ (ops k a)*(η/U) := by have := ηU_nonneg; positivity
-      calc |y-0| = |y| := by rw [sub_zero]
-        _ ≤ η := hy
-        _ = U*(η/U) := hηU.symm
-        _ ≤ ((1+U)*Γ (ops k a)+U)*(0+η/U) := by nlinarith
-    have hc0 : 0 < |c| := abs_pos.mpr hc
+    have hc0 : 0 < |c| := lt_of_lt_of_le (by norm_num) hc.2.1
+    have hy := hy hc.2
     refine ⟨?_,?_⟩
     · rw [abs_div]
       have := div_le_div_of_nonneg_right ea hc0.le

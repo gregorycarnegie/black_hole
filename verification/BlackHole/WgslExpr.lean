@@ -1,6 +1,7 @@
 module
 
 public import BlackHole.WgslPoly
+public import BlackHole.WgslSinCos
 public import Mathlib.Analysis.SpecialFunctions.Trigonometric.DerivHyp
 public import Mathlib.Analysis.Calculus.MeanValue
 
@@ -56,8 +57,30 @@ inductive GExpr
   | tanh (f a : GExpr)
   /-- `if a < b { x } else { y }`; WGSL compares the computed operands exactly. -/
   | lt2 (a b x y : GExpr)
+  /-- `sincos(a).x` and `sincos(a).y` of the shader's arithmetic `sincos`. -/
+  | sinS (a : GExpr)
+  | cosS (a : GExpr)
 
 def exp2R (x : ℝ) : ℝ := Real.exp (x*Real.log 2)
+
+/-- Some WGSL evaluation of the shader's arithmetic `sincos(x)` (geodesic.wesl)
+returns `out`: rounded reduction by `π/2` with `round`, clamped remainder,
+Horner polynomials with binary32 coefficients, quadrant from `k mod 4`. -/
+def SinCosComputes (x : ℝ) (out : ℝ × ℝ) : Prop :=
+  ∃ (t : ℝ) (k : ℤ) (r0 r yy : ℝ) (Bs Bc : List ℝ) (hS s c : ℝ),
+    Rnd (x*(10680707/16777216)) t ∧ |(k : ℝ)-t| ≤ 1/2 ∧
+    |r0-(x-k*(13176795/8388608)-k*(-6151831/140737488355328))| ≤
+      ((1+u)^3-1)*(|x|+|(k : ℝ)*(13176795/8388608)|+|(k : ℝ)*(-6151831/140737488355328)|)+
+        5*(1+u)^3*η ∧
+    r = Max.max (-1) (Min.min 1 r0) ∧ Rnd (r*r) yy ∧
+    List.Forall₂ (fun a b => Rnd a b ∧ |a| ≤ 1) sinCoeffs Bs ∧
+    List.Forall₂ (fun a b => Rnd a b ∧ |a| ≤ 1) cosCoeffs Bc ∧
+    HornerComp Bs yy hS ∧ Rnd (r*hS) s ∧ HornerComp Bc yy c ∧ out = quadSel (k % 4) s c
+
+theorem sincos_spec {x : ℝ} {out : ℝ × ℝ} (h : SinCosComputes x out) (hx : |x| ≤ 2^18) :
+    |out.1-Real.sin x| ≤ 128*u*(1+|x|) ∧ |out.2-Real.cos x| ≤ 128*u*(1+|x|) := by
+  obtain ⟨t,k,r0,r,yy,Bs,Bc,hS,s,c,ht,hk,hred,hr,hy,hBs,hBc,hhS,hs,hc,rfl⟩ := h
+  exact sincos_error x hx t k ht hk r0 hred r hr yy hy Bs Bc hBs hBc hS hhS s hs c hc
 def log2R (x : ℝ) : ℝ := Real.log x/Real.log 2
 
 /-- One ULP of a binary32 value `z`, including subnormals, is at most this. -/
@@ -86,6 +109,8 @@ def exact (v : ℕ → ℝ) : GExpr → ℝ
   | inh f a => exact (fun _ => exact v a) f
   | tanh _ a => Real.tanh (exact v a)
   | lt2 a b x y => if exact v a < exact v b then exact v x else exact v y
+  | sinS a => Real.sin (exact v a)
+  | cosS a => Real.cos (exact v a)
 
 /-- The running forward error bound at exact inputs `v` with input errors `E`. -/
 def bound (v E : ℕ → ℝ) : GExpr → ℝ
@@ -117,6 +142,8 @@ def bound (v E : ℕ → ℝ) : GExpr → ℝ
   | inh f a => bound (fun _ => exact v a) (fun _ => bound v E a) f
   | tanh f a => Max.max (bound v E a+1/10^5) (bound (fun _ => exact v a) (fun _ => bound v E a) f)
   | lt2 a b x y => if exact v a < exact v b then bound v E x else bound v E y
+  | sinS a => bound v E a+128*u*(1+(|exact v a|+bound v E a))
+  | cosS a => bound v E a+128*u*(1+(|exact v a|+bound v E a))
 
 /-- Conditions under which the running bound is valid. -/
 def Safe (v E : ℕ → ℝ) : GExpr → Prop
@@ -126,7 +153,8 @@ def Safe (v E : ℕ → ℝ) : GExpr → Prop
   | sub a b => Safe v E a ∧ Safe v E b
   | mul a b => Safe v E a ∧ Safe v E b
   | neg a => Safe v E a
-  | div a b => Safe v E a ∧ Safe v E b ∧ bound v E b < |exact v b|
+  | div a b => Safe v E a ∧ Safe v E b ∧ bound v E b < |exact v b| ∧
+      1/2^126 ≤ |exact v b|-bound v E b ∧ |exact v b|+bound v E b ≤ 2^126
   | sqrt a => Safe v E a ∧ 0 < exact v a ∧ bound v E a ≤ exact v a
   | max a b => Safe v E a ∧ Safe v E b
   | min a b => Safe v E a ∧ Safe v E b
@@ -142,6 +170,8 @@ def Safe (v E : ℕ → ℝ) : GExpr → Prop
       ∀ t, exact (fun _ => t) f = Real.tanh t
   | lt2 a b x y => Safe v E a ∧ Safe v E b ∧ Safe v E x ∧ Safe v E y ∧
       bound v E a+bound v E b < |exact v a-exact v b|
+  | sinS a => Safe v E a ∧ |exact v a|+bound v E a ≤ 2^18
+  | cosS a => Safe v E a ∧ |exact v a|+bound v E a ≤ 2^18
 
 /-- Some WGSL evaluation of the program from computed inputs `w` returns `y`. -/
 def Computes (w : ℕ → ℝ) : GExpr → ℝ → Prop
@@ -151,7 +181,7 @@ def Computes (w : ℕ → ℝ) : GExpr → ℝ → Prop
   | sub a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya-yb) y
   | mul a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya*yb) y
   | neg a, y => ∃ ya, Computes w a ya ∧ y = -ya
-  | div a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Wgsl.Div ya yb y
+  | div a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ DivSpec ya yb y
   | sqrt a, y => ∃ ya, Computes w a ya ∧ |y-Real.sqrt ya| ≤ 10*u*Real.sqrt ya+η
   | max a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ y = Max.max ya yb
   | min a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ y = Min.min ya yb
@@ -168,6 +198,8 @@ def Computes (w : ℕ → ℝ) : GExpr → ℝ → Prop
       (|y-Real.tanh ya| ≤ 1/10^5 ∨ Computes (fun _ => ya) f y)
   | lt2 a b x y, r => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧
       ((ya < yb ∧ Computes w x r) ∨ (¬ ya < yb ∧ Computes w y r))
+  | sinS a, y => ∃ ya out, Computes w a ya ∧ SinCosComputes ya out ∧ y = out.1
+  | cosS a, y => ∃ ya out, Computes w a ya ∧ SinCosComputes ya out ∧ y = out.2
 
 lemma max_lip (a b c d : ℝ) : |Max.max a b-Max.max c d| ≤ Max.max |a-c| |b-d| := by
   rcases le_total a b with h1 | h1 <;> rcases le_total c d with h2 | h2 <;>
@@ -334,9 +366,11 @@ theorem error : ∀ (e : GExpr) (v w E : ℕ → ℝ), (∀ i, |w i-v i| ≤ E i
     rw [show -ya- -exact v a = -(ya-exact v a) by ring,abs_neg]; exact ea
   | div a b, v, w, E, hw, y, hs, h => by
     obtain ⟨ya,yb,ha,hb,hy⟩ := h
-    obtain ⟨sa,sb,hden⟩ := hs
+    obtain ⟨sa,sb,hden,hlo,hhi⟩ := hs
     have ea := error a v w E hw ya sa ha
     have eb := error b v w E hw yb sb hb
+    have hy := hy ⟨by have := abs_sub_abs_le_abs_sub (exact v b) yb; rw [abs_sub_comm] at this; linarith,
+      by have := abs_sub_abs_le_abs_sub yb (exact v b); linarith⟩
     simp only [exact,bound]
     set A := exact v a; set B := exact v b; set Ba := bound v E a; set Bb := bound v E b
     have hBb : 0 ≤ Bb := (abs_nonneg _).trans eb
@@ -578,6 +612,35 @@ theorem error : ∀ (e : GExpr) (v w E : ℕ → ℝ), (∀ i, |w i-v i| ≤ E i
       rcases hbr with ⟨h',-⟩ | ⟨-,hr⟩
       · exact absurd h' hy
       · simp only [hab,↓reduceIte]; exact error y v w E hw r sy hr
+
+  | sinS a, v, w, E, hw, y, hs, h => by
+    obtain ⟨ya,out,ha,hsc,rfl⟩ := h
+    obtain ⟨sa,hrange⟩ := hs
+    have ea := error a v w E hw ya sa ha
+    simp only [exact,bound]
+    have hya : |ya| ≤ |exact v a|+bound v E a := by
+      have := abs_sub_abs_le_abs_sub ya (exact v a); linarith
+    have hspec := (sincos_spec hsc (hya.trans hrange)).1
+    have hlip : |Real.sin ya-Real.sin (exact v a)| ≤ |ya-exact v a| := Real.abs_sin_sub_sin_le _ _
+    have hu := u_pos
+    have : 128*u*(1+|ya|) ≤ 128*u*(1+(|exact v a|+bound v E a)) := by gcongr
+    calc |out.1-Real.sin (exact v a)| ≤ |out.1-Real.sin ya|+|Real.sin ya-Real.sin (exact v a)| :=
+          abs_sub_le _ _ _
+      _ ≤ _ := by linarith
+  | cosS a, v, w, E, hw, y, hs, h => by
+    obtain ⟨ya,out,ha,hsc,rfl⟩ := h
+    obtain ⟨sa,hrange⟩ := hs
+    have ea := error a v w E hw ya sa ha
+    simp only [exact,bound]
+    have hya : |ya| ≤ |exact v a|+bound v E a := by
+      have := abs_sub_abs_le_abs_sub ya (exact v a); linarith
+    have hspec := (sincos_spec hsc (hya.trans hrange)).2
+    have hlip : |Real.cos ya-Real.cos (exact v a)| ≤ |ya-exact v a| := Real.abs_cos_sub_cos_le _ _
+    have hu := u_pos
+    have : 128*u*(1+|ya|) ≤ 128*u*(1+(|exact v a|+bound v E a)) := by gcongr
+    calc |out.2-Real.cos (exact v a)| ≤ |out.2-Real.cos ya|+|Real.cos ya-Real.cos (exact v a)| :=
+          abs_sub_le _ _ _
+      _ ≤ _ := by linarith
 
 end GExpr
 

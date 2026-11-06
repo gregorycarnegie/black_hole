@@ -3,8 +3,8 @@ module
 public import BlackHole.WgslScreen
 
 /-! All-input WGSL error bounds for `sample_plasma` and its helpers in
-`geodesic.wesl` (obligation F2), for disk models 0 (thin), 1 (truncated hot
-flow) and 2 (slim) of a single, non-binary source.
+`geodesic.wesl` (obligation F2), for all four disk models (thin, truncated
+hot flow, slim, warped) of a single, non-binary source.
 
 Every builtin follows the WGSL f32 accuracy table: `pow(x, y)` is inherited
 from `exp2(y * log2(x))`, `tanh` is the worse of `10⁻⁵` absolute and
@@ -12,17 +12,19 @@ from `exp2(y * log2(x))`, `tanh` is the worse of `10⁻⁵` absolute and
 inherited from their defining expressions, and decimal literals are their
 binary32 values. Matrix entries `M i j` denote row `i`, column `j`
 (`m.M[j][i]` in WGSL), as in `WgslScreen`, so `screen_frame` is reused
-directly. The `atan2` argument of `disk_midplane_y` is computed but unused
-for these models.
+directly.
 
-The warped model (3) uses `atan2(pos.z, pos.x)`. WGSL defines `atan2(y, x)`
-only for `|x| ∈ [2⁻¹²⁶, 2¹²⁶]` and normal `y`. For `pos.z = 0` or tiny
-`pos.x`, a conforming result can be far from the exact angle, so the
-unchanged warped model has no useful bound there (`WgslCounterexamples`).
+The warped model's `disk_midplane_y` used to take `atan2(pos.z, pos.x)`,
+which WGSL leaves unspecified at `pos.z = 0` (`WgslCounterexamples`). It now
+computes `sin(φ-γ) = (z cos γ - x sin γ)/ρ` from the arithmetic `sincos`
+(`GExpr.sinS`/`cosS`, bounded by `WgslSinCos.sincos_error`), returning `0`
+on the axis. `polarization_color` view 2 likewise replaces
+`cos(atan2(y,x)+c)` by `(x cos c - y sin c)/|pol.xy|`.
 
 Inputs: `g` 0–15, `inv` 16–31, `p` 32–35, screen 36–39, `pos` 40–42, disk
 `r1` 43, `r2` 44, `h_thin` 45, `h_hot` 46, `spin` 47, `isco_r` 48, `r_trunc`
-49, camera `frequency_ghz` 50, `faraday_depth` 51, `conversion_depth` 52. -/
+49, camera `frequency_ghz` 50, `faraday_depth` 51, `conversion_depth` 52, and
+for the warped model `r_bp` 53, `tilt_deg` 54, `twist_deg` 55. -/
 
 @[expose] public section
 noncomputable section
@@ -55,6 +57,11 @@ def L0_02 : ℝ := 5368709/268435456
 def L0_999 : ℝ := 16760439/16777216
 def L1em12 : ℝ := 2305843/2305843009213693952
 def L1em20 : ℝ := 1547425/154742504910672534362390528
+def L0_1 : ℝ := 13421773/134217728
+def L1em8 : ℝ := 11258999/1125899906842624
+/-- `PI / 180.0` evaluated in binary32. -/
+def LPI_180 : ℝ := 9370165/536870912
+def LSQRT3_2 : ℝ := 14529495/16777216
 
 /-! ### Inputs -/
 
@@ -69,6 +76,9 @@ def rTrunc : GExpr := input 49
 def freq : GExpr := input 50
 def faraday : GExpr := input 51
 def conversion : GExpr := input 52
+def rBp : GExpr := input 53
+def tilt : GExpr := input 54
+def twist : GExpr := input 55
 
 /-! ### Inherited builtins -/
 
@@ -108,7 +118,21 @@ def diskRadius : GExpr :=
     (mul (c (1/2)) (add q root))
   sqrt (max r2 (c L1em12))
 
-def hOverR (model : Fin 3) (r : GExpr) : GExpr :=
+/-- `disk_midplane_y(r, pos.xz)` for the warped model, without `atan2`:
+`sin(φ-γ) = (z cos γ - x sin γ)/ρ`, with the axis returned as `0`. -/
+def midplane (r : GExpr) : GExpr :=
+  let rbpSafe := max rBp (c (2*L0_1))
+  let lnNorm := clamp (div (log (div (max r (c (2*L0_01))) rbpSafe)) (c (1/2))) (c (-10)) (c 10)
+  let w := mul (c (1/2)) (add (c 1) (tanhW lnNorm))
+  let beta := mul (mul tilt (c LPI_180)) w
+  let gamma := mul (mul twist (c LPI_180)) (log (add (c 1) (div r rbpSafe)))
+  let rho2 := add (mul (pos 0) (pos 0)) (mul (pos 2) (pos 2))
+  lt (neg rho2) 0
+    (mul (mul r (sinS beta)) (div (sub (mul (pos 2) (cosS gamma)) (mul (pos 0) (sinS gamma)))
+      (sqrt rho2)))
+    (c 0)
+
+def hOverR (model : Fin 4) (r : GExpr) : GExpr :=
   if model = 1 then
     let safeR := max r (c (2*L1em3))
     let safeRt := max rTrunc (c (2*L1em3))
@@ -148,11 +172,13 @@ def hotEmissivity (r : GExpr) : GExpr :=
 /-! ### `sample_plasma` -/
 
 /-- The twelve `Plasma` fields: rgb 0–2, j 3–6, alpha 7, rho 8–10, energy 11. -/
-def body (model : Fin 3) (o : Fin 12) : GExpr :=
+def mid (model : Fin 4) (r : GExpr) : GExpr := if model = 3 then midplane r else c 0
+
+def body (model : Fin 4) (o : Fin 12) : GExpr :=
   let r := diskRadius
   let hr := hOverR model r
   let height := max (mul hr r) (c L1em4)
-  let z := div (pos 1) height
+  let z := div (sub (pos 1) (mid model r)) height
   let density := div (mul (mul (c L0_4) (exp (mul (mul (c (-1/2)) z) z))) (edgeFade r)) height
   let kk : Fin 4 → GExpr := k
   let omega := div (sub (c 1) (mul (c (1/2)) (clamp (mul hr (c 2)) (c 0) (c 1))))
@@ -208,17 +234,41 @@ def body (model : Fin 3) (o : Fin 12) : GExpr :=
   | 11 => energy
 
 /-- The early returns: outside `(r1, r2)` or with `|z| ≥ 4`, every field is zero. -/
-def plasma (model : Fin 3) (o : Fin 12) : GExpr :=
+def plasma (model : Fin 4) (o : Fin 12) : GExpr :=
   let r := diskRadius
-  let z := div (pos 1) (max (mul (hOverR model r) r) (c L1em4))
+  let z := div (sub (pos 1) (mid model r)) (max (mul (hOverR model r) r) (c L1em4))
   lt2 r1 r (lt2 r r2 (lt (abs z) 4 (body model o) (c 0)) (c 0)) (c 0)
 
-theorem sample_plasma_error (model : Fin 3) (v w E : ℕ → ℝ) (hw : ∀ i, |w i-v i| ≤ E i)
+theorem sample_plasma_error (model : Fin 4) (v w E : ℕ → ℝ) (hw : ∀ i, |w i-v i| ≤ E i)
     (o : Fin 12) (y : ℝ) (hs : (plasma model o).Safe v E) (hy : (plasma model o).Computes w y) :
     |y-(plasma model o).exact v| ≤ (plasma model o).bound v E :=
   error (plasma model o) v w E hw y hs hy
 
 /-! ### Display kernels -/
+
+/-- `polarization_color` view 2 channel `k` (inputs: Stokes `I,Q,U,V` 0–3), with
+`cos(atan2(y,x)+c) = (x cos c - y sin c)/|pol.xy|` in place of `atan2`/`cos`. -/
+def polarizationHue (k : Fin 3) : GExpr :=
+  let pol (i : Fin 3) : GExpr := clamp (div (input (i+1)) (input 0)) (c (-1)) (c 1)
+  let rho2 := add (mul (pol 0) (pol 0)) (mul (pol 1) (pol 1))
+  let rho := sqrt rho2
+  let ux := div (pol 0) rho
+  let uy := div (pol 1) rho
+  let comp : Fin 3 → GExpr := ![ux,add (mul (c (-1/2)) ux) (mul (c LSQRT3_2) uy),
+    sub (mul (c (-1/2)) ux) (mul (c LSQRT3_2) uy)]
+  lt (neg (input 0)) (-L1em8)
+    (lt (neg rho2) 0 (mul (add (c (1/2)) (mul (c (1/2)) (comp k))) (clamp rho (c 0) (c 1))) (c 0))
+    (c 0)
+
+theorem polarization_hue_error (k : Fin 3) (v w E : ℕ → ℝ) (hw : ∀ i, |w i-v i| ≤ E i) (y : ℝ)
+    (hs : (polarizationHue k).Safe v E) (hy : (polarizationHue k).Computes w y) :
+    |y-(polarizationHue k).exact v| ≤ (polarizationHue k).bound v E :=
+  error (polarizationHue k) v w E hw y hs hy
+
+theorem midplane_error (r : GExpr) (v w E : ℕ → ℝ) (hw : ∀ i, |w i-v i| ≤ E i) (y : ℝ)
+    (hs : (midplane r).Safe v E) (hy : (midplane r).Computes w y) :
+    |y-(midplane r).exact v| ≤ (midplane r).bound v E :=
+  error (midplane r) v w E hw y hs hy
 
 /-- `tonemap`: clamped ACES polynomial ratio, per channel (input 0). -/
 def tonemap : GExpr :=

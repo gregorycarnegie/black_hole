@@ -25,7 +25,7 @@ fn energies(@builtin(global_invocation_id) gid: vec3<u32>) {
             let radius = disk_radius(ray.pos,disk.spin,disk.binary_enabled!=0u);
             let height = max(get_h_over_r(max(radius,disk.r1))*max(radius,disk.r1),0.001);
             if radius > disk.r1-distance && radius < disk.r2+distance {
-                let mid = disk_midplane_y(max(radius,0.001),atan2(ray.pos.z,ray.pos.x));
+                let mid = disk_midplane_y(max(radius,0.001),ray.pos.xz);
                 let to_disk = max(abs(ray.pos.y-mid)-4.0*height,0.0);
                 distance = min(distance,max(0.25*height,0.5*to_disk));
             }

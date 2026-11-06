@@ -25,13 +25,13 @@ return binary32 values far from the exact angle:
   (`acos_zero_far`). The inner `sqrt(1 - 0*0)` is required to be accurate;
   the gap comes from `atan2` at `x = 0`.
 
-So no useful accuracy bound holds, on every conforming implementation, for
-`sample_skybox` (`dir.z = 0` or `dir.y = 0`), `polarization_color` view 2
-(`pol.y = 0`) and the warped-disk plasma (`pos.z = 0`) as currently written.
-This is a property of the unchanged code, not of the computation: handling
-those inputs explicitly, or computing the angle with an arithmetic
-approximation that has a proved bound (as `sincos` does for sine and
-cosine), would make them boundable. -/
+So the former `sample_skybox` (`dir.z = 0` or `dir.y = 0`), `polarization_color`
+view 2 (`pol.y = 0`) and warped-disk plasma (`pos.z = 0`) had no useful bound
+on every conforming implementation. The shader now avoids these gaps: the
+skybox uses the arithmetic `atan2_arith` (`WgslAtan2`: within `128u`, with
+texture-coordinate bounds `skybox_longitude_error` and
+`skybox_latitude_error`), and the polarization hue and warped midplane use
+exact trigonometric identities with no angle (`WgslPlasma`). -/
 
 @[expose] public section
 noncomputable section
