@@ -130,6 +130,57 @@ impl Store {
         };
         self.intern(Node::Sel([l, r, x, y]))
     }
+    /// `if k mod 4 == n { x } else { y }`, read back as `GExpr.qsel` when a
+    /// chain of these is exactly the shader's quadrant selection.
+    fn quad(&mut self, k: Id, n: i64, x: Id, y: Id) -> Id {
+        if x == y {
+            return x;
+        }
+        let nn = self.dyadic(n.into(), 0);
+        let (one, two) = (self.dyadic(1, 0), self.dyadic(2, 0));
+        let chain = |st: &Store, t: Id, m: Id| match &st.nodes[t as usize] {
+            Node::F(f, a) if f == "quad" && a[0] == k && a[1] == m => Some((a[2], a[3])),
+            _ => None,
+        };
+        let neg = |st: &Store, t: Id| match st.nodes[t as usize] {
+            Node::Neg(a) => Some(a),
+            _ => None,
+        };
+        if n == 0
+            && let Some((b, rest)) = chain(self, y, one)
+            && let Some((c, d)) = chain(self, rest, two)
+        {
+            // (s, c), (c, -s), (-s, -c), (-c, s): the components of quadSel.
+            if neg(self, c) == Some(x) && neg(self, d) == Some(b) {
+                return self.f("qsel0", vec![k, x, b]);
+            }
+            if neg(self, b) == Some(d) && neg(self, c) == Some(x) {
+                return self.f("qsel1", vec![k, d, x]);
+            }
+        }
+        self.intern(Node::F("quad".into(), vec![k, nn, x, y]))
+    }
+
+    /// `k` when `t` is `min(max(k, -2^31), 2^31 - 128)` for `k` a `round`.
+    fn saturated_round(&self, t: Id) -> Option<Id> {
+        let Node::F(f, a) = &self.nodes[t as usize] else {
+            return None;
+        };
+        let hi = a
+            .iter()
+            .find(|&&x| self.nodes[x as usize] == Node::C(16_777_215, 7))?;
+        let inner = *a.iter().find(|&x| x != hi)?;
+        let Node::F(g, b) = &self.nodes[inner as usize] else {
+            return None;
+        };
+        let lo = b
+            .iter()
+            .find(|&&x| self.nodes[x as usize] == Node::C(-1, 31))?;
+        let k = *b.iter().find(|&x| x != lo)?;
+        let is_round = matches!(&self.nodes[k as usize], Node::F(r, _) if r == "round");
+        (f == "min" && g == "max" && a.len() == 2 && b.len() == 2 && is_round).then_some(k)
+    }
+
     /// Values that cannot be negative in any WGSL evaluation.
     fn nonneg(&self, t: Id) -> bool {
         match &self.nodes[t as usize] {
@@ -242,6 +293,11 @@ impl Parser<'_> {
                 let a = self.expr(s);
                 let c = self.rational(s);
                 s.div(a, c)
+            }
+            "qsel" => {
+                let j = self.next().to_string();
+                let (k, a, b) = (self.expr(s), self.expr(s), self.expr(s));
+                s.f(&format!("qsel{j}"), vec![k, a, b])
             }
             "scale" => {
                 let k: i32 = self.next().parse().unwrap();
@@ -360,6 +416,8 @@ enum Cond {
     Le(Id, Id),
     Eq(Id, Id),
     Not(Box<Cond>),
+    /// `k mod 4 == n` for `k` the result of `round`.
+    Quad(Id, i64),
     /// `if c { a } else { b }` for boolean `a`, `b` (short-circuit operators).
     If(Box<Cond>, Box<Cond>, Box<Cond>),
     /// An untracked flag: both branches must agree on every computed value.
@@ -385,6 +443,7 @@ fn select(s: &mut Store, cond: &Cond, x: Id, y: Id) -> Id {
             s.sel(na, zero, y, x)
         }
         Cond::Not(c) => select(s, c, y, x),
+        &Cond::Quad(k, n) => s.quad(k, n, x, y),
         Cond::If(c, a, b) => {
             let xa = select(s, a, x, y);
             let xb = select(s, b, x, y);
@@ -410,6 +469,10 @@ enum Value {
     Int(i64),
     /// Integer vectors, such as the loop counter naga's SPIR-V writer adds.
     Ints(Vec<i64>),
+    /// `i32(k)` for `k` the result of `round`: exact for `|k| < 2^31`.
+    RoundedInt(Id),
+    /// `i32(k) & 3`: `k mod 4` in two's complement.
+    Mod4(Id),
     Bool(Cond),
     /// A flag the Lean models do not track (`Metric.valid`).
     Unknown,
@@ -443,7 +506,12 @@ impl Value {
             Value::Matrix(cols) => cols.into_iter().for_each(|c| out.extend(c)),
             Value::Struct(fields) => fields.into_iter().for_each(|f| f.flatten(out)),
             // Flags, including booleans the SPIR-V reader stores as integers.
-            Value::Bool(_) | Value::Unknown | Value::Int(_) | Value::Ints(_) => {}
+            Value::Bool(_)
+            | Value::Unknown
+            | Value::Int(_)
+            | Value::Ints(_)
+            | Value::RoundedInt(_)
+            | Value::Mod4(_) => {}
         }
     }
     fn get(&self, path: &[usize]) -> Value {
@@ -583,6 +651,8 @@ fn binary(s: &mut Store, op: BinaryOperator, a: Value, b: Value) -> Value {
             Ints(x.iter().zip(&y).map(|(a, b)| i64::from(a == b)).collect())
         }
         (B::Subtract, Ints(x), Ints(y)) => Ints(x.iter().zip(&y).map(|(a, b)| a - b).collect()),
+        (B::And, RoundedInt(k), Int(3)) => Mod4(k),
+        (B::Equal, Mod4(k), Int(n)) => Bool(Cond::Quad(k, n)),
         (B::LogicalAnd | B::LogicalOr, Unknown, _) | (B::LogicalAnd | B::LogicalOr, _, Unknown) => {
             Unknown
         }
@@ -677,6 +747,7 @@ fn math(s: &mut Store, fun: MathFunction, mut args: Vec<Value>) -> Value {
         M::Exp2 => "exp2",
         M::Log => "log",
         M::Log2 => "log2",
+        M::Round => "round",
         _ => "",
     };
     if !name.is_empty() {
@@ -838,6 +909,23 @@ fn common(
                 .collect();
             math(s, *fun, args)
         }
+        Expression::As {
+            expr,
+            kind: ScalarKind::Sint,
+            convert: Some(4),
+        } => match sub(s, *expr) {
+            Value::Scalar(k) if matches!(&s.nodes[k as usize], Node::F(f, _) if f == "round") => {
+                Value::RoundedInt(k)
+            }
+            // naga's SPIR-V writer saturates to the i32 range first; for a
+            // rounded `k` with `|k| < 2^31` the clamp is inactive.
+            Value::Scalar(t) if s.saturated_round(t).is_some() => {
+                Value::RoundedInt(s.saturated_round(t).unwrap())
+            }
+            Value::Int(i) => Value::Int(i),
+            Value::Scalar(k) => panic!("integer conversion of {}", s.show(k, 3)),
+            v => panic!("integer conversion of {v:?}"),
+        },
         // `all`/`any` only feed flags here; a branch on them that changed a
         // computed value would fail as an untracked-flag branch.
         Expression::Relational { fun, argument } => match sub(s, *argument) {
@@ -1437,6 +1525,14 @@ fn warped_setup(s: &mut Store, cx: &Ctx) -> Env {
     plasma_setup(s, cx, 3)
 }
 
+/// The arithmetic `sincos(x)` with `x` input 0.
+fn sincos_setup(s: &mut Store, _: &Ctx) -> Env {
+    Env {
+        args: vec![scalar(s, 0)],
+        ..Env::default()
+    }
+}
+
 /// `kerr_radius(x, a)` with `x` inputs 0–2 and `a` inputs 3–5.
 fn kerr_radius_setup(s: &mut Store, _: &Ctx) -> Env {
     Env {
@@ -1504,6 +1600,7 @@ impl Stage {
 #[case::plasma_warped("sample_plasma.3", warped_setup as Setup)]
 #[case::atan2_arith("atan2_arith", atan2_setup as Setup)]
 #[case::kerr_radius("kerr_radius", kerr_radius_setup as Setup)]
+#[case::sincos("sincos", sincos_setup as Setup)]
 fn naga_ir_matches_lean_model(
     #[case] model: &str,
     #[case] setup: Setup,
@@ -1556,12 +1653,16 @@ fn fixture_lists_the_checked_kernels() {
         ("sample_plasma.3", 12),
         ("sample_plasma.3:let", 78),
         ("screen_frame", 9),
+        ("sincos", 2),
+        ("sincos:let", 7),
         ("screen_frame:let", 21),
         ("spatial_unit", 3),
         ("spin_scale", 3),
         ("tonemap", 3),
     ];
-    assert_eq!(counts, expected.map(|(n, c)| (n.to_string(), c)).to_vec());
+    let mut expected = expected.map(|(n, c)| (n.to_string(), c)).to_vec();
+    expected.sort();
+    assert_eq!(counts, expected);
 }
 
 proptest::proptest! {

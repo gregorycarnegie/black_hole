@@ -5,7 +5,7 @@ public import BlackHole.WgslAtan2
 public import BlackHole.WgslPlasma
 public import BlackHole.WgslAddKerr
 public import BlackHole.WgslAtan2Program
-public import BlackHole.WgslKerrProgram
+public import BlackHole.WgslSinCosProgram
 
 /-! Translation-validation fixture for the straight-line kernels (obligation
 F3).
@@ -107,7 +107,8 @@ theorem fixture_eq : fixture = kernels := by decide +kernel
 above plus `(div a b)`, `(max a b)`, `(min a b)`, unary `(sqrt a)`, `(abs a)`,
 `(invsqrt a)`, `(exp a)`, `(exp2 a)`, `(log a)`, `(log2 a)`, `(sinS a)`,
 `(cosS a)`, `(inh f a)`, `(tanh f a)`, `(lt c num den a b)`,
-`(lt2 a b x y)` and `(scale k a)` for `2^k * a`. -/
+`(lt2 a b x y)`, `(scale k a)` for `2^k * a`, `(round a)` and
+`(qsel j k s c)`. -/
 
 /-- Matrix entries in WGSL storage order: column by column. -/
 def columns {α : Type} (f : Fin 4 → Fin 4 → α) : List α :=
@@ -153,7 +154,9 @@ def branching : List (String × WgslExpr.GExpr) :=
   slotProgram "sample_plasma.2" (WgslPlasma.plasmaLets 2) plasmaOutputs ++
   slotProgram "sample_plasma.3" (WgslPlasma.plasmaLets 3) plasmaOutputs ++
   slotProgram "atan2_arith" WgslAtan2Program.atan2Lets [WgslAtan2Program.atan2Out] ++
-  slotProgram "kerr_radius" WgslKerrProgram.kerrLets [WgslKerrProgram.kerrOut]
+  slotProgram "kerr_radius" WgslKerrProgram.kerrLets [WgslKerrProgram.kerrOut] ++
+  slotProgram "sincos" WgslSinCosProgram.sincosLets
+    [WgslSinCosProgram.sincosOut false, WgslSinCosProgram.sincosOut true]
 
 def gsexp : WgslExpr.GExpr → String
   | .input i => s!"(in {i})"
@@ -179,6 +182,8 @@ def gsexp : WgslExpr.GExpr → String
   | .lt c t a b => s!"(lt {gsexp c} {t.num} {t.den} {gsexp a} {gsexp b})"
   | .lt2 a b x y => s!"(lt2 {gsexp a} {gsexp b} {gsexp x} {gsexp y})"
   | .scale k a => s!"(scale {k} {gsexp a})"
+  | .round a => s!"(round {gsexp a})"
+  | .qsel j k a b => s!"(qsel {if j then 1 else 0} {gsexp k} {gsexp a} {gsexp b})"
 
 def renderBranching : String :=
   String.intercalate "\n" (branching.map fun (n,e) => n ++ " " ++ gsexp e) ++ "\n"
@@ -207,6 +212,16 @@ private meta partial def gparse : List String → Lean.MacroM (Lean.Term × List
     let (b, rest) ← gparse rest
     let ")" :: rest := rest | Lean.Macro.throwError "expected )"
     return (← `(WgslExpr.GExpr.lt $c $(← ratTerm n d) $a $b), rest)
+  | "(" :: "qsel" :: j :: rest => do
+    let (k, rest) ← gparse rest
+    let (a, rest) ← gparse rest
+    let (b, rest) ← gparse rest
+    let ")" :: rest := rest | Lean.Macro.throwError "expected )"
+    let jt ← match j with
+      | "0" => `(false)
+      | "1" => `(true)
+      | _ => Lean.Macro.throwError s!"invalid component {j}"
+    return (← `(WgslExpr.GExpr.qsel $jt $k $a $b), rest)
   | "(" :: "scale" :: k :: rest => do
     let (a, rest) ← gparse rest
     let ")" :: rest := rest | Lean.Macro.throwError "expected )"
@@ -222,7 +237,7 @@ private meta partial def gparse : List String → Lean.MacroM (Lean.Term × List
     let ctor ← match op, args.size with
       | "add", 2 | "sub", 2 | "mul", 2 | "div", 2 | "max", 2 | "min", 2 | "inh", 2
       | "tanh", 2 | "neg", 1 | "sqrt", 1 | "abs", 1 | "invsqrt", 1 | "exp", 1 | "exp2", 1
-      | "log", 1 | "log2", 1 | "sinS", 1 | "cosS", 1 | "lt2", 4 =>
+      | "log", 1 | "log2", 1 | "sinS", 1 | "cosS", 1 | "round", 1 | "lt2", 4 =>
         pure (Lean.mkIdent (Lean.Name.mkStr `BlackHole.WgslExpr.GExpr op))
       | _, _ => Lean.Macro.throwError s!"unknown operation {op}/{args.size}"
     return (← `($ctor $args*), rest')

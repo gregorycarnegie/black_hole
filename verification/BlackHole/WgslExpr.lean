@@ -64,7 +64,17 @@ inductive GExpr
   unless it is subnormal, so the result is exact or within `η` (including a
   flush to zero). -/
   | scale (k : ℤ) (a : GExpr)
+  /-- `round(a)`: an integer within `1/2` of `a` (WGSL rounds to nearest,
+  ties to even). -/
+  | round (a : GExpr)
+  /-- Component `j` (`false` first) of `quadSel (k mod 4) s c` for an
+  integer `k`: the arithmetic `sincos`'s quadrant selection from
+  `i32(k) & 3`. -/
+  | qsel (j : Bool) (k s c : GExpr)
   deriving DecidableEq
+
+/-- Component `j` of a pair, `false` first. -/
+def qpick (j : Bool) (p : ℝ × ℝ) : ℝ := if j then p.2 else p.1
 
 def exp2R (x : ℝ) : ℝ := Real.exp (x*Real.log 2)
 
@@ -117,6 +127,8 @@ def exact (v : ℕ → ℝ) : GExpr → ℝ
   | sinS a => Real.sin (exact v a)
   | cosS a => Real.cos (exact v a)
   | scale k a => (2:ℝ)^k*exact v a
+  | round a => ((_root_.round (exact v a) : ℤ) : ℝ)
+  | qsel j k s c => qpick j (quadSel (⌊exact v k⌋ % 4) (exact v s) (exact v c))
 
 /-- The running forward error bound at exact inputs `v` with input errors `E`. -/
 def bound (v E : ℕ → ℝ) : GExpr → ℝ
@@ -151,6 +163,8 @@ def bound (v E : ℕ → ℝ) : GExpr → ℝ
   | sinS a => bound v E a+128*u*(1+(|exact v a|+bound v E a))
   | cosS a => bound v E a+128*u*(1+(|exact v a|+bound v E a))
   | scale k a => (2:ℝ)^k*bound v E a+η
+  | round _ => 0
+  | qsel _ _ s c => Max.max (bound v E s) (bound v E c)
 
 /-- Conditions under which the running bound is valid. -/
 def Safe (v E : ℕ → ℝ) : GExpr → Prop
@@ -180,6 +194,9 @@ def Safe (v E : ℕ → ℝ) : GExpr → Prop
   | sinS a => Safe v E a ∧ |exact v a|+bound v E a ≤ 2^18
   | cosS a => Safe v E a ∧ |exact v a|+bound v E a ≤ 2^18
   | scale _ a => Safe v E a
+  | round a => Safe v E a ∧ ∀ n : ℤ, bound v E a < |exact v a-(n+1/2)|
+  | qsel _ k s c => Safe v E k ∧ Safe v E s ∧ Safe v E c ∧ bound v E k < 1/2 ∧
+      ∃ n : ℤ, exact v k = n
 
 /-- Some WGSL evaluation of the program from computed inputs `w` returns `y`. -/
 def Computes (w : ℕ → ℝ) : GExpr → ℝ → Prop
@@ -209,6 +226,9 @@ def Computes (w : ℕ → ℝ) : GExpr → ℝ → Prop
   | sinS a, y => ∃ ya out, Computes w a ya ∧ SinCosComputes ya out ∧ y = out.1
   | cosS a, y => ∃ ya out, Computes w a ya ∧ SinCosComputes ya out ∧ y = out.2
   | scale k a, y => ∃ ya, Computes w a ya ∧ |y-(2:ℝ)^k*ya| ≤ η
+  | round a, y => ∃ ya, Computes w a ya ∧ (∃ n : ℤ, y = n) ∧ |y-ya| ≤ 1/2
+  | qsel j k s c, y => ∃ yk ys yc, Computes w k yk ∧ Computes w s ys ∧ Computes w c yc ∧
+      ∃ n : ℤ, yk = n ∧ y = qpick j (quadSel (n % 4) ys yc)
 
 lemma max_lip (a b c d : ℝ) : |Max.max a b-Max.max c d| ≤ Max.max |a-c| |b-d| := by
   rcases le_total a b with h1 | h1 <;> rcases le_total c d with h2 | h2 <;>
@@ -659,6 +679,49 @@ theorem error : ∀ (e : GExpr) (v w E : ℕ → ℝ), (∀ i, |w i-v i| ≤ E i
       _ = |y-2^k*ya|+2^k*|ya-exact v a| := by rw [← mul_sub,abs_mul,abs_of_pos hk]
       _ ≤ η+2^k*bound v E a := by gcongr
       _ = _ := by ring
+  | round a, v, w, E, hw, y, hs, h => by
+    obtain ⟨ya,ha,⟨n,rfl⟩,hy⟩ := h
+    obtain ⟨sa,hsep⟩ := hs
+    have ea := abs_le.mp (error a v w E hw ya sa ha)
+    have hy' := abs_le.mp hy
+    simp only [exact,bound]
+    set e := exact v a
+    set m := _root_.round e
+    have hm := abs_le.mp (abs_sub_round e)
+    have h1 := hsep m
+    have h2 := hsep (m-1)
+    push_cast at h2
+    have hn : n = m := by
+      by_contra hne
+      rcases lt_or_gt_of_ne hne with hlt | hgt
+      · have : (n:ℝ) ≤ m-1 := by exact_mod_cast Int.le_sub_one_of_lt hlt
+        rw [abs_of_nonneg (by linarith)] at h2
+        linarith
+      · have : (m:ℝ)+1 ≤ n := by exact_mod_cast Int.add_one_le_of_lt hgt
+        rw [abs_of_nonpos (by linarith)] at h1
+        linarith
+    subst hn
+    simp
+  | qsel j k s c, v, w, E, hw, y, hs, h => by
+    obtain ⟨yk,ys,yc,hk,hsy,hcy,n,rfl,rfl⟩ := h
+    obtain ⟨sk,ss,sc,hkb,N,hN⟩ := hs
+    have ek := error k v w E hw (n:ℝ) sk hk
+    have es := error s v w E hw ys ss hsy
+    have ec := error c v w E hw yc sc hcy
+    have hnN : n = N := by
+      rw [hN] at ek
+      have h1 : |((n-N : ℤ) : ℝ)| < 1 := by push_cast; linarith
+      rw [← Int.cast_abs] at h1
+      have h2 : |n-N| < 1 := by exact_mod_cast h1
+      have := Int.abs_lt_one_iff.mp h2
+      omega
+    subst hnN
+    simp only [exact,bound,hN,Int.floor_intCast]
+    have ns : |-ys - -exact v s| = |ys-exact v s| := by rw [← abs_neg]; ring_nf
+    have nc : |-yc - -exact v c| = |yc-exact v c| := by rw [← abs_neg]; ring_nf
+    unfold quadSel qpick
+    split_ifs <;> simp only [ns,nc] <;>
+      first | exact le_max_of_le_left es | exact le_max_of_le_right ec
 
 end GExpr
 

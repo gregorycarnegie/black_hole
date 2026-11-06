@@ -53,6 +53,8 @@ def subst (σ : ℕ → GExpr) : GExpr → GExpr
   | .lt c t a b => lt (subst σ c) t (subst σ a) (subst σ b)
   | .lt2 a b x y => lt2 (subst σ a) (subst σ b) (subst σ x) (subst σ y)
   | .scale k a => scale k (subst σ a)
+  | .round a => round (subst σ a)
+  | .qsel j k a b => qsel j (subst σ k) (subst σ a) (subst σ b)
 
 /-- Inputs below `letBase` stay; slot references read the expanded slots. -/
 def lookup (slots : List GExpr) (i : ℕ) : GExpr :=
