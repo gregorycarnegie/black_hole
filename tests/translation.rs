@@ -15,7 +15,8 @@
 //! (`clamp`, `length`, `normalize`, `cross`) expand to those formulas.
 
 use naga::{
-    BinaryOperator, Expression, Handle, Literal, MathFunction, Module, Statement, TypeInner,
+    ArraySize, BinaryOperator, Expression, Handle, Literal, MathFunction, Module, ScalarKind,
+    Statement, TypeInner,
 };
 use std::collections::HashMap;
 
@@ -208,23 +209,49 @@ fn parse_sexp(toks: &[&str], pos: &mut usize) -> Tree {
     t
 }
 
-fn fixture() -> HashMap<String, Tree> {
+/// Fixture entries by kernel name, in output order.
+fn fixture() -> HashMap<String, Vec<Tree>> {
     let text = [
         include_str!("../verification/fixtures/kernels.sexp"),
         include_str!("../verification/fixtures/kernels-branching.sexp"),
     ]
     .concat();
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            let spaced = line.replace('(', " ( ").replace(')', " ) ");
-            let tokens: Vec<&str> = spaced.split_whitespace().collect();
-            let mut pos = 1;
-            let tree = parse_sexp(&tokens, &mut pos);
-            assert_eq!(pos, tokens.len(), "trailing tokens in {}", tokens[0]);
-            (tokens[0].to_string(), tree)
-        })
-        .collect()
+    let mut entries: HashMap<String, Vec<Tree>> = HashMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let spaced = line.replace('(', " ( ").replace(')', " ) ");
+        let tokens: Vec<&str> = spaced.split_whitespace().collect();
+        let mut pos = 1;
+        let tree = parse_sexp(&tokens, &mut pos);
+        assert_eq!(pos, tokens.len(), "trailing tokens in {}", tokens[0]);
+        entries.entry(tokens[0].to_string()).or_default().push(tree);
+    }
+    entries
+}
+
+fn rename(t: &Tree, f: &dyn Fn(u32) -> u32) -> Tree {
+    let all = |cs: &[Tree]| cs.iter().map(|c| rename(c, f)).collect();
+    let bx = |c: &Tree| Box::new(rename(c, f));
+    match t {
+        Tree::In(i) => Tree::In(f(*i)),
+        Tree::C(..) => t.clone(),
+        Tree::Add(cs) => Tree::Add(all(cs)),
+        Tree::Mul(cs) => Tree::Mul(all(cs)),
+        Tree::F(n, cs) => Tree::F(n.clone(), all(cs)),
+        Tree::Sel(cs) => Tree::Sel(all(cs)),
+        Tree::Sub(a, b) => Tree::Sub(bx(a), bx(b)),
+        Tree::Div(a, b) => Tree::Div(bx(a), bx(b)),
+        Tree::Neg(a) => Tree::Neg(bx(a)),
+    }
+}
+
+fn compare(computed: Vec<Tree>, lean: &[Tree], name: &str) {
+    assert_eq!(computed.len(), lean.len(), "{name}: output count");
+    for (i, (tree, lean)) in computed.into_iter().zip(lean).enumerate() {
+        let lean = normalize(lean.clone());
+        if let Some(d) = difference(&normalize(tree), &lean, &format!("{name}.{i}")) {
+            panic!("naga IR differs from the Lean model {d}");
+        }
+    }
 }
 
 /// A branch condition on computed values.
@@ -234,6 +261,8 @@ enum Cond {
     Lt(Tree, Tree),
     Le(Tree, Tree),
     Eq(Tree, Tree),
+    /// An untracked flag: both branches must agree on every computed value.
+    Unknown,
 }
 
 /// Values that cannot be negative in any WGSL evaluation.
@@ -269,6 +298,7 @@ fn select(cond: Cond, x: Tree, y: Tree) -> Tree {
             Tree::Sel(vec![Tree::Neg(Box::new(s)), ZERO, y, x])
         }
         Cond::Eq(a, b) => panic!("no exact encoding of {a:?} == {b:?}"),
+        Cond::Unknown => panic!("a branch on an untracked flag changes a computed value"),
     }
 }
 
@@ -278,12 +308,15 @@ enum Value {
     Vector(Vec<Tree>),
     /// Columns.
     Matrix(Vec<Vec<Tree>>),
+    /// Structs and arrays.
     Struct(Vec<Value>),
     Int(i64),
     Bool(BoolValue),
+    /// A flag the Lean models do not track (`Metric.valid`).
+    Unknown,
 }
 
-/// `Cond` compared structurally only to detect unchanged values.
+/// Conditions are never treated as equal, so merges keep both branches.
 #[derive(Clone, Debug)]
 struct BoolValue(Cond);
 
@@ -300,19 +333,58 @@ impl Value {
             v => panic!("expected scalar, got {v:?}"),
         }
     }
+    fn int(self) -> i64 {
+        match self {
+            Value::Int(i) => i,
+            v => panic!("expected integer, got {v:?}"),
+        }
+    }
     fn cond(self) -> Cond {
         match self {
             Value::Bool(BoolValue(c)) => c,
+            Value::Unknown => Cond::Unknown,
             v => panic!("expected bool, got {v:?}"),
         }
     }
+    /// The floating-point components; flags are dropped.
     fn flatten(self, out: &mut Vec<Tree>) {
         match self {
             Value::Scalar(t) => out.push(t),
             Value::Vector(v) => out.extend(v),
             Value::Matrix(cols) => cols.into_iter().for_each(|c| out.extend(c)),
             Value::Struct(fields) => fields.into_iter().for_each(|f| f.flatten(out)),
-            v => panic!("cannot flatten {v:?}"),
+            Value::Bool(_) | Value::Unknown => {}
+            Value::Int(i) => panic!("integer output {i}"),
+        }
+    }
+    fn get(&self, path: &[usize]) -> Value {
+        let Some((&i, rest)) = path.split_first() else {
+            return self.clone();
+        };
+        match self {
+            Value::Struct(f) => f[i].get(rest),
+            Value::Matrix(m) => Value::Vector(m[i].clone()).get(rest),
+            Value::Vector(v) if rest.is_empty() => Value::Scalar(v[i].clone()),
+            v => panic!("path {path:?} into {v:?}"),
+        }
+    }
+    fn set(&mut self, path: &[usize], new: Value) {
+        let Some((&i, rest)) = path.split_first() else {
+            *self = new;
+            return;
+        };
+        match self {
+            Value::Struct(f) => f[i].set(rest, new),
+            Value::Matrix(m) => {
+                let mut col = Value::Vector(m[i].clone());
+                col.set(rest, new);
+                let Value::Vector(c) = col else {
+                    unreachable!()
+                };
+                m[i] = c;
+            }
+            Value::Vector(v) if rest.is_empty() => v[i] = new.scalar(),
+            v => panic!("path {path:?} into {v:?}"),
         }
     }
 }
@@ -336,13 +408,18 @@ fn select_value(cond: &Cond, a: Value, b: Value) -> Value {
                 .map(|(x, y)| select_value(cond, x, y))
                 .collect(),
         ),
+        (Bool(_) | Unknown, Bool(_) | Unknown) => Unknown,
         (a, b) => panic!("cannot merge {a:?} and {b:?}"),
     }
 }
 
 fn zero(module: &Module, ty: Handle<naga::Type>) -> Value {
     match &module.types[ty].inner {
-        TypeInner::Scalar(_) => Value::Scalar(ZERO),
+        TypeInner::Scalar(s) => match s.kind {
+            ScalarKind::Float => Value::Scalar(ZERO),
+            ScalarKind::Bool => Value::Bool(BoolValue(Cond::Const(false))),
+            _ => Value::Int(0),
+        },
         TypeInner::Vector { size, .. } => Value::Vector(vec![ZERO; *size as usize]),
         TypeInner::Matrix { columns, rows, .. } => {
             Value::Matrix(vec![vec![ZERO; *rows as usize]; *columns as usize])
@@ -350,6 +427,11 @@ fn zero(module: &Module, ty: Handle<naga::Type>) -> Value {
         TypeInner::Struct { members, .. } => {
             Value::Struct(members.iter().map(|m| zero(module, m.ty)).collect())
         }
+        TypeInner::Array {
+            base,
+            size: ArraySize::Constant(n),
+            ..
+        } => Value::Struct(vec![zero(module, *base); n.get() as usize]),
         t => panic!("unsupported zero value {t:?}"),
     }
 }
@@ -378,17 +460,24 @@ fn lanes(args: Vec<Value>, f: impl Fn(Vec<Tree>) -> Tree) -> Value {
 fn binary(op: BinaryOperator, a: Value, b: Value) -> Value {
     use BinaryOperator as B;
     use Value::*;
+    let flag = |c: Cond| Bool(BoolValue(c));
     match (op, a, b) {
-        (B::Equal, Int(x), Int(y)) => Bool(BoolValue(Cond::Const(x == y))),
-        (B::NotEqual, Int(x), Int(y)) => Bool(BoolValue(Cond::Const(x != y))),
+        (B::Add, Int(x), Int(y)) => Int(x + y),
+        (B::Subtract, Int(x), Int(y)) => Int(x - y),
+        (B::Less, Int(x), Int(y)) => flag(Cond::Const(x < y)),
+        (B::Equal, Int(x), Int(y)) => flag(Cond::Const(x == y)),
+        (B::NotEqual, Int(x), Int(y)) => flag(Cond::Const(x != y)),
+        (B::LogicalAnd | B::LogicalOr, Unknown, _) | (B::LogicalAnd | B::LogicalOr, _, Unknown) => {
+            Unknown
+        }
         (B::Less | B::LessEqual | B::Greater | B::GreaterEqual | B::Equal, Scalar(x), Scalar(y)) => {
-            Bool(BoolValue(match op {
+            flag(match op {
                 B::Less => Cond::Lt(x, y),
                 B::Greater => Cond::Lt(y, x),
                 B::LessEqual => Cond::Le(x, y),
                 B::GreaterEqual => Cond::Le(y, x),
                 _ => Cond::Eq(x, y),
-            }))
+            })
         }
         (B::Multiply, Matrix(m), Vector(v)) => {
             // Row r of M v sums M[c][r] v[c] over columns c.
@@ -532,19 +621,18 @@ fn common(
                         })
                         .collect(),
                 ),
-                TypeInner::Struct { .. } => Value::Struct(parts),
+                TypeInner::Struct { .. } | TypeInner::Array { .. } => Value::Struct(parts),
                 t => panic!("unsupported compose {t:?}"),
             }
         }
         Expression::Splat { size, value } => {
             Value::Vector(vec![sub(*value).scalar(); *size as usize])
         }
-        Expression::AccessIndex { base, index } => match sub(*base) {
-            Value::Vector(v) => Value::Scalar(v[*index as usize].clone()),
-            Value::Matrix(m) => Value::Vector(m[*index as usize].clone()),
-            Value::Struct(f) => f[*index as usize].clone(),
-            v => panic!("index into {v:?}"),
-        },
+        Expression::AccessIndex { base, index } => sub(*base).get(&[*index as usize]),
+        Expression::Access { base, index } => {
+            let i = sub(*index).int() as usize;
+            sub(*base).get(&[i])
+        }
         Expression::Swizzle {
             size,
             vector,
@@ -595,7 +683,26 @@ fn global(module: &Module, h: Handle<Expression>) -> Value {
         .unwrap_or_else(|| panic!("unsupported constant {e:?}"))
 }
 
-type Globals = HashMap<String, Value>;
+/// What a kernel is evaluated on, and the parts of it the Lean model
+/// abstracts.
+#[derive(Default)]
+struct Env {
+    args: Vec<Value>,
+    globals: HashMap<String, Value>,
+    /// Calls whose results the Lean model reads as inputs.
+    opaque_calls: HashMap<&'static str, Value>,
+    /// `let` values the Lean model reads as inputs: the computed value must
+    /// equal the expected trees, and is then replaced.
+    lets: HashMap<&'static str, (Vec<Tree>, Value)>,
+    /// Values the model assumes positive; the other branch is outside it.
+    positive: Vec<Tree>,
+}
+
+enum Flow {
+    Next,
+    Break,
+    Continue,
+}
 
 /// Symbolic execution of one function; branches on computed values fork the
 /// frame and merge the results into `Sel` nodes.
@@ -603,13 +710,32 @@ type Globals = HashMap<String, Value>;
 struct Frame<'a> {
     module: &'a Module,
     func: &'a naga::Function,
-    globals: &'a Globals,
+    env: &'a Env,
+    top: bool,
     args: Vec<Value>,
     emitted: HashMap<Handle<Expression>, Value>,
     locals: HashMap<Handle<naga::LocalVariable>, Value>,
 }
 
 impl<'a> Frame<'a> {
+    /// The local variable and component path a pointer expression names.
+    fn place(&mut self, h: Handle<Expression>) -> Option<(Handle<naga::LocalVariable>, Vec<usize>)> {
+        match self.func.expressions[h] {
+            Expression::LocalVariable(l) => Some((l, vec![])),
+            Expression::AccessIndex { base, index } => {
+                let mut p = self.place(base)?;
+                p.1.push(index as usize);
+                Some(p)
+            }
+            Expression::Access { base, index } => {
+                let mut p = self.place(base)?;
+                p.1.push(self.eval(index).int() as usize);
+                Some(p)
+            }
+            _ => None,
+        }
+    }
+
     fn eval(&mut self, h: Handle<Expression>) -> Value {
         if let Some(v) = self.emitted.get(&h) {
             return v.clone();
@@ -619,15 +745,16 @@ impl<'a> Frame<'a> {
             Expression::FunctionArgument(i) => self.args[*i as usize].clone(),
             Expression::GlobalVariable(g) => {
                 let name = self.module.global_variables[*g].name.as_deref().unwrap();
-                self.globals
+                self.env
+                    .globals
                     .get(name)
                     .unwrap_or_else(|| panic!("global {name} has no value"))
                     .clone()
             }
             // Globals evaluate to their values, so loads through them are reads.
-            Expression::Load { pointer } => match func.expressions[*pointer] {
-                Expression::LocalVariable(l) => self.locals[&l].clone(),
-                _ => self.eval(*pointer),
+            Expression::Load { pointer } => match self.place(*pointer) {
+                Some((l, path)) => self.locals[&l].get(&path),
+                None => self.eval(*pointer),
             },
             e => {
                 let module = self.module;
@@ -635,6 +762,109 @@ impl<'a> Frame<'a> {
                     .unwrap_or_else(|| panic!("unsupported expression {e:?}"))
             }
         }
+    }
+
+    fn emit(&mut self, h: Handle<Expression>) {
+        // Pointers into locals are resolved by the loads and stores that use them.
+        if self.place(h).is_some() {
+            return;
+        }
+        // A loop re-emits its body's expressions; each iteration recomputes them.
+        self.emitted.remove(&h);
+        let mut v = self.eval(h);
+        let name = self.func.named_expressions.get(&h).map(String::as_str);
+        if let Some((expected, replacement)) = name.filter(|_| self.top).and_then(|n| self.env.lets.get(n)) {
+            let mut computed = Vec::new();
+            v.flatten(&mut computed);
+            compare(computed, expected, name.unwrap());
+            v = replacement.clone();
+        }
+        self.emitted.insert(h, v);
+    }
+
+    fn resolve(&self, c: Cond) -> Cond {
+        let positive = |t: &Tree| self.env.positive.contains(t);
+        match c {
+            Cond::Le(a, z) if z == ZERO && positive(&a) => Cond::Const(false),
+            Cond::Lt(z, a) if z == ZERO && positive(&a) => Cond::Const(true),
+            c => c,
+        }
+    }
+
+    /// Statements that never fork; `None` for those `exec` handles.
+    fn simple(&mut self, statement: &'a Statement) -> Option<Flow> {
+        match statement {
+            Statement::Emit(range) => range.clone().for_each(|h| self.emit(h)),
+            Statement::Store { pointer, value } => {
+                let (l, path) = self
+                    .place(*pointer)
+                    .unwrap_or_else(|| panic!("store through {:?}", self.func.expressions[*pointer]));
+                let v = self.eval(*value);
+                self.locals.get_mut(&l).unwrap().set(&path, v);
+            }
+            Statement::Call {
+                function,
+                arguments,
+                result,
+            } => {
+                let args = arguments.iter().map(|a| self.eval(*a)).collect();
+                let callee = &self.module.functions[*function];
+                let name = callee.name.as_deref().unwrap_or_default();
+                let v = match self.env.opaque_calls.get(name) {
+                    Some(v) => v.clone(),
+                    None => run(self.module, callee, args, self.env, false),
+                };
+                if let Some(r) = result {
+                    self.emitted.insert(*r, v);
+                }
+            }
+            Statement::Loop {
+                body,
+                continuing,
+                break_if,
+            } => loop {
+                if let Flow::Break = self.straight(body) {
+                    break;
+                }
+                self.straight(continuing);
+                if let Some(c) = break_if {
+                    let Cond::Const(stop) = self.eval(*c).cond() else {
+                        panic!("loop exit depends on computed values");
+                    };
+                    if stop {
+                        break;
+                    }
+                }
+            },
+            Statement::Break => return Some(Flow::Break),
+            Statement::Continue => return Some(Flow::Continue),
+            _ => return None,
+        }
+        Some(Flow::Next)
+    }
+
+    /// A loop body: every branch must be decided by integer values.
+    fn straight(&mut self, block: &'a naga::Block) -> Flow {
+        for statement in block.iter() {
+            let flow = match statement {
+                Statement::Block(b) => self.straight(b),
+                Statement::If {
+                    condition,
+                    accept,
+                    reject,
+                } => match self.eval(*condition).cond() {
+                    Cond::Const(b) => self.straight(if b { accept } else { reject }),
+                    c => panic!("loop branch on computed value {c:?}"),
+                },
+                s => self
+                    .simple(s)
+                    .unwrap_or_else(|| panic!("unsupported statement in loop {s:?}")),
+            };
+            if !matches!(flow, Flow::Next) {
+                return flow;
+            }
+        }
+        Flow::Next
     }
 
     /// Runs the statements on `stack` (innermost block last) to a `return`.
@@ -649,60 +879,42 @@ impl<'a> Frame<'a> {
             };
             *top = rest;
             match statement {
-                Statement::Emit(range) => {
-                    for h in range.clone() {
-                        let v = self.eval(h);
-                        self.emitted.insert(h, v);
-                    }
-                }
                 Statement::Block(b) => stack.push(b),
                 Statement::Return { value } => return self.eval(value.expect("void return")),
-                Statement::Store { pointer, value } => {
-                    let Expression::LocalVariable(l) = self.func.expressions[*pointer] else {
-                        panic!("store through {:?}", self.func.expressions[*pointer]);
-                    };
-                    let v = self.eval(*value);
-                    self.locals.insert(l, v);
-                }
-                Statement::Call {
-                    function,
-                    arguments,
-                    result,
-                } => {
-                    let args = arguments.iter().map(|a| self.eval(*a)).collect();
-                    let callee = &self.module.functions[*function];
-                    let v = run(self.module, callee, args, self.globals);
-                    if let Some(r) = result {
-                        self.emitted.insert(*r, v);
-                    }
-                }
                 Statement::If {
                     condition,
                     accept,
                     reject,
-                } => match self.eval(*condition).cond() {
-                    Cond::Const(b) => stack.push(if b { accept } else { reject }),
-                    c => {
-                        let mut other = self.clone();
-                        let mut other_stack = stack.clone();
-                        other_stack.push(reject);
-                        stack.push(accept);
-                        let a = self.exec(stack);
-                        let b = other.exec(other_stack);
-                        return select_value(&c, a, b);
+                } => {
+                    let c = self.eval(*condition).cond();
+                    match self.resolve(c) {
+                        Cond::Const(b) => stack.push(if b { accept } else { reject }),
+                        c => {
+                            let mut other = self.clone();
+                            let mut other_stack = stack.clone();
+                            other_stack.push(reject);
+                            stack.push(accept);
+                            let a = self.exec(stack);
+                            let b = other.exec(other_stack);
+                            return select_value(&c, a, b);
+                        }
                     }
+                }
+                s => match self.simple(s) {
+                    Some(Flow::Next) => {}
+                    _ => panic!("unsupported statement {s:?}"),
                 },
-                s => panic!("unsupported statement {s:?}"),
             }
         }
     }
 }
 
-fn run(module: &Module, func: &naga::Function, args: Vec<Value>, globals: &Globals) -> Value {
+fn run(module: &Module, func: &naga::Function, args: Vec<Value>, env: &Env, top: bool) -> Value {
     let mut frame = Frame {
         module,
         func,
-        globals,
+        env,
+        top,
         args,
         emitted: HashMap::new(),
         locals: HashMap::new(),
@@ -723,6 +935,7 @@ const UNUSED: u32 = u32::MAX;
 fn opaque(module: &Module, ty: Handle<naga::Type>) -> Value {
     let u = || Tree::In(UNUSED);
     match &module.types[ty].inner {
+        TypeInner::Scalar(s) if s.kind == ScalarKind::Bool => Value::Unknown,
         TypeInner::Scalar(_) => Value::Scalar(u()),
         TypeInner::Vector { size, .. } => Value::Vector(vec![u(); *size as usize]),
         TypeInner::Matrix { columns, rows, .. } => {
@@ -772,7 +985,7 @@ fn record(module: &Module, ty: Handle<naga::Type>, fields: &[(&str, Value)]) -> 
     )
 }
 
-fn global_record(module: &Module, name: &str, fields: &[(&str, Value)]) -> Globals {
+fn global_record(module: &Module, name: &str, fields: &[(&str, Value)]) -> HashMap<String, Value> {
     let (_, var) = module
         .global_variables
         .iter()
@@ -792,7 +1005,7 @@ fn function<'m>(module: &'m Module, name: &str) -> &'m naga::Function {
 
 /// Input layout of `BlackHole.WgslGeodesic`: `inv` 0–15, `dx` 16–31,
 /// `dy` 32–47, `dz` 48–63, momentum 64–67, screen 68–71.
-fn geodesic_rhs_setup(module: &Module, func: &naga::Function) -> (Vec<Value>, Globals) {
+fn geodesic_rhs_setup(module: &Module, func: &naga::Function, _: &Fixture) -> Env {
     let ray = record(
         module,
         func.arguments[0].ty,
@@ -808,77 +1021,125 @@ fn geodesic_rhs_setup(module: &Module, func: &naga::Function) -> (Vec<Value>, Gl
             ("dz", matrix(48)),
         ],
     );
-    (vec![ray, metric], Globals::new())
+    Env {
+        args: vec![ray, metric],
+        ..Env::default()
+    }
 }
 
-fn scalar_setup(_: &Module, _: &naga::Function) -> (Vec<Value>, Globals) {
-    (vec![scalar(0)], Globals::new())
+fn scalar_setup(_: &Module, _: &naga::Function, _: &Fixture) -> Env {
+    Env {
+        args: vec![scalar(0)],
+        ..Env::default()
+    }
 }
 
 /// Every channel reads input 0, matching the one-channel Lean model.
-fn tonemap_setup(_: &Module, _: &naga::Function) -> (Vec<Value>, Globals) {
-    (vec![Value::Vector(vec![Tree::In(0); 3])], Globals::new())
+fn tonemap_setup(_: &Module, _: &naga::Function, _: &Fixture) -> Env {
+    Env {
+        args: vec![Value::Vector(vec![Tree::In(0); 3])],
+        ..Env::default()
+    }
 }
 
 /// Stokes vector 0–3 with `polarization_view == 2` (the hue view).
-fn polarization_setup(module: &Module, _: &naga::Function) -> (Vec<Value>, Globals) {
-    let globals = global_record(module, "cam", &[("polarization_view", Value::Int(2))]);
-    (vec![vector(0, 4)], globals)
+fn polarization_setup(module: &Module, _: &naga::Function, _: &Fixture) -> Env {
+    Env {
+        args: vec![vector(0, 4)],
+        globals: global_record(module, "cam", &[("polarization_view", Value::Int(2))]),
+        ..Env::default()
+    }
 }
 
 /// `WgslScreen.spatialUnit` with `v` at inputs 100–102 and `gamma` from the
 /// metric `g` (entry `4 i + j`): `gamma[c][r] = g[c+1][r+1]`.
-fn spatial_unit_setup(_: &Module, _: &naga::Function) -> (Vec<Value>, Globals) {
+fn spatial_unit_setup(_: &Module, _: &naga::Function, _: &Fixture) -> Env {
     let gamma = Value::Matrix(
         (0..3)
             .map(|c| (0..3).map(|r| Tree::In(4 * (r + 1) + c + 1)).collect())
             .collect(),
     );
-    (vec![vector(100, 3), gamma], Globals::new())
+    Env {
+        args: vec![vector(100, 3), gamma],
+        ..Env::default()
+    }
 }
 
-type Setup = fn(&Module, &naga::Function) -> (Vec<Value>, Globals);
+/// Input layout of `BlackHole.WgslAddKerr`: `x` 0–2, mass 6, incoming `g`
+/// 8–23, `inv` 24–39, `dx/dy/dz` 40–87, clearance 88. The model reads the
+/// scaled spin `a` as inputs 3–5 and `kerr_radius(x, a)` as input 7; the
+/// computed `a` must equal `WgslAddKerr.spinScale` (spin 200–202, mass 6).
+/// The model covers `mass > 0`; `mass <= 0` returns the input metric.
+fn add_kerr_setup(module: &Module, func: &naga::Function, fixture: &Fixture) -> Env {
+    let base = record(
+        module,
+        func.arguments[0].ty,
+        &[
+            ("g", matrix(8)),
+            ("inv", matrix(24)),
+            ("dx", matrix(40)),
+            ("dy", matrix(56)),
+            ("dz", matrix(72)),
+            ("clearance", scalar(88)),
+        ],
+    );
+    let spin_input = |i: u32| if i < 3 { 200 + i } else { 6 };
+    let spin_scale = fixture["spin_scale"]
+        .iter()
+        .map(|t| rename(t, &spin_input))
+        .collect();
+    Env {
+        args: vec![base, vector(0, 3), scalar(6), vector(200, 3)],
+        opaque_calls: HashMap::from([("kerr_radius", scalar(7))]),
+        lets: HashMap::from([("a", (spin_scale, vector(3, 3)))]),
+        positive: vec![Tree::In(6)],
+        ..Env::default()
+    }
+}
+
+type Fixture = HashMap<String, Vec<Tree>>;
+type Setup = fn(&Module, &naga::Function, &Fixture) -> Env;
 
 #[rstest::rstest]
-#[case::geodesic_rhs("geodesic_rhs", geodesic_rhs_setup as Setup, 11)]
-#[case::atan_poly("atan_poly", scalar_setup as Setup, 1)]
-#[case::tonemap("tonemap", tonemap_setup as Setup, 3)]
-#[case::heatmap_color("heatmap_color", scalar_setup as Setup, 3)]
-#[case::polarization_color("polarization_color", polarization_setup as Setup, 3)]
-#[case::spatial_unit("spatial_unit", spatial_unit_setup as Setup, 3)]
-fn naga_ir_matches_lean_model(#[case] name: &str, #[case] setup: Setup, #[case] outputs: usize) {
+#[case::geodesic_rhs("geodesic_rhs", geodesic_rhs_setup as Setup)]
+#[case::atan_poly("atan_poly", scalar_setup as Setup)]
+#[case::tonemap("tonemap", tonemap_setup as Setup)]
+#[case::heatmap_color("heatmap_color", scalar_setup as Setup)]
+#[case::polarization_color("polarization_color", polarization_setup as Setup)]
+#[case::spatial_unit("spatial_unit", spatial_unit_setup as Setup)]
+#[case::add_kerr("add_kerr", add_kerr_setup as Setup)]
+fn naga_ir_matches_lean_model(#[case] name: &str, #[case] setup: Setup) {
     let source = common::compile_wesl(include_str!("../assets/shaders/geodesic.wesl"));
     let module = naga::front::wgsl::parse_str(&source).expect("geodesic.wesl parses");
     let func = function(&module, name);
-    let (args, globals) = setup(&module, func);
-    let mut out = Vec::new();
-    run(&module, func, args, &globals).flatten(&mut out);
-    assert_eq!(out.len(), outputs);
     let fixture = fixture();
-    for (i, tree) in out.into_iter().enumerate() {
-        let key = if outputs == 1 {
-            name.to_string()
-        } else {
-            format!("{name}.{i}")
-        };
-        let lean = normalize(fixture[&key].clone());
-        if let Some(d) = difference(&normalize(tree), &lean, &key) {
-            panic!("naga IR differs from the Lean model {d}");
-        }
-    }
+    let env = setup(&module, func, &fixture);
+    let mut out = Vec::new();
+    run(&module, func, env.args.clone(), &env, true).flatten(&mut out);
+    compare(out, &fixture[name], name);
 }
 
 #[test]
 fn fixture_lists_the_checked_kernels() {
-    let mut keys: Vec<String> = fixture().into_keys().collect();
-    keys.sort();
-    let mut expected: Vec<String> = (0..11).map(|i| format!("geodesic_rhs.{i}")).collect();
-    expected.push("atan_poly".into());
-    for name in ["tonemap", "heatmap_color", "polarization_color", "spatial_unit"] {
-        expected.extend((0..3).map(|i| format!("{name}.{i}")));
-    }
-    expected.sort();
-    assert_eq!(keys, expected);
+    let mut counts: Vec<(String, usize)> = fixture()
+        .into_iter()
+        .map(|(name, trees)| (name, trees.len()))
+        .collect();
+    counts.sort();
+    let expected = [
+        ("add_kerr", 81),
+        ("atan_poly", 1),
+        ("geodesic_rhs", 11),
+        ("heatmap_color", 3),
+        ("polarization_color", 3),
+        ("spatial_unit", 3),
+        ("spin_scale", 3),
+        ("tonemap", 3),
+    ];
+    assert_eq!(
+        counts,
+        expected.map(|(n, c)| (n.to_string(), c)).to_vec()
+    );
 }
 
 proptest::proptest! {

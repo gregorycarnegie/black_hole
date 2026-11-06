@@ -25,7 +25,9 @@ m.valid = m.valid && m.inv[0][0] < -1.0e-6;
 Inputs: `x` 0–2, `a` 3–5 (the scaled spin actually used), `mass` 6, the
 computed Kerr radius `raw_r` 7 (its error is `WgslKerrRadius.kerr_radius_error`,
 at most `160u·r`), incoming `g` 8–23, `inv` 24–39, `dx/dy/dz` 40–87 and
-clearance 88. The scaling of `spin` into `a` is `spinScale` below.
+clearance 88. The scaling of `spin` into `a` is `spinScale` below. The
+programs describe `mass > 0`; for `mass <= 0` the shader returns the incoming
+metric unchanged.
 
 `add_kerr_error` bounds every updated metric, inverse, derivative and
 clearance entry by the running bound of `WgslExpr`, for every input where its
@@ -92,12 +94,14 @@ def dn (j i : Fin 3) : GExpr :=
 def dl (j : Fin 3) (i : Fin 4) : GExpr :=
   Fin.cases (c 0) (fun i => div (sub (dn j i) (mul (mul (mul (ell i.succ) (c 2)) r) (dr j))) r2a2) i
 
-/-- Updated metric entries `g + 2 h ell ell^T`. -/
-def gOut (i j : Fin 4) : GExpr := add (g0 i j) (mul (mul (mul (c 2) h) (ell i)) (ell j))
-/-- Updated derivative entries `d + 2 dh ell ell^T + 2 h (dl ell^T + ell dl^T)`. -/
+/-- `outer(a, b)` entry `(i, j)`: `a[i]*b[j]`. -/
+def outer (u v : Fin 4 → GExpr) (i j : Fin 4) : GExpr := mul (u i) (v j)
+/-- Updated metric entries `g + (2 h) ll`, with `ll = outer(ell, ell)`. -/
+def gOut (i j : Fin 4) : GExpr := add (g0 i j) (mul (mul (c 2) h) (outer ell ell i j))
+/-- Updated derivative entries `d + (2 dh) ll + (2 h)(outer(dl, ell) + outer(ell, dl))`. -/
 def dOut (e : Fin 3) (i j : Fin 4) : GExpr :=
-  add (d0 e i j) (add (mul (mul (mul (c 2) (dh e)) (ell i)) (ell j))
-    (mul (mul (c 2) h) (add (mul (dl e i) (ell j)) (mul (ell i) (dl e j)))))
+  add (d0 e i j) (add (mul (mul (c 2) (dh e)) (outer ell ell i j))
+    (mul (mul (c 2) h) (add (outer (dl e) ell i j) (outer ell (dl e) i j))))
 def raised (i : Fin 4) : GExpr := sum4 fun j => mul (inv0 i j) (ell j)
 def divisor : GExpr := add (c 1) (mul (mul (c 2) h) (sum4 fun i => mul (ell i) (raised i)))
 /-- Updated inverse entries; the early return keeps the incoming inverse. -/

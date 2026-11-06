@@ -4,6 +4,7 @@ public import BlackHole.WgslGeodesic
 public import BlackHole.WgslAtan2
 public import BlackHole.WgslPlasma
 public import BlackHole.WgslScreen
+public import BlackHole.WgslAddKerr
 
 /-! Translation-validation fixture for the straight-line kernels (obligation
 F3).
@@ -27,12 +28,12 @@ open WgslPoly PExpr
 
 /-- The kernel outputs the fixture records, in order. -/
 def kernels : List (String × PExpr) :=
-  [("geodesic_rhs.0", WgslGeodesic.rhs 0), ("geodesic_rhs.1", WgslGeodesic.rhs 1),
-    ("geodesic_rhs.2", WgslGeodesic.rhs 2), ("geodesic_rhs.3", WgslGeodesic.rhs 3),
-    ("geodesic_rhs.4", WgslGeodesic.rhs 4), ("geodesic_rhs.5", WgslGeodesic.rhs 5),
-    ("geodesic_rhs.6", WgslGeodesic.rhs 6), ("geodesic_rhs.7", WgslGeodesic.rhs 7),
-    ("geodesic_rhs.8", WgslGeodesic.rhs 8), ("geodesic_rhs.9", WgslGeodesic.rhs 9),
-    ("geodesic_rhs.10", WgslGeodesic.rhs 10), ("atan_poly", WgslAtan2.polyE)]
+  [("geodesic_rhs", WgslGeodesic.rhs 0), ("geodesic_rhs", WgslGeodesic.rhs 1),
+    ("geodesic_rhs", WgslGeodesic.rhs 2), ("geodesic_rhs", WgslGeodesic.rhs 3),
+    ("geodesic_rhs", WgslGeodesic.rhs 4), ("geodesic_rhs", WgslGeodesic.rhs 5),
+    ("geodesic_rhs", WgslGeodesic.rhs 6), ("geodesic_rhs", WgslGeodesic.rhs 7),
+    ("geodesic_rhs", WgslGeodesic.rhs 8), ("geodesic_rhs", WgslGeodesic.rhs 9),
+    ("geodesic_rhs", WgslGeodesic.rhs 10), ("atan_poly", WgslAtan2.polyE)]
 
 def sexp : PExpr → String
   | input i => s!"(in {i})"
@@ -107,20 +108,33 @@ above plus `(div a b)`, `(max a b)`, `(min a b)`, unary `(sqrt a)`, `(abs a)`,
 `(cosS a)`, `(inh f a)`, `(tanh f a)`, `(lt c num den a b)` and
 `(lt2 a b x y)`. -/
 
+/-- Matrix entries in WGSL storage order: column by column. -/
+def columns {α : Type} (f : Fin 4 → Fin 4 → α) : List α :=
+  (List.finRange 4).flatMap fun c => (List.finRange 4).map fun r => f r c
+
+/-- `add_kerr`'s outputs in the order of the `Metric` struct: `g`, `inv`,
+`dx`, `dy`, `dz`, `clearance` (the `valid` flag is not modeled here). -/
+def addKerrOutputs : List WgslAddKerr.Output :=
+  columns .metric ++ columns .inverse ++
+    (List.finRange 3).flatMap (fun e => columns (.derivative e)) ++ [.clearance]
+
 open WgslExpr in
 /-- The branching kernel outputs the fixture records, in order. `tonemap` is
 recorded once per channel; `spatial_unit` reads `v` from inputs 100–102. -/
 def branching : List (String × WgslExpr.GExpr) :=
-  [("tonemap.0", WgslPlasma.tonemap), ("tonemap.1", WgslPlasma.tonemap),
-    ("tonemap.2", WgslPlasma.tonemap),
-    ("heatmap_color.0", WgslPlasma.heatmap 0), ("heatmap_color.1", WgslPlasma.heatmap 1),
-    ("heatmap_color.2", WgslPlasma.heatmap 2),
-    ("polarization_color.0", WgslPlasma.polarizationHue 0),
-    ("polarization_color.1", WgslPlasma.polarizationHue 1),
-    ("polarization_color.2", WgslPlasma.polarizationHue 2),
-    ("spatial_unit.0", WgslScreen.spatialUnit (fun j => GExpr.input (100+j)) 0),
-    ("spatial_unit.1", WgslScreen.spatialUnit (fun j => GExpr.input (100+j)) 1),
-    ("spatial_unit.2", WgslScreen.spatialUnit (fun j => GExpr.input (100+j)) 2)]
+  [("tonemap", WgslPlasma.tonemap), ("tonemap", WgslPlasma.tonemap),
+    ("tonemap", WgslPlasma.tonemap),
+    ("heatmap_color", WgslPlasma.heatmap 0), ("heatmap_color", WgslPlasma.heatmap 1),
+    ("heatmap_color", WgslPlasma.heatmap 2),
+    ("polarization_color", WgslPlasma.polarizationHue 0),
+    ("polarization_color", WgslPlasma.polarizationHue 1),
+    ("polarization_color", WgslPlasma.polarizationHue 2),
+    ("spatial_unit", WgslScreen.spatialUnit (fun j => GExpr.input (100+j)) 0),
+    ("spatial_unit", WgslScreen.spatialUnit (fun j => GExpr.input (100+j)) 1),
+    ("spatial_unit", WgslScreen.spatialUnit (fun j => GExpr.input (100+j)) 2),
+    ("spin_scale", WgslAddKerr.spinScale 0), ("spin_scale", WgslAddKerr.spinScale 1),
+    ("spin_scale", WgslAddKerr.spinScale 2)] ++
+  addKerrOutputs.map fun o => ("add_kerr", WgslAddKerr.program o)
 
 def gsexp : WgslExpr.GExpr → String
   | .input i => s!"(in {i})"
@@ -190,8 +204,12 @@ macro "branching_fixture" : term => do
     `(Prod.mk $(Lean.quote name) $e)
   `([$entries,*])
 
+set_option maxHeartbeats 20000000 in
+set_option maxRecDepth 100000 in
 def branchingFixture : List (String × WgslExpr.GExpr) := branching_fixture
 
+set_option maxHeartbeats 20000000 in
+set_option maxRecDepth 100000 in
 /-- The committed branching fixture is exactly the modeled kernels. -/
 theorem branching_fixture_eq : branchingFixture = branching := by decide +kernel
 
