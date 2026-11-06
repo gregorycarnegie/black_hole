@@ -36,7 +36,7 @@ noncomputable section
 namespace BlackHole.WgslScreen
 open Wgsl WgslExpr GExpr
 
-def f32_1em20 : ℝ := 1547425/154742504910672534362390528
+def f32_1em20 : ℚ := 1547425/154742504910672534362390528
 
 def g (i j : Fin 4) : GExpr := input (4*i+j)
 def inv (i j : Fin 4) : GExpr := input (16+4*i+j)

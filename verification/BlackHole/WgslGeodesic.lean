@@ -59,8 +59,10 @@ def contracted (i : Fin 4) : PExpr :=
 def posRhs (i : Fin 3) : PExpr := k i.succ
 def momRhs (i : Fin 4) : PExpr :=
   mul (const (1/2)) (Fin.cases (const 0) (fun e => dot k (mv (dmat e) k)) i)
+/-- `-0.5*m.inv*(...)` scales every matrix entry before the product. -/
 def screenRhs (i : Fin 4) : PExpr :=
-  mul (const (-1/2)) (mv inv (fun j => sub (add (mv (comb k) f j) (mv (comb f) k j)) (contracted j)) i)
+  mv (fun i j => mul (const (-1/2)) (inv i j))
+    (fun j => sub (add (mv (comb k) f j) (mv (comb f) k j)) (contracted j)) i
 
 /-- All eleven output components of `geodesic_rhs`. -/
 def rhs (o : Fin 11) : PExpr :=
@@ -98,7 +100,7 @@ theorem rhs_divcOk (o : Fin 11) : (rhs o).DivcOk := by
   · have hj (j : Fin 4) :
         (sub (add (mv (comb k) f j) (mv (comb f) k j)) (contracted j)).DivcOk :=
       ⟨⟨divcOk_mv (hcomb k hk) (fun _ => hin _) j,divcOk_mv (hcomb f (fun _ => hin _)) hk j⟩,hcon j⟩
-    exact ⟨trivial,divcOk_mv (fun _ _ => hin _) hj _⟩
+    exact divcOk_mv (M := fun i j => mul (const (-1/2)) (inv i j)) (fun _ _ => ⟨trivial,hin _⟩) hj _
 
 /-- The WGSL error of every `geodesic_rhs` output, for every input. `A` is
 the absolute evaluation of that output's program. -/
@@ -108,14 +110,14 @@ theorem geodesic_rhs_error (v w α : ℕ → ℝ) (kk : ℕ → ℕ)
     |y-(rhs o).exact v| ≤ Γ ((rhs o).ops kk)*(rhs o).absEval α :=
   (error v w α kk hα hw (rhs o) y (rhs_divcOk o) hy).2
 
-/-- Rounded operations per output: 7 for position, 176 for momentum and 869
+/-- Rounded operations per output: 7 for position, 176 for momentum and 872
 for the screen, counting each use of the shared `k` separately. -/
-theorem rhs_ops (o : Fin 11) : (rhs o).ops (fun _ => 0) ≤ 869 := by
+theorem rhs_ops (o : Fin 11) : (rhs o).ops (fun _ => 0) ≤ 872 := by
   fin_cases o <;> decide
 
-theorem Γ869_small : Γ 869 < 3/10000 := by
-  have hn : ((869:ℕ):ℝ)*U < 1 := by unfold U Wgsl.u; norm_num
-  refine (Γ_le 869 hn).trans_lt ?_
+theorem Γ872_small : Γ 872 < 3/10000 := by
+  have hn : ((872:ℕ):ℝ)*U < 1 := by unfold U Wgsl.u; norm_num
+  refine (Γ_le 872 hn).trans_lt ?_
   unfold U Wgsl.u; norm_num
 
 /-- With exact inputs every `geodesic_rhs` output is within `3·10⁻⁴` of the
@@ -126,12 +128,12 @@ theorem geodesic_rhs_exact_inputs (v : ℕ → ℝ) (o : Fin 11) (y : ℝ) (hy :
     (rhs_divcOk o) hy
   have hA : 0 ≤ (rhs o).absEval (fun i => |v i|) := (abs_nonneg _).trans hall.1
   refine hall.2.trans (mul_le_mul_of_nonneg_right ?_ hA)
-  exact ((Γ_mono (rhs_ops o)).trans Γ869_small.le)
+  exact ((Γ_mono (rhs_ops o)).trans Γ872_small.le)
 
 /-! RK4 arithmetic. Inputs: state component 0, step `h` 1, stage derivatives
 2–5 (each carrying the error of its own `geodesic_rhs` evaluation). -/
 
-def stage (c : ℝ) : PExpr := add (input 0) (mul (mul (const c) (input 1)) (input 2))
+def stage (c : ℚ) : PExpr := add (input 0) (mul (mul (const c) (input 1)) (input 2))
 def combination : PExpr :=
   add (input 0) (mul (divc (input 1) 6)
     (add (add (add (input 2) (mul (const 2) (input 3))) (mul (const 2) (input 4))) (input 5)))
@@ -153,10 +155,10 @@ theorem rk4_combination_error (v w α : ℕ → ℝ) (kk : ℕ → ℕ)
   simpa [combination,exact] using h
 
 /-- A stage state `ray + (c h) d`, with `c = 1/2` or `1`. -/
-theorem rk4_stage_error (c : ℝ) (v w α : ℕ → ℝ) (kk : ℕ → ℕ)
+theorem rk4_stage_error (c : ℚ) (v w α : ℕ → ℝ) (kk : ℕ → ℕ)
     (hα : ∀ i, |v i| ≤ α i) (hw : ∀ i, |w i-v i| ≤ Γ (kk i)*α i) (y : ℝ)
     (hy : (stage c).Computes w y) :
-    |y-(v 0+c*v 1*v 2)| ≤ Γ (kk 0+kk 1+kk 2+3)*(stage c).absEval α := by
+    |y-(v 0+(c : ℝ)*v 1*v 2)| ≤ Γ (kk 0+kk 1+kk 2+3)*(stage c).absEval α := by
   have h := (error v w α kk hα hw (stage c) y (by simp [stage,DivcOk]) hy).2
   have hops : (stage c).ops kk = kk 0+kk 1+kk 2+3 := by simp only [stage,ops]; omega
   rw [hops] at h

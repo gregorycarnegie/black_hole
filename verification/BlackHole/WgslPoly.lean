@@ -17,10 +17,11 @@ kernels, described by a magnitude bound `α i ≥ |v i|` and an operation count
 
 `error` proves `|y - exact| ≤ ((1+U)^N - 1)·A` for every input and every
 admissible rounding, where `N` counts operations and `A` is the absolute
-evaluation with `η/U` added at each rounded node. Both `N` and `A` are
-unchanged by the reassociation of sums and products that WGSL permits, and
-fusion is covered because a fused result satisfies the same per-operation
-model. -/
+evaluation with `η/U` added at each rounded node. `N` is unchanged by the
+reassociation of sums and products that WGSL permits, and `A` by reassociating
+sums and commuting products; reassociating a product changes `A` only in its
+flush-to-zero terms. Fusion is covered because a fused result satisfies the
+same per-operation model. -/
 
 @[expose] public section
 noncomputable section
@@ -65,23 +66,24 @@ lemma Γ_le (n : ℕ) (h : (n:ℝ)*U < 1) : Γ n ≤ (n*U)/(1-n*U) := by
 
 inductive PExpr
   | input (i : ℕ)
-  | const (c : ℝ)
+  | const (c : ℚ)
   | add (a b : PExpr)
   | sub (a b : PExpr)
   | mul (a b : PExpr)
   | neg (a : PExpr)
-  | divc (a : PExpr) (c : ℝ)
+  | divc (a : PExpr) (c : ℚ)
+  deriving DecidableEq
 
 namespace PExpr
 
 def exact (v : ℕ → ℝ) : PExpr → ℝ
   | input i => v i
-  | const c => c
+  | const c => (c : ℝ)
   | add a b => exact v a+exact v b
   | sub a b => exact v a-exact v b
   | mul a b => exact v a*exact v b
   | neg a => -exact v a
-  | divc a c => exact v a/c
+  | divc a c => exact v a/(c : ℝ)
 
 /-- Operation count, including the operations behind each input. -/
 def ops (k : ℕ → ℕ) : PExpr → ℕ
@@ -96,22 +98,22 @@ def ops (k : ℕ → ℕ) : PExpr → ℕ
 /-- Absolute evaluation, with the flush allowance `η/U` per rounded node. -/
 def absEval (α : ℕ → ℝ) : PExpr → ℝ
   | input i => α i
-  | const c => |c|
+  | const c => |(c : ℝ)|
   | add a b => absEval α a+absEval α b+η/U
   | sub a b => absEval α a+absEval α b+η/U
   | mul a b => absEval α a*absEval α b+η/U
   | neg a => absEval α a
-  | divc a c => absEval α a/|c|+η/U
+  | divc a c => absEval α a/|(c : ℝ)|+η/U
 
 /-- Some WGSL evaluation of the program, from computed inputs `w`, returns `y`. -/
 def Computes (w : ℕ → ℝ) : PExpr → ℝ → Prop
   | input i, y => y = w i
-  | const c, y => y = c
+  | const c, y => y = (c : ℝ)
   | add a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya+yb) y
   | sub a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya-yb) y
   | mul a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya*yb) y
   | neg a, y => ∃ ya, Computes w a ya ∧ y = -ya
-  | divc a c, y => ∃ ya, Computes w a ya ∧ DivSpec ya c y
+  | divc a c, y => ∃ ya, Computes w a ya ∧ DivSpec ya (c : ℝ) y
 
 /-- Every constant divisor lies in WGSL's specified division range. -/
 def DivcOk : PExpr → Prop
@@ -121,7 +123,7 @@ def DivcOk : PExpr → Prop
   | sub a b => DivcOk a ∧ DivcOk b
   | mul a b => DivcOk a ∧ DivcOk b
   | neg a => DivcOk a
-  | divc a c => DivcOk a ∧ 1/2^126 ≤ |c| ∧ |c| ≤ 2^126
+  | divc a c => DivcOk a ∧ 1/2^126 ≤ |(c : ℝ)| ∧ |(c : ℝ)| ≤ 2^126
 
 lemma ηU_nonneg : 0 ≤ η/U := div_nonneg η_pos.le U_pos.le
 
@@ -252,8 +254,11 @@ theorem error (v w α : ℕ → ℝ) (k : ℕ → ℕ)
     have hAa : 0 ≤ Aa := (abs_nonneg _).trans ea
     have hga := Γ_nonneg (ops k a)
     have hηU : U*(η/U) = η := by field_simp
-    have hc0 : 0 < |c| := lt_of_lt_of_le (by norm_num) hc.2.1
-    have hy := hy hc.2
+    have hc2 : 1/2^126 ≤ |(c : ℝ)| ∧ |(c : ℝ)| ≤ 2^126 := hc.2
+    clear hc
+    generalize (c : ℝ) = c at hy hc2 ⊢
+    have hc0 : 0 < |c| := lt_of_lt_of_le (by norm_num) hc2.1
+    have hy := hy hc2
     refine ⟨?_,?_⟩
     · rw [abs_div]
       have := div_le_div_of_nonneg_right ea hc0.le

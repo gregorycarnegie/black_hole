@@ -30,7 +30,7 @@ open Wgsl WgslPoly
 
 inductive GExpr
   | input (i : ℕ)
-  | const (c : ℝ)
+  | const (c : ℚ)
   | add (a b : GExpr)
   | sub (a b : GExpr)
   | mul (a b : GExpr)
@@ -40,7 +40,7 @@ inductive GExpr
   | max (a b : GExpr)
   | min (a b : GExpr)
   /-- `if c < t { a } else { b }` for an exact threshold `t`. -/
-  | lt (c : GExpr) (t : ℝ) (a b : GExpr)
+  | lt (c : GExpr) (t : ℚ) (a b : GExpr)
   | abs (a : GExpr)
   /-- `inverseSqrt`, 2 ULP. -/
   | invsqrt (a : GExpr)
@@ -60,6 +60,7 @@ inductive GExpr
   /-- `sincos(a).x` and `sincos(a).y` of the shader's arithmetic `sincos`. -/
   | sinS (a : GExpr)
   | cosS (a : GExpr)
+  deriving DecidableEq
 
 def exp2R (x : ℝ) : ℝ := Real.exp (x*Real.log 2)
 
@@ -90,7 +91,7 @@ namespace GExpr
 
 def exact (v : ℕ → ℝ) : GExpr → ℝ
   | input i => v i
-  | const c => c
+  | const c => (c : ℝ)
   | add a b => exact v a+exact v b
   | sub a b => exact v a-exact v b
   | mul a b => exact v a*exact v b
@@ -99,7 +100,7 @@ def exact (v : ℕ → ℝ) : GExpr → ℝ
   | sqrt a => Real.sqrt (exact v a)
   | max a b => Max.max (exact v a) (exact v b)
   | min a b => Min.min (exact v a) (exact v b)
-  | lt c t a b => if exact v c < t then exact v a else exact v b
+  | lt c t a b => if exact v c < (t : ℝ) then exact v a else exact v b
   | abs a => |exact v a|
   | invsqrt a => 1/Real.sqrt (exact v a)
   | exp a => Real.exp (exact v a)
@@ -126,7 +127,7 @@ def bound (v E : ℕ → ℝ) : GExpr → ℝ
   | sqrt a => bound v E a/Real.sqrt (exact v a)+10*u*Real.sqrt (exact v a+bound v E a)+η
   | max a b => Max.max (bound v E a) (bound v E b)
   | min a b => Max.max (bound v E a) (bound v E b)
-  | lt c t a b => if exact v c < t then bound v E a else bound v E b
+  | lt c t a b => if exact v c < (t : ℝ) then bound v E a else bound v E b
   | abs a => bound v E a
   | invsqrt a => bound v E a/(Real.sqrt (exact v a-bound v E a)*Real.sqrt (exact v a)*
       (Real.sqrt (exact v a-bound v E a)+Real.sqrt (exact v a)))+
@@ -158,7 +159,7 @@ def Safe (v E : ℕ → ℝ) : GExpr → Prop
   | sqrt a => Safe v E a ∧ 0 < exact v a ∧ bound v E a ≤ exact v a
   | max a b => Safe v E a ∧ Safe v E b
   | min a b => Safe v E a ∧ Safe v E b
-  | lt c t a b => Safe v E c ∧ Safe v E a ∧ Safe v E b ∧ bound v E c < |exact v c-t|
+  | lt c t a b => Safe v E c ∧ Safe v E a ∧ Safe v E b ∧ bound v E c < |exact v c-(t : ℝ)|
   | abs a => Safe v E a
   | invsqrt a => Safe v E a ∧ bound v E a < exact v a
   | exp a => Safe v E a
@@ -176,7 +177,7 @@ def Safe (v E : ℕ → ℝ) : GExpr → Prop
 /-- Some WGSL evaluation of the program from computed inputs `w` returns `y`. -/
 def Computes (w : ℕ → ℝ) : GExpr → ℝ → Prop
   | input i, y => y = w i
-  | const c, y => y = c
+  | const c, y => y = (c : ℝ)
   | add a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya+yb) y
   | sub a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya-yb) y
   | mul a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ Rnd (ya*yb) y
@@ -186,7 +187,7 @@ def Computes (w : ℕ → ℝ) : GExpr → ℝ → Prop
   | max a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ y = Max.max ya yb
   | min a b, y => ∃ ya yb, Computes w a ya ∧ Computes w b yb ∧ y = Min.min ya yb
   | lt c t a b, y => ∃ yc, Computes w c yc ∧
-      ((yc < t ∧ Computes w a y) ∨ (¬ yc < t ∧ Computes w b y))
+      ((yc < (t : ℝ) ∧ Computes w a y) ∨ (¬ yc < (t : ℝ) ∧ Computes w b y))
   | abs a, y => ∃ ya, Computes w a ya ∧ y = |ya|
   | invsqrt a, y => ∃ ya, Computes w a ya ∧ InvSqrt ya y
   | exp a, y => ∃ ya, Computes w a ya ∧ |y-Real.exp ya| ≤ (3+2*|ya|)*ulp (Real.exp ya)

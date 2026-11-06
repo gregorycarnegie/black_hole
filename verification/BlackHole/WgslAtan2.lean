@@ -184,7 +184,8 @@ def cfs : List ℚ := [1, -11184811/33554432, 13421773/67108864, -9586981/671088
   14913081/134217728, -3050403/33554432, 10324441/134217728, -8947849/134217728,
   15790321/268435456, -7064091/134217728, 12782641/268435456, -11671107/268435456,
   5368709/134217728]
-def cf (k : ℕ) : ℝ := ((cfs.getD k 0 : ℚ) : ℝ)
+def cfq (k : ℕ) : ℚ := cfs.getD k 0
+def cf (k : ℕ) : ℝ := (cfq k : ℝ)
 
 /-- `f32(π)`. -/
 def PIf : ℝ := 13176795/4194304
@@ -195,7 +196,7 @@ open PExpr in
 def u2 : PExpr := mul (input 0) (input 0)
 
 open PExpr in
-def hornerE : List ℝ → PExpr
+def hornerE : List ℚ → PExpr
   | [] => const 0
   | [c] => const c
   | c :: cs => add (const c) (mul u2 (hornerE cs))
@@ -203,15 +204,15 @@ def hornerE : List ℝ → PExpr
 open PExpr in
 /-- `atan_poly(u)`, reading `u` as input 0. -/
 def polyE : PExpr :=
-  mul (input 0) (add (const 1) (mul u2 (hornerE [cf 1,cf 2,cf 3,cf 4,cf 5,cf 6,cf 7,cf 8,
-    cf 9,cf 10,cf 11,cf 12])))
+  mul (input 0) (add (const 1) (mul u2 (hornerE [cfq 1,cfq 2,cfq 3,cfq 4,cfq 5,cfq 6,cfq 7,cfq 8,
+    cfq 9,cfq 10,cfq 11,cfq 12])))
 
 /-- The polynomial the shader evaluates, with its binary32 coefficients. -/
 def p32 (u : ℝ) : ℝ := ∑ k ∈ Finset.range 13, cf k*u^(2*k+1)
 
 theorem polyE_exact (v : ℕ → ℝ) : polyE.exact v = p32 (v 0) := by
-  simp only [polyE,hornerE,u2,PExpr.exact,p32,Finset.sum_range_succ,Finset.sum_range_zero]
-  have h0 : cf 0 = 1 := by norm_num [cf,cfs]
+  simp only [polyE,hornerE,u2,PExpr.exact,p32,Finset.sum_range_succ,Finset.sum_range_zero,cf]
+  have h0 : (cfq 0 : ℝ) = 1 := by norm_num [cfq,cfs]
   rw [h0]
   ring
 
@@ -229,7 +230,7 @@ lemma absEval_le (b : ℝ) (hb : b = 4145/10000) :
     polyE.absEval (fun _ => b) ≤ 45/100 := by
   have he : η/U = (1/2^126)/(5*(1/2^24)) := rfl
   subst hb
-  simp only [polyE,hornerE,u2,PExpr.absEval,he,cf,cfs]
+  simp only [polyE,hornerE,u2,PExpr.absEval,he,cfq,cfs]
   norm_num
 
 lemma coeff_error (v : ℝ) (hv : |v| ≤ 1) : |p32 v-poly v| ≤ u := by
@@ -241,7 +242,7 @@ lemma coeff_error (v : ℝ) (hv : |v| ≤ 1) : |p32 v-poly v| ≤ u := by
     rw [abs_mul,abs_pow]
     exact mul_le_of_le_one_right (abs_nonneg _) (pow_le_one₀ (abs_nonneg _) hv)
   refine (Finset.abs_sum_le_sum_abs _ _).trans ((Finset.sum_le_sum fun k _ => hterm k).trans ?_)
-  simp only [Finset.sum_range_succ,Finset.sum_range_zero,cf,cfs]
+  simp only [Finset.sum_range_succ,Finset.sum_range_zero,cf,cfq,cfs]
   norm_num [u]
 
 lemma pi_close : 0 < PIf-π ∧ PIf-π ≤ 151/100*u := by

@@ -44,13 +44,13 @@ noncomputable section
 namespace BlackHole.WgslAddKerr
 open Wgsl WgslExpr GExpr
 
-def c (r : ℝ) : GExpr := const r
+def c (r : ℚ) : GExpr := const r
 
 /-! The shader's decimal literals as the binary32 values it actually uses. -/
-def f32_0_8 : ℝ := 13421773/16777216
-def f32_0_999 : ℝ := 16760439/16777216
-def f32_1em12 : ℝ := 2305843/2305843009213693952
-def f32_1em6 : ℝ := 8796093/8796093022208
+def f32_0_8 : ℚ := 13421773/16777216
+def f32_0_999 : ℚ := 16760439/16777216
+def f32_1em12 : ℚ := 2305843/2305843009213693952
+def f32_1em6 : ℚ := 8796093/8796093022208
 def xs (i : Fin 3) : GExpr := input i
 def as (i : Fin 3) : GExpr := input (3+i)
 def mass : GExpr := input 6

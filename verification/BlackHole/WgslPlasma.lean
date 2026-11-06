@@ -34,34 +34,34 @@ open Wgsl WgslExpr GExpr WgslScreen
 
 /-! ### Literals (binary32 values) -/
 
-def c (r : ℝ) : GExpr := const r
-def L0_4 : ℝ := 13421773/33554432
-def L1em4 : ℝ := 13743895/137438953472
-def L1em3 : ℝ := 8589935/8589934592
-def L0_01 : ℝ := 5368709/536870912
-def L0_06 : ℝ := 16106127/268435456
-def L0_35 : ℝ := 11744051/33554432
-def L0_488 : ℝ := 16374563/33554432
-def L0_6 : ℝ := 5033165/8388608
-def L0_65 : ℝ := 5452595/8388608
-def L0_3 : ℝ := 5033165/16777216
-def L0_2126 : ℝ := 891709/4194304
-def L0_7152 : ℝ := 11999065/16777216
-def L0_0722 : ℝ := 1211315/16777216
-def L0_7 : ℝ := 11744051/16777216
-def L1em5 : ℝ := 2748779/274877906944
-def L0_95 : ℝ := 15938355/16777216
-def L0_80 : ℝ := 13421773/16777216
-def L0_05 : ℝ := 13421773/268435456
-def L0_02 : ℝ := 5368709/268435456
-def L0_999 : ℝ := 16760439/16777216
-def L1em12 : ℝ := 2305843/2305843009213693952
-def L1em20 : ℝ := 1547425/154742504910672534362390528
-def L0_1 : ℝ := 13421773/134217728
-def L1em8 : ℝ := 11258999/1125899906842624
+def c (r : ℚ) : GExpr := const r
+def L0_4 : ℚ := 13421773/33554432
+def L1em4 : ℚ := 13743895/137438953472
+def L1em3 : ℚ := 8589935/8589934592
+def L0_01 : ℚ := 5368709/536870912
+def L0_06 : ℚ := 16106127/268435456
+def L0_35 : ℚ := 11744051/33554432
+def L0_488 : ℚ := 16374563/33554432
+def L0_6 : ℚ := 5033165/8388608
+def L0_65 : ℚ := 5452595/8388608
+def L0_3 : ℚ := 5033165/16777216
+def L0_2126 : ℚ := 891709/4194304
+def L0_7152 : ℚ := 11999065/16777216
+def L0_0722 : ℚ := 1211315/16777216
+def L0_7 : ℚ := 11744051/16777216
+def L1em5 : ℚ := 2748779/274877906944
+def L0_95 : ℚ := 15938355/16777216
+def L0_80 : ℚ := 13421773/16777216
+def L0_05 : ℚ := 13421773/268435456
+def L0_02 : ℚ := 5368709/268435456
+def L0_999 : ℚ := 16760439/16777216
+def L1em12 : ℚ := 2305843/2305843009213693952
+def L1em20 : ℚ := 1547425/154742504910672534362390528
+def L0_1 : ℚ := 13421773/134217728
+def L1em8 : ℚ := 11258999/1125899906842624
 /-- `PI / 180.0` evaluated in binary32. -/
-def LPI_180 : ℝ := 9370165/536870912
-def LSQRT3_2 : ℝ := 14529495/16777216
+def LPI_180 : ℚ := 9370165/536870912
+def LSQRT3_2 : ℚ := 14529495/16777216
 
 /-! ### Inputs -/
 
@@ -88,7 +88,7 @@ def smoothstep (e0 e1 x : GExpr) : GExpr :=
   let t := clamp (div (sub x e0) (sub e1 e0)) (c 0) (c 1)
   mul (mul t t) (sub (c 3) (mul (c 2) t))
 /-- `pow(x, y)` for an exact exponent, inherited from `exp2(y * log2(x))`. -/
-def pow (x : GExpr) (y : ℝ) : GExpr := inh (exp2 (mul (c y) (log2 (input 0)))) x
+def pow (x : GExpr) (y : ℚ) : GExpr := inh (exp2 (mul (c y) (log2 (input 0)))) x
 def tanhInh : GExpr :=
   div (mul (sub (exp (input 0)) (exp (neg (input 0)))) (c (1/2)))
     (mul (add (exp (input 0)) (exp (neg (input 0)))) (c (1/2)))
@@ -157,10 +157,10 @@ def ntTemp (r : GExpr) : GExpr :=
 
 def blackbody (t : GExpr) (i : Fin 3) : GExpr :=
   let s := clamp t (c 0) (c 1)
-  let c1 : Fin 3 → ℝ := ![L0_05,0,0]
-  let c2 : Fin 3 → ℝ := ![1,L0_35,L0_02]
-  let c3 : Fin 3 → ℝ := ![1,L0_95,L0_80]
-  let c4 : Fin 3 → ℝ := ![L0_65,L0_80,1]
+  let c1 : Fin 3 → ℚ := ![L0_05,0,0]
+  let c2 : Fin 3 → ℚ := ![1,L0_35,L0_02]
+  let c3 : Fin 3 → ℚ := ![1,L0_95,L0_80]
+  let c4 : Fin 3 → ℚ := ![L0_65,L0_80,1]
   lt s L0_4 (mix (c (c1 i)) (c (c2 i)) (div s (c L0_4)))
     (lt s (3/4) (mix (c (c2 i)) (c (c3 i)) (div (sub s (c L0_4)) (c L0_35)))
       (mix (c (c3 i)) (c (c4 i)) (div (sub s (c (3/4))) (c (1/4)))))
@@ -211,12 +211,12 @@ def body (model : Fin 4) (o : Fin 12) : GExpr :=
         (c (-10)) (c 10))))
     else c 0
   let thermal : Fin 3 → GExpr := fun i => mul (sub (c 1) hot) (blackbody (div (ntTemp r) (c L0_488)) i)
-  let tint : Fin 3 → ℝ := ![1,L0_65,L0_3]
+  let tint : Fin 3 → ℚ := ![1,L0_65,L0_3]
   let synch : Fin 3 → GExpr := fun i =>
     mul (mul (mul (mul hot (hotEmissivity r)) perp2) freqRatio) (c (tint i))
   let boost := mul (mul redshift redshift) redshift
   let rgb : Fin 3 → GExpr := fun i => mul (mul density boost) (add (thermal i) (synch i))
-  let lum : Fin 3 → ℝ := ![L0_2126,L0_7152,L0_0722]
+  let lum : Fin 3 → ℚ := ![L0_2126,L0_7152,L0_0722]
   let intensity := dot3 rgb (fun i => c (lum i))
   let synchI := mul (mul density boost) (dot3 synch (fun i => c (lum i)))
   let rotation := mul (mul (mul (mul (mul (c 2) faraday) density) bpar) freqRatio) freqRatio
@@ -282,8 +282,10 @@ theorem tonemap_error (v w E : ℕ → ℝ) (hw : ∀ i, |w i-v i| ≤ E i) (y :
     |y-tonemap.exact v| ≤ tonemap.bound v E :=
   error tonemap v w E hw y hs hy
 
-/-- `heatmap_color` channel `i`: `clamp(t*3 - i, 0, 1)` (input 0). -/
-def heatmap (i : Fin 3) : GExpr := clamp (sub (mul (input 0) (c 3)) (c (i:ℝ))) (c 0) (c 1)
+/-- `heatmap_color` channel `i`: `clamp(t*3, 0, 1)` for `i = 0`, else
+`clamp(t*3 - i, 0, 1)` (input 0). -/
+def heatmap (i : Fin 3) : GExpr :=
+  clamp (if i = 0 then mul (input 0) (c 3) else sub (mul (input 0) (c 3)) (c (i:ℚ))) (c 0) (c 1)
 
 theorem heatmap_error (i : Fin 3) (v w E : ℕ → ℝ) (hw : ∀ k, |w k-v k| ≤ E k) (y : ℝ)
     (hs : (heatmap i).Safe v E) (hy : (heatmap i).Computes w y) :

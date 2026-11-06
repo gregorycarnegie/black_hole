@@ -9,6 +9,8 @@ on:
       - 'verification/lakefile.toml'
       - 'verification/lake-manifest.json'
       - 'verification/fixtures/horizon-binary32.csv'
+      - 'verification/fixtures/kernels.sexp'
+      - 'verification/fixtures/kernels-branching.sexp'
       - 'verification/check.py'
       - '.github/workflows/verification.yml'
       - '.gitattributes'
