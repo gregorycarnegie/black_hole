@@ -10,7 +10,8 @@
 //! bounds by the commutations. Sum reassociation, which WGSL permits and naga
 //! leaves to the backend for `dot` and matrix products, changes the `WgslExpr`
 //! running bounds; `WgslReassoc` and the checked domains of obligation F2
-//! cover every sum reassociation.
+//! cover every sum reassociation and every product reassociation that keeps
+//! each factor in its role.
 //! Two expressions agree exactly when they get the same node, so shared
 //! subexpressions are compared once; sharing is only a representation, and
 //! both sides denote trees. Constants are exact dyadic rationals. Branches

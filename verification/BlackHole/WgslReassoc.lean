@@ -243,10 +243,128 @@ theorem sum_bound (v E : ℕ → ℝ) : ∀ e : GExpr,
     refine ⟨h.1, h.2, ?_⟩
     simp [lmag, lbnd]
 
+/-! ### Product chains
+
+A maximal chain of `*` and `/` is described by its factors (`prodLeaves`,
+`true` for a divisor). A divisor position is flattened only through `*`
+(`mulLeaves`), so reassociation keeps every factor in its role: `(a*b)/c` may
+become `(a/c)*b` or `a*(b/c)`, and `(a/b)/c` may become `a/(b*c)`, but `b`
+never moves into a divisor as in `a/(c/b)`. -/
+
+def IsProd : GExpr → Prop
+  | .mul _ _ => True
+  | .div _ _ => True
+  | _ => False
+
+instance (e : GExpr) : Decidable (IsProd e) := by
+  cases e <;> simp only [IsProd] <;> infer_instance
+
+def IsMul : GExpr → Prop
+  | .mul _ _ => True
+  | _ => False
+
+instance (e : GExpr) : Decidable (IsMul e) := by
+  cases e <;> simp only [IsMul] <;> infer_instance
+
+/-- The factors of a product of divisors. -/
+def mulLeaves : GExpr → List GExpr
+  | .mul a b => mulLeaves a ++ mulLeaves b
+  | e => [e]
+
+/-- The factors of the maximal product chain at `e`, `true` for divisors. -/
+def prodLeaves : GExpr → List (Bool × GExpr)
+  | .mul a b => prodLeaves a ++ prodLeaves b
+  | .div a b => prodLeaves a ++ (mulLeaves b).map fun x => (true, x)
+  | e => [(false, e)]
+
+lemma mulLeaves_of_not {e : GExpr} (h : ¬ IsMul e) : mulLeaves e = [e] := by
+  cases e <;> simp_all [IsMul, mulLeaves]
+
+lemma prodLeaves_of_not {e : GExpr} (h : ¬ IsProd e) : prodLeaves e = [(false, e)] := by
+  cases e <;> simp_all [IsProd, prodLeaves]
+
+lemma mulLeaves_length_pos : ∀ e : GExpr, 0 < (mulLeaves e).length
+  | .mul a b => by simp [mulLeaves]; have := mulLeaves_length_pos a; omega
+  | .input _ | .const _ | .add _ _ | .sub _ _ | .neg _ | .div _ _ | .sqrt _ | .max _ _ | .min _ _
+  | .lt _ _ _ _ | .abs _ | .invsqrt _ | .exp _ | .exp2 _ | .log _ | .log2 _ | .inh _ _ | .tanh _ _
+  | .lt2 _ _ _ _ | .sinS _ | .cosS _ | .scale _ _ | .round _ | .qsel _ _ _ _ => by simp [mulLeaves]
+
+lemma prodLeaves_length_pos : ∀ e : GExpr, 0 < (prodLeaves e).length
+  | .mul a b => by simp [prodLeaves]; have := prodLeaves_length_pos a; omega
+  | .div a b => by simp [prodLeaves]; have := prodLeaves_length_pos a; omega
+  | .input _ | .const _ | .add _ _ | .sub _ _ | .neg _ | .sqrt _ | .max _ _ | .min _ _
+  | .lt _ _ _ _ | .abs _ | .invsqrt _ | .exp _ | .exp2 _ | .log _ | .log2 _ | .inh _ _ | .tanh _ _
+  | .lt2 _ _ _ _ | .sinS _ | .cosS _ | .scale _ _ | .round _ | .qsel _ _ _ _ => by simp [prodLeaves]
+
+set_option linter.unusedSimpArgs false in
+lemma mulLeaves_size : ∀ (e : GExpr), ∀ x ∈ mulLeaves e, sizeOf x ≤ sizeOf e
+  | .mul a b => by
+    intro x hx; simp only [mulLeaves, List.mem_append] at hx
+    rcases hx with h | h
+    · have := mulLeaves_size a x h; simp only [GExpr.mul.sizeOf_spec]; omega
+    · have := mulLeaves_size b x h; simp only [GExpr.mul.sizeOf_spec]; omega
+  | .input _ | .const _ | .add _ _ | .sub _ _ | .neg _ | .div _ _ | .sqrt _ | .max _ _ | .min _ _
+  | .lt _ _ _ _ | .abs _ | .invsqrt _ | .exp _ | .exp2 _ | .log _ | .log2 _ | .inh _ _ | .tanh _ _
+  | .lt2 _ _ _ _ | .sinS _ | .cosS _ | .scale _ _ | .round _ | .qsel _ _ _ _ => by
+    intro x hx; simp only [mulLeaves, List.mem_singleton] at hx; subst hx; exact le_rfl
+
+set_option linter.unusedSimpArgs false in
+lemma prodLeaves_size : ∀ (e : GExpr), IsProd e → ∀ p ∈ prodLeaves e, sizeOf p.2 < sizeOf e
+  | .mul a b, _ => by
+    intro p hp; simp only [prodLeaves, List.mem_append] at hp
+    rcases hp with h | h
+    · by_cases ha : IsProd a
+      · have := prodLeaves_size a ha p h; simp only [GExpr.mul.sizeOf_spec]; omega
+      · rw [prodLeaves_of_not ha] at h; simp at h; subst h; simp only [GExpr.mul.sizeOf_spec]; omega
+    · by_cases hb : IsProd b
+      · have := prodLeaves_size b hb p h; simp only [GExpr.mul.sizeOf_spec]; omega
+      · rw [prodLeaves_of_not hb] at h; simp at h; subst h; simp only [GExpr.mul.sizeOf_spec]; omega
+  | .div a b, _ => by
+    intro p hp; simp only [prodLeaves, List.mem_append, List.mem_map] at hp
+    rcases hp with h | ⟨x, hx, rfl⟩
+    · by_cases ha : IsProd a
+      · have := prodLeaves_size a ha p h; simp only [GExpr.div.sizeOf_spec]; omega
+      · rw [prodLeaves_of_not ha] at h; simp at h; subst h; simp only [GExpr.div.sizeOf_spec]; omega
+    · have := mulLeaves_size b x hx; simp only [GExpr.div.sizeOf_spec]; omega
+  | .input _, h | .const _, h | .add _ _, h | .sub _ _, h | .neg _, h | .sqrt _, h | .max _ _, h
+  | .min _ _, h | .lt _ _ _ _, h | .abs _, h | .invsqrt _, h | .exp _, h | .exp2 _, h
+  | .log _, h | .log2 _, h | .inh _ _, h | .tanh _ _, h | .lt2 _ _ _ _, h | .sinS _, h
+  | .cosS _, h | .scale _ _, h | .round _, h | .qsel _ _ _ _, h => absurd h (by simp [IsProd])
+
+/-- A factor's contribution: the value, or its inverse for a divisor. -/
+def fval (v : ℕ → ℝ) (p : Bool × GExpr) : ℝ := if p.1 then (p.2.exact v)⁻¹ else p.2.exact v
+
+lemma mul_exact (v : ℕ → ℝ) : ∀ e : GExpr, e.exact v = ((mulLeaves e).map fun x => x.exact v).prod
+  | .mul a b => by simp only [mulLeaves, exact, List.map_append, List.prod_append, mul_exact v a,
+      mul_exact v b]
+  | .input _ | .const _ | .add _ _ | .sub _ _ | .neg _ | .div _ _ | .sqrt _ | .max _ _ | .min _ _
+  | .lt _ _ _ _ | .abs _ | .invsqrt _ | .exp _ | .exp2 _ | .log _ | .log2 _ | .inh _ _ | .tanh _ _
+  | .lt2 _ _ _ _ | .sinS _ | .cosS _ | .scale _ _ | .round _ | .qsel _ _ _ _ => by simp [mulLeaves]
+
+lemma prod_inv_map (L : List GExpr) (v : ℕ → ℝ) :
+    ((L.map fun x => x.exact v).prod)⁻¹ = (L.map fun x => (x.exact v)⁻¹).prod := by
+  induction L with
+  | nil => simp
+  | cons x L ih => simp [ih, mul_comm]
+
+lemma prod_exact (v : ℕ → ℝ) : ∀ e : GExpr, e.exact v = ((prodLeaves e).map (fval v)).prod
+  | .mul a b => by simp only [prodLeaves, exact, List.map_append, List.prod_append, prod_exact v a,
+      prod_exact v b]
+  | .div a b => by
+    simp only [prodLeaves, exact, List.map_append, List.prod_append, prod_exact v a, List.map_map]
+    rw [div_eq_mul_inv, mul_exact v b, prod_inv_map]
+    congr 2
+  | .input _ | .const _ | .add _ _ | .sub _ _ | .neg _ | .sqrt _ | .max _ _ | .min _ _
+  | .lt _ _ _ _ | .abs _ | .invsqrt _ | .exp _ | .exp2 _ | .log _ | .log2 _ | .inh _ _ | .tanh _ _
+  | .lt2 _ _ _ _ | .sinS _ | .cosS _ | .scale _ _ | .round _ | .qsel _ _ _ _ => by
+    simp [prodLeaves, fval]
+
 /-! ### Reassociation -/
 
-/-- `e'` evaluates the sum chains of `e` in any association and order, with
-each leaf replaced by a reassociation of it; everything else keeps its form. -/
+/-- `e'` evaluates the sum chains of `e` in any association and order, and
+its product chains in any association and order that keeps each factor in its
+role, with each leaf replaced by a reassociation of it; everything else keeps
+its form. -/
 inductive RA : GExpr → GExpr → Prop
   | sum {e e' : GExpr} (he : IsSum e) (he' : IsSum e')
       (σ : Fin (sumLeaves e).length ≃ Fin (sumLeaves e').length)
@@ -254,8 +372,10 @@ inductive RA : GExpr → GExpr → Prop
       (hl : ∀ i, RA ((sumLeaves e)[i]).2 ((sumLeaves e')[σ i]).2) : RA e e'
   | input (i : ℕ) : RA (.input i) (.input i)
   | const (c : ℚ) : RA (.const c) (.const c)
-  | mul {a b a' b' : GExpr} : RA a a' → RA b b' → RA (.mul a b) (.mul a' b')
-  | div {a b a' b' : GExpr} : RA a a' → RA b b' → RA (.div a b) (.div a' b')
+  | prod {e e' : GExpr} (he : IsProd e) (he' : IsProd e')
+      (σ : Fin (prodLeaves e).length ≃ Fin (prodLeaves e').length)
+      (hs : ∀ i, ((prodLeaves e')[σ i]).1 = ((prodLeaves e)[i]).1)
+      (hl : ∀ i, RA ((prodLeaves e)[i]).2 ((prodLeaves e')[σ i]).2) : RA e e'
   | sqrt {a a' : GExpr} : RA a a' → RA (.sqrt a) (.sqrt a')
   | max {a b a' b' : GExpr} : RA a a' → RA b b' → RA (.max a b) (.max a' b')
   | min {a b a' b' : GExpr} : RA a a' → RA b b' → RA (.min a b) (.min a' b')
@@ -292,8 +412,13 @@ theorem exact_RA (v : ℕ → ℝ) {e e' : GExpr} (h : RA e e') : e'.exact v = e
     congr 1; ext i; rw [hs i, ih i]
   | input i => rfl
   | const c => rfl
-  | mul _ _ iha ihb => simp only [exact, iha, ihb]
-  | div _ _ iha ihb => simp only [exact, iha, ihb]
+  | prod he he' σ hs hl ih =>
+    rename_i e e''
+    rw [prod_exact v e, prod_exact v e'', ← List.ofFn_getElem_eq_map, ← List.ofFn_getElem_eq_map,
+      List.prod_ofFn, List.prod_ofFn, ← Equiv.prod_comp σ]
+    congr 1; ext i; simp only [fval]
+    have h1 := hs i; have h2 := ih i
+    simp only [Fin.getElem_fin] at h1 h2 ⊢; rw [h1, h2]
   | sqrt _ iha => simp only [exact, iha]
   | max _ _ iha ihb => simp only [exact, iha, ihb]
   | min _ _ iha ihb => simp only [exact, iha, ihb]
@@ -325,14 +450,17 @@ theorem RA.refl (e : GExpr) : RA e e := by
     by_cases hs : IsSum e
     · exact RA.sum hs hs (Equiv.refl _) (fun _ => rfl)
         fun i => ih' _ (sumLeaves_size e hs _ (List.getElem_mem _))
+    by_cases hp : IsProd e
+    · exact RA.prod hp hp (Equiv.refl _) (fun _ => rfl)
+        fun i => ih' _ (prodLeaves_size e hp _ (List.getElem_mem _))
     · cases e with
       | add a b => exact absurd trivial hs
       | sub a b => exact absurd trivial hs
       | neg a => exact absurd trivial hs
       | input i => exact .input i
       | const c => exact .const c
-      | mul a b => exact .mul (ih' a (by size_tac)) (ih' b (by size_tac))
-      | div a b => exact .div (ih' a (by size_tac)) (ih' b (by size_tac))
+      | mul a b => exact absurd trivial hp
+      | div a b => exact absurd trivial hp
       | sqrt a => exact .sqrt (ih' a (by size_tac))
       | max a b => exact .max (ih' a (by size_tac)) (ih' b (by size_tac))
       | min a b => exact .min (ih' a (by size_tac)) (ih' b (by size_tac))
@@ -364,16 +492,54 @@ lemma RA.sum_inv {e e' : GExpr} (h : RA e e') (he : IsSum e) :
       ∀ i, RA ((sumLeaves e)[i]).2 ((sumLeaves e')[σ i]).2 := by
   cases h with
   | sum _ he' σ hs hl => exact ⟨he', σ, hs, hl⟩
+  | prod hp => exact absurd hp (by cases e <;> simp_all [IsSum, IsProd])
   | _ => simp_all [IsSum]
+
+/-- A reassociation of a product chain is a product chain whose factors are
+the reassociated factors, permuted, each in its role. -/
+lemma RA.prod_inv {e e' : GExpr} (h : RA e e') (he : IsProd e) :
+    ∃ (_ : IsProd e') (σ : Fin (prodLeaves e).length ≃ Fin (prodLeaves e').length),
+      (∀ i, ((prodLeaves e')[σ i]).1 = ((prodLeaves e)[i]).1) ∧
+      ∀ i, RA ((prodLeaves e)[i]).2 ((prodLeaves e')[σ i]).2 := by
+  cases h with
+  | prod _ he' σ hs hl => exact ⟨he', σ, hs, hl⟩
+  | sum hs => exact absurd hs (by cases e <;> simp_all [IsSum, IsProd])
+  | _ => simp_all [IsProd]
 
 lemma RA.input_inv {i : ℕ} {x' : GExpr} (h : RA (.input i) x') : x' = .input i := by
   cases h with
   | sum he => exact absurd he (by simp [IsSum])
+  | prod he => exact absurd he (by simp [IsProd])
   | input => rfl
 
 lemma RA.const_inv {c : ℚ} {x' : GExpr} (h : RA (.const c) x') : x' = .const c := by
   cases h with
   | sum he => exact absurd he (by simp [IsSum])
+  | prod he => exact absurd he (by simp [IsProd])
   | const => rfl
+
+/-- `Πy - Πx ≤ Πy' - Πx'` when, factor by factor, `0 ≤ x ≤ y`, `x ≤ x' ≤ y'`
+and `y - x ≤ y' - x'`. -/
+lemma prod_gap_mono (L : List (ℝ × ℝ × ℝ × ℝ))
+    (h : ∀ q ∈ L, 0 ≤ q.1 ∧ q.1 ≤ q.2.1 ∧ q.1 ≤ q.2.2.1 ∧ q.2.2.1 ≤ q.2.2.2 ∧
+      q.2.1-q.1 ≤ q.2.2.2-q.2.2.1) :
+    0 ≤ (L.map (·.1)).prod ∧ (L.map (·.1)).prod ≤ (L.map (·.2.1)).prod ∧
+      (L.map (·.2.1)).prod ≤ (L.map (·.2.2.2)).prod ∧
+      (L.map (·.2.1)).prod-(L.map (·.1)).prod ≤ (L.map (·.2.2.2)).prod-(L.map (·.2.2.1)).prod := by
+  induction L with
+  | nil => simp
+  | cons q L ih =>
+    obtain ⟨p0, p1, p2, p3⟩ := ih fun r hr => h r (by simp [hr])
+    obtain ⟨a0, ab, aa', a'b', gap⟩ := h q (by simp)
+    obtain ⟨x, y, x', y'⟩ := q
+    simp only [List.map_cons, List.prod_cons] at p0 p1 p2 p3 ⊢
+    simp only at a0 ab aa' a'b' gap
+    set X := (L.map (·.1)).prod; set Y := (L.map (·.2.1)).prod
+    set X' := (L.map (·.2.2.1)).prod; set Y' := (L.map (·.2.2.2)).prod
+    refine ⟨mul_nonneg a0 p0, mul_le_mul ab p1 p0 (a0.trans ab), mul_le_mul (by linarith) p2 (by linarith) (by linarith), ?_⟩
+    have Y0 : 0 ≤ Y := p0.trans p1
+    nlinarith [mul_le_mul_of_nonneg_left p2 (by linarith : (0:ℝ) ≤ y'-x'),
+      mul_le_mul_of_nonneg_right gap Y0, mul_le_mul_of_nonneg_left p3 (by linarith : (0:ℝ) ≤ x'),
+      mul_le_mul_of_nonneg_right aa' (by linarith : (0:ℝ) ≤ Y-X)]
 
 end BlackHole.WgslReassoc

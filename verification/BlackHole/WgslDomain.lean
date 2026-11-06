@@ -1,7 +1,7 @@
 module
 
 public import BlackHole.WgslPlasma
-public import BlackHole.WgslReassoc
+public import BlackHole.WgslReassocBound
 public import Mathlib.Analysis.Complex.ExponentialBounds
 public import Mathlib.Analysis.SpecialFunctions.Log.Deriv
 
@@ -16,9 +16,10 @@ exact value lies in `[A.lo, A.hi]` and the running bound is at most `A.b`
 proved by evaluating it once per box of a cover, in the kernel.
 
 At a sum the bound is also raised to cover every association of its chain
-(`WgslReassoc.sum_bound`), whose leaf data is carried across `let` slots, so
-success also implies `Safe` for every reassociation of the sums (`ev_robust`,
-`evLets_robust`), which WGSL permits.
+(`WgslReassoc.sum_bound`), and at a product or quotient every association that
+keeps each factor in its role (`WgslReassoc.prod_bound`); the chains' factor
+data is carried across `let` slots. Success therefore also implies `Safe` for
+every such reassociation (`ev_robust`, `evLets_robust`), which WGSL permits.
 
 Arithmetic is exact rational arithmetic, with endpoints rounded outward to
 `2⁻¹⁶⁰` after each step. `sqrt`, `exp` and `log` use proved enclosures:
@@ -335,6 +336,32 @@ lemma le_logHi {q : ℚ} (hq : 0 < q) : Real.log q ≤ ((logHi q : ℚ) : ℝ) :
 
 /-! ### Abstract values -/
 
+/-- Data on a list of divisors: their number, a lower bound on the product of
+their magnitudes, upper bounds on the products of `1 + B/|t|`, of
+`max(1, |t|)` and of `max(1, 1/|t|)`, and a lower bound on the product of
+`min(1, |t|)`. -/
+structure DD where
+  m : ℕ
+  T : ℚ
+  P : ℚ
+  mn : ℚ
+  mx : ℚ
+  im : ℚ
+
+def DD.one : DD := ⟨0, 1, 1, 1, 1, 1⟩
+
+/-- Data on a product chain: its number of factors, upper bounds on the
+numerators' `Π(|t|+B)` and `Π max(1, |t|+B)`, a lower bound on their `Π|t|`
+at the same magnitudes, and its divisors. -/
+structure PD where
+  n : ℕ
+  ψ : ℚ
+  M : ℚ
+  T : ℚ
+  d : DD
+
+def PD.one : PD := ⟨1, 0, 1, 0, DD.one⟩
+
 /-- An interval `[lo, hi]` for an exact value and an upper bound `b` on its
 running error bound. -/
 structure Av where
@@ -348,9 +375,16 @@ structure Av where
   sn : ℕ
   sm : ℚ
   sb : ℚ
+  /-- Whether the value is a product chain, with its data. -/
+  pc : Bool
+  pd : PD
+  /-- Whether the value is a product `*`, with the data of its factors as
+  divisors. -/
+  mc : Bool
+  md : DD
 
-/-- A value that is not a sum chain. -/
-abbrev Av.mk3 (lo hi b : ℚ) : Av := ⟨lo, hi, b, false, 1, 0, 0⟩
+/-- A value that is not a chain. -/
+abbrev Av.mk3 (lo hi b : ℚ) : Av := ⟨lo, hi, b, false, 1, 0, 0, false, PD.one, false, DD.one⟩
 
 def Av.H (A : Av) (x B : ℝ) : Prop := (A.lo : ℝ) ≤ x ∧ x ≤ A.hi ∧ 0 ≤ B ∧ B ≤ A.b
 
@@ -434,7 +468,49 @@ def chainB (n : ℕ) (sm sb : ℚ) : ℚ := ((1+qU)^(n-1)-1)*sm+(1+qU)^(n-1)*sb+
 
 /-- A sum chain: `R`'s interval, its bound raised to cover every association. -/
 def chainAv (R : Av) (n : ℕ) (sm sb : ℚ) : Av :=
-  ⟨R.lo, R.hi, rup 160 (Max.max R.b (chainB n sm sb)), true, n, sm, sb⟩
+  ⟨R.lo, R.hi, rup 160 (Max.max R.b (chainB n sm sb)), true, n, sm, sb, false, PD.one, false, DD.one⟩
+
+/-! A value's product-chain data: its own factors if it is a product chain,
+else itself as the only numerator; and its factors as divisors. -/
+def DD.mul (x y : DD) : DD :=
+  ⟨x.m+y.m, rdn 160 (x.T*y.T), rup 160 (x.P*y.P), rdn 160 (x.mn*y.mn), rup 160 (x.mx*y.mx),
+    rup 160 (x.im*y.im)⟩
+def DD.leaf (A : Av) : DD :=
+  ⟨1, mig A, rup 160 (1+A.b/mig A), Min.min 1 (mig A), Max.max 1 (mag A), rup 160 (Max.max 1 (1/mig A))⟩
+def PD.leaf (A : Av) : PD := ⟨1, mag A+A.b, Max.max 1 (mag A+A.b), mag A, DD.one⟩
+def PD.mul (p q : PD) : PD :=
+  ⟨p.n+q.n, rup 160 (p.ψ*q.ψ), rup 160 (p.M*q.M), rdn 160 (p.T*q.T), p.d.mul q.d⟩
+def PD.div (p : PD) (m : DD) : PD := ⟨p.n+m.m, p.ψ, p.M, p.T, p.d.mul m⟩
+def pdOf (A : Av) : PD := if A.pc then A.pd else PD.leaf A
+def mdOf (A : Av) : DD := if A.mc then A.md else DD.leaf A
+
+/-- `U'` and `2⁻¹⁰⁰` as rationals. -/
+def qU' : ℚ := 5/16777216+1/67108864
+def q2m100 : ℚ := 1/1267650600228229401496703205376
+
+/-- The bound of every role-preserving association of a product chain
+(`WgslReassoc.prod_bound`), if its margins hold. -/
+def chainPB (p : PD) : Option ℚ :=
+  -- `Xq` and `Kq` bound `P (1+U')ᵐ⁻¹` and `(1+U)ⁿ⁻¹` by `(1+x)ᵏ ≤ 1/(1-kx)`,
+  -- and `Mq` bounds `M im/cᵐ`.
+  let Xq := p.d.P/(1-((p.d.m-1 : ℕ) : ℚ)*qU')
+  let Kq := 1/(1-((p.n-1 : ℕ) : ℚ)*qU)
+  let Mq := p.M*p.d.im/(2-Xq)^p.d.m
+  if 0 < p.d.T ∧ p.n ≤ 64 ∧ Xq < 2 ∧ q2m100 ≤ p.d.mn ∧
+      qη ≤ p.d.mn*(2-Xq) ∧ p.d.mx*Xq ≤ q2p126 ∧ Mq ≤ 1237940039285380274899124224
+  then some ((Kq/(2-Xq)*p.ψ-p.T)/p.d.T+2*((p.n:ℚ)-1)*Kq*qη*Mq)
+  else none
+
+/-- A product chain: `R`'s interval, its bound raised to cover every
+role-preserving association. -/
+def prodAv (R : Av) (cb : ℚ) (p : PD) (mc : Bool) (md : DD) : Av :=
+  ⟨R.lo, R.hi, rup 160 (Max.max R.b cb), false, 1, 0, 0, true, p, mc, md⟩
+
+lemma Av.H.prod {R : Av} {x B : ℝ} (h : R.H x B) (cb : ℚ) (p : PD) (mc : Bool) (md : DD) :
+    (prodAv R cb p mc md).H x B :=
+  ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.trans (by
+    simp only [prodAv]; exact (show ((R.b:ℚ):ℝ) ≤ ((Max.max R.b cb : ℚ) : ℝ) by
+      exact_mod_cast le_max_left _ _).trans (le_rup_real _ _))⟩
 
 lemma Av.H.chain {R : Av} {x B : ℝ} (h : R.H x B) (n : ℕ) (sm sb : ℚ) : (chainAv R n sm sb).H x B :=
   ⟨h.1, h.2.1, h.2.2.1, h.2.2.2.trans (by
@@ -532,12 +608,15 @@ def ev (d : ℕ) (env : ℕ → Option Av) : GExpr → Option Av
       some (chainAv (nrm (addAv A B)) (sdn A+sdn B) (sdm A+sdm B) (sdb A+sdb B))
   | .sub a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
       some (chainAv (nrm (subAv A B)) (sdn A+sdn B) (sdm A+sdm B) (sdb A+sdb B))
-  | .mul a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
-      some (nrm (if a = b then sqAv A else mulAv A B))
+  | .mul a b => (ev d env a).bind fun A => (if a = b then some A else ev d env b).bind fun B =>
+      (chainPB ((pdOf A).mul (pdOf B))).map fun cb =>
+        prodAv (nrm (if a = b then sqAv A else mulAv A B)) cb ((pdOf A).mul (pdOf B)) true
+          ((mdOf A).mul (mdOf B))
   | .neg a => (ev d env a).bind fun A =>
       some (chainAv (Av.mk3 (-A.hi) (-A.lo) A.b) (sdn A) (sdm A) (sdb A))
   | .div a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
-      if divOk B then some (nrm (divAv A B)) else none
+      if divOk B then (chainPB ((pdOf A).div (mdOf B))).map fun cb =>
+        prodAv (nrm (divAv A B)) cb ((pdOf A).div (mdOf B)) false DD.one else none
   | .sqrt a => (ev d env a).bind fun A => if sqrtOk A then some (nrm (sqrtAv A)) else none
   | .max a b => (ev d env a).bind fun A => (ev d env b).bind fun B =>
       some (Av.mk3 (Max.max A.lo B.lo) (Max.max A.hi B.hi) (Max.max A.b B.b))
@@ -1038,13 +1117,19 @@ theorem ev_sound (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (v E : �
     exact ⟨(sub_H hA hB).nrm.chain _ _ _,sa,sb⟩
   | mul a b iha ihb =>
     intro env v E R henv h
-    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
-    obtain ⟨A, ha, B, hb, rfl⟩ := h
+    simp only [ev, Option.bind_eq_some_iff, Option.map_eq_some_iff] at h
+    obtain ⟨A, ha, B, hb, cb, -, rfl⟩ := h
+    have hb' : ev d env b = some B := by
+      split_ifs at hb with hab
+      · subst hab; rw [ha]; exact hb
+      · exact hb
     obtain ⟨hA, sa⟩ := iha env v E A henv ha
-    obtain ⟨hB, sb⟩ := ihb env v E B henv hb
+    obtain ⟨hB, sb⟩ := ihb env v E B henv hb'
     refine ⟨?_,sa,sb⟩
+    apply Av.H.prod
     split_ifs with hab
     · subst hab
+      obtain rfl : B = A := by rw [ha] at hb'; exact (Option.some.inj hb').symm
       exact (sq_H hA).nrm
     · exact (mul_H hA hB).nrm
   | neg a iha =>
@@ -1058,11 +1143,11 @@ theorem ev_sound (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (v E : �
     simp only [ev, Option.bind_eq_some_iff] at h
     obtain ⟨A, ha, B, hb, h⟩ := h
     split_ifs at h with ok
-    simp only [Option.some.injEq] at h; subst h
+    obtain ⟨cb, -, rfl⟩ := Option.map_eq_some_iff.mp h
     obtain ⟨hA, sa⟩ := iha env v E A henv ha
     obtain ⟨hB, sb⟩ := ihb env v E B henv hb
     obtain ⟨hR, s1, s2, s3⟩ := div_H hA hB ok
-    exact ⟨hR.nrm,sa,sb,s1,s2,s3⟩
+    exact ⟨hR.nrm.prod _ _ _ _,sa,sb,s1,s2,s3⟩
   | sqrt a iha =>
     intro env v E R henv h
     simp only [ev, Option.bind_eq_some_iff] at h
@@ -1380,6 +1465,605 @@ lemma nearEnv_H {ref : List ℚ} {w : ℚ} {v E : ℕ → ℝ} (h : Near ref w v
     have := abs_le.mp h1
     exact ⟨by push_cast; linarith, by push_cast; linarith, h2, by push_cast; linarith⟩
 
+/-! ### Product-chain invariants -/
+
+section ProdInv
+open WgslReassoc
+
+/-- A factor of a product chain with `λ ≤ |t| ≤ μ`, every reassociation of
+which is `Safe` with bound in `[0, β]`; the data is `(λ, μ, β)`. -/
+def FacP (v E : ℕ → ℝ) (p : Bool × GExpr) (q : ℝ × ℝ × ℝ) : Prop :=
+  0 ≤ q.1 ∧ q.1 ≤ |p.2.exact v| ∧ |p.2.exact v| ≤ q.2.1 ∧ 0 ≤ q.2.2 ∧
+    ∀ x', RA p.2 x' → x'.Safe v E ∧ 0 ≤ x'.bound v E ∧ x'.bound v E ≤ q.2.2
+
+/-- Products over the numerators, and over the divisors, of a chain. -/
+def zN (L : List (Bool × GExpr)) (Q : List (ℝ × ℝ × ℝ)) (f : ℝ × ℝ × ℝ → ℝ) : ℝ :=
+  ((L.zip Q).map fun z => if z.1.1 then 1 else f z.2).prod
+def zD (L : List (Bool × GExpr)) (Q : List (ℝ × ℝ × ℝ)) (f : ℝ × ℝ × ℝ → ℝ) : ℝ :=
+  ((L.zip Q).map fun z => if z.1.1 then f z.2 else 1).prod
+
+lemma zN_append {L₁ L₂ : List (Bool × GExpr)} {Q₁ Q₂ : List (ℝ × ℝ × ℝ)} (h : L₁.length = Q₁.length)
+    (f : ℝ × ℝ × ℝ → ℝ) : zN (L₁ ++ L₂) (Q₁ ++ Q₂) f = zN L₁ Q₁ f*zN L₂ Q₂ f := by
+  simp [zN, List.zip_append h]
+
+lemma zD_append {L₁ L₂ : List (Bool × GExpr)} {Q₁ Q₂ : List (ℝ × ℝ × ℝ)} (h : L₁.length = Q₁.length)
+    (f : ℝ × ℝ × ℝ → ℝ) : zD (L₁ ++ L₂) (Q₁ ++ Q₂) f = zD L₁ Q₁ f*zD L₂ Q₂ f := by
+  simp [zD, List.zip_append h]
+
+lemma zN_divs (L : List GExpr) (Q : List (ℝ × ℝ × ℝ)) (f : ℝ × ℝ × ℝ → ℝ) :
+    zN (L.map fun x => (true, x)) Q f = 1 := by
+  unfold zN; rw [List.prod_eq_one]; intro y hy
+  obtain ⟨z, hz, rfl⟩ := List.mem_map.mp hy
+  obtain ⟨x, -, hx⟩ := List.mem_map.mp (List.of_mem_zip hz).1
+  simp [← hx]
+
+lemma zD_divs {L : List GExpr} {Q : List (ℝ × ℝ × ℝ)} (h : L.length = Q.length) (f : ℝ × ℝ × ℝ → ℝ) :
+    zD (L.map fun x => (true, x)) Q f = (Q.map f).prod := by
+  induction L generalizing Q with
+  | nil => cases Q <;> simp_all [zD]
+  | cons x L ih =>
+    cases Q with
+    | nil => simp at h
+    | cons q Q =>
+      simp only [List.length_cons, Nat.add_right_cancel_iff] at h
+      have := ih h
+      simp only [zD, List.map_cons, List.zip_cons_cons, List.prod_cons, ↓reduceIte] at this ⊢
+      rw [this]
+
+/-- Data on a list of divisors bounds the true divisor quantities. -/
+def DDH (d : DD) (Q : List (ℝ × ℝ × ℝ)) : Prop :=
+  Q.length = d.m ∧ 0 ≤ (d.T:ℝ) ∧ (d.T:ℝ) ≤ (Q.map (·.1)).prod ∧
+    (Q.map fun q => 1+q.2.2/q.1).prod ≤ (d.P:ℝ) ∧ 0 ≤ (d.mn:ℝ) ∧
+    (d.mn:ℝ) ≤ (Q.map fun q => Min.min 1 q.1).prod ∧ (Q.map fun q => Max.max 1 q.2.1).prod ≤ (d.mx:ℝ) ∧
+    (Q.map fun q => Max.max 1 (1/q.1)).prod ≤ (d.im:ℝ)
+
+/-- `d` bounds the factors of the product `x` as divisors. -/
+def MH (v E : ℕ → ℝ) (d : DD) (x : GExpr) : Prop :=
+  ∃ Q : List (ℝ × ℝ × ℝ), List.Forall₂ (fun ℓ q => FacP v E (true, ℓ) q) (mulLeaves x) Q ∧ DDH d Q
+
+/-- `p` bounds the factors of the product chain `x`. -/
+def PH (v E : ℕ → ℝ) (p : PD) (x : GExpr) : Prop :=
+  (prodLeaves x).length = p.n ∧ ∃ Q : List (ℝ × ℝ × ℝ), List.Forall₂ (FacP v E) (prodLeaves x) Q ∧
+    zN (prodLeaves x) Q (fun q => q.2.1+q.2.2) ≤ (p.ψ:ℝ) ∧
+    zN (prodLeaves x) Q (fun q => Max.max 1 (q.2.1+q.2.2)) ≤ (p.M:ℝ) ∧
+    0 ≤ (p.T:ℝ) ∧ (p.T:ℝ) ≤ zN (prodLeaves x) Q (·.2.1) ∧ nd (prodLeaves x) = p.d.m ∧
+    0 ≤ (p.d.T:ℝ) ∧ (p.d.T:ℝ) ≤ zD (prodLeaves x) Q (·.1) ∧
+    zD (prodLeaves x) Q (fun q => 1+q.2.2/q.1) ≤ (p.d.P:ℝ) ∧
+    0 ≤ (p.d.mn:ℝ) ∧ (p.d.mn:ℝ) ≤ zD (prodLeaves x) Q (fun q => Min.min 1 q.1) ∧
+    zD (prodLeaves x) Q (fun q => Max.max 1 q.2.1) ≤ (p.d.mx:ℝ) ∧
+    zD (prodLeaves x) Q (fun q => Max.max 1 (1/q.1)) ≤ (p.d.im:ℝ)
+
+end ProdInv
+
+
+section ProdComb
+open WgslReassoc
+
+lemma mig_nonneg (A : Av) : 0 ≤ mig A := by
+  unfold mig; split_ifs with p q
+  · exact p.le
+  · linarith
+  · exact le_rfl
+
+lemma zN_nonneg {L : List (Bool × GExpr)} {Q : List (ℝ × ℝ × ℝ)} {f : ℝ × ℝ × ℝ → ℝ}
+    (h : ∀ q ∈ Q, 0 ≤ f q) : 0 ≤ zN L Q f :=
+  List.prod_nonneg fun y hy => by
+    obtain ⟨z, hz, rfl⟩ := List.mem_map.mp hy
+    split_ifs
+    · exact zero_le_one
+    · exact h _ (List.of_mem_zip hz).2
+
+lemma zD_nonneg {L : List (Bool × GExpr)} {Q : List (ℝ × ℝ × ℝ)} {f : ℝ × ℝ × ℝ → ℝ}
+    (h : ∀ q ∈ Q, 0 ≤ f q) : 0 ≤ zD L Q f :=
+  List.prod_nonneg fun y hy => by
+    obtain ⟨z, hz, rfl⟩ := List.mem_map.mp hy
+    split_ifs
+    · exact h _ (List.of_mem_zip hz).2
+    · exact zero_le_one
+
+lemma prod_map_nonneg {Q : List (ℝ × ℝ × ℝ)} {f : ℝ × ℝ × ℝ → ℝ} (h : ∀ q ∈ Q, 0 ≤ f q) :
+    0 ≤ (Q.map f).prod :=
+  List.prod_nonneg fun y hy => by obtain ⟨q, hq, rfl⟩ := List.mem_map.mp hy; exact h q hq
+
+/-- The nonnegative quantities of the factors. -/
+lemma FacP.nn {v E : ℕ → ℝ} {p : Bool × GExpr} {q : ℝ × ℝ × ℝ} (h : FacP v E p q) :
+    0 ≤ q.1 ∧ 0 ≤ q.2.1 ∧ 0 ≤ q.2.2 :=
+  ⟨h.1, (abs_nonneg _).trans h.2.2.1, h.2.2.2.1⟩
+
+lemma forall₂_mem {α β : Type*} {R : α → β → Prop} {L : List α} {Q : List β}
+    (h : List.Forall₂ R L Q) : ∀ q ∈ Q, ∃ p ∈ L, R p q := by
+  induction h with
+  | nil => simp
+  | cons hr _ ih =>
+    intro q hq
+    rcases List.mem_cons.mp hq with rfl | hq
+    · exact ⟨_, List.mem_cons_self .., hr⟩
+    · obtain ⟨p, hp, hpq⟩ := ih q hq; exact ⟨p, List.mem_cons_of_mem _ hp, hpq⟩
+
+lemma up_mul {a b A B : ℝ} (ha : 0 ≤ a) (hb : 0 ≤ b) (hA : a ≤ A) (hB : b ≤ B) : a*b ≤ A*B :=
+  mul_le_mul hA hB hb (ha.trans hA)
+
+lemma rup_mul (x y : ℚ) : (x:ℝ)*y ≤ ((rup 160 (x*y) : ℚ) : ℝ) := by
+  have := le_rup_real 160 (x*y); push_cast at this; exact this
+
+lemma rdn_mul (x y : ℚ) : ((rdn 160 (x*y) : ℚ) : ℝ) ≤ (x:ℝ)*y := by
+  have := rdn_le_real 160 (x*y); push_cast at this; exact this
+
+lemma rdn_mul_nonneg {x y : ℚ} (hx : 0 ≤ (x:ℝ)) (hy : 0 ≤ (y:ℝ)) : 0 ≤ ((rdn 160 (x*y) : ℚ) : ℝ) := by
+  have : (0:ℚ) ≤ x*y := by exact_mod_cast mul_nonneg hx hy
+  exact_mod_cast rdn_nonneg 160 this
+
+/-- A value that is not a product chain is its chain's only numerator. -/
+lemma PH_leaf {v E : ℕ → ℝ} {A : Av} {x : GExpr} (hx : ¬ IsProd x)
+    (h : ∀ x', RA x x' → x'.Safe v E ∧ A.H (x'.exact v) (x'.bound v E)) : PH v E (PD.leaf A) x := by
+  obtain ⟨-, hH⟩ := h x (RA.refl x)
+  have hm := abs_le_mag hH
+  have hb : (0:ℝ) ≤ A.b := hH.b_nonneg
+  have fac : FacP v E (false, x) (0, mag A, A.b) :=
+    ⟨le_rfl, abs_nonneg _, hm, hb, fun x' hx' => by
+      obtain ⟨s', h'⟩ := h x' hx'; exact ⟨s', h'.2.2.1, h'.2.2.2⟩⟩
+  refine ⟨by simp [prodLeaves_of_not hx, PD.leaf], [(0, mag A, A.b)],
+    by rw [prodLeaves_of_not hx]; exact List.Forall₂.cons fac List.Forall₂.nil, ?_⟩
+  simp only [prodLeaves_of_not hx, zN, zD, PD.leaf, DD.one, List.zip_cons_cons, List.zip_nil_left,
+    List.map_cons, List.map_nil, List.prod_cons, List.prod_nil, Bool.false_eq_true, ↓reduceIte,
+    mul_one, nd, List.countP_cons, List.countP_nil]
+  push_cast
+  refine ⟨le_rfl, le_rfl, by linarith [abs_nonneg (exact v x)], le_rfl, trivial, by norm_num, le_rfl,
+    le_rfl, by norm_num, le_rfl, le_rfl, le_rfl⟩
+
+/-- A value that is not a product is its own only factor as a divisor. -/
+lemma MH_leaf {v E : ℕ → ℝ} {A : Av} {x : GExpr} (hx : ¬ IsMul x)
+    (h : ∀ x', RA x x' → x'.Safe v E ∧ A.H (x'.exact v) (x'.bound v E)) : MH v E (DD.leaf A) x := by
+  obtain ⟨-, hH⟩ := h x (RA.refl x)
+  have hm := abs_le_mag hH
+  have hl := mig_le_abs hH
+  have hb : (0:ℝ) ≤ A.b := hH.b_nonneg
+  have h0 : (0:ℝ) ≤ mig A := by exact_mod_cast mig_nonneg A
+  have fac : FacP v E (true, x) (mig A, mag A, A.b) :=
+    ⟨h0, hl, hm, hb, fun x' hx' => by
+      obtain ⟨s', h'⟩ := h x' hx'; exact ⟨s', h'.2.2.1, h'.2.2.2⟩⟩
+  refine ⟨[(mig A, mag A, A.b)], by rw [mulLeaves_of_not hx]; exact List.Forall₂.cons fac List.Forall₂.nil, ?_⟩
+  simp only [DDH, DD.leaf, List.map_cons, List.map_nil, List.prod_cons, List.prod_nil, mul_one,
+    List.length_singleton]
+  refine ⟨trivial, h0, le_rfl, ?_, by push_cast; exact le_min zero_le_one h0, ?_, ?_, ?_⟩
+  · have := le_rup_real 160 (1+A.b/mig A); push_cast at this; exact this
+  · push_cast; exact le_rfl
+  · push_cast; exact le_rfl
+  · have := le_rup_real 160 (Max.max 1 (1/mig A)); push_cast at this; exact this
+
+end ProdComb
+
+
+section ProdComb2
+open WgslReassoc
+
+/-- The nonnegativity of the factor quantities in a chain. -/
+lemma Q_nn {v E : ℕ → ℝ} {L : List (Bool × GExpr)} {Q : List (ℝ × ℝ × ℝ)}
+    (h : List.Forall₂ (FacP v E) L Q) : ∀ q ∈ Q, 0 ≤ q.1 ∧ 0 ≤ q.2.1 ∧ 0 ≤ q.2.2 := fun q hq => by
+  obtain ⟨p, -, hpq⟩ := forall₂_mem h q hq; exact hpq.nn
+
+lemma Qd_nn {v E : ℕ → ℝ} {L : List GExpr} {Q : List (ℝ × ℝ × ℝ)}
+    (h : List.Forall₂ (fun ℓ q => FacP v E (true, ℓ) q) L Q) : ∀ q ∈ Q, 0 ≤ q.1 ∧ 0 ≤ q.2.1 ∧ 0 ≤ q.2.2 :=
+  fun q hq => by obtain ⟨p, -, hpq⟩ := forall₂_mem h q hq; exact hpq.nn
+
+lemma DDH_mul {d e : DD} {Q R : List (ℝ × ℝ × ℝ)} (hQ : ∀ q ∈ Q, 0 ≤ q.1 ∧ 0 ≤ q.2.1 ∧ 0 ≤ q.2.2)
+    (hR : ∀ q ∈ R, 0 ≤ q.1 ∧ 0 ≤ q.2.1 ∧ 0 ≤ q.2.2) (hd : DDH d Q) (he : DDH e R) :
+    DDH (d.mul e) (Q ++ R) := by
+  obtain ⟨d1, d2, d3, d4, d5, d6, d7, d8⟩ := hd
+  obtain ⟨e1, e2, e3, e4, e5, e6, e7, e8⟩ := he
+  have n1 := fun q hq => (hQ q hq).1
+  have m1 := fun q hq => (hR q hq).1
+  simp only [DDH, DD.mul, List.map_append, List.prod_append, List.length_append]
+  refine ⟨by rw [d1, e1], rdn_mul_nonneg d2 e2, (rdn_mul _ _).trans (up_mul d2 e2 d3 e3),
+    le_trans (up_mul (prod_map_nonneg fun q hq => add_nonneg zero_le_one (div_nonneg (hQ q hq).2.2 (n1 q hq)))
+      (prod_map_nonneg fun q hq => add_nonneg zero_le_one (div_nonneg (hR q hq).2.2 (m1 q hq))) d4 e4)
+      (rup_mul _ _),
+    rdn_mul_nonneg d5 e5, (rdn_mul _ _).trans (up_mul d5 e5 d6 e6),
+    le_trans (up_mul (prod_map_nonneg fun q _ => le_max_of_le_left zero_le_one)
+      (prod_map_nonneg fun q _ => le_max_of_le_left zero_le_one) d7 e7) (rup_mul _ _),
+    le_trans (up_mul (prod_map_nonneg fun q _ => le_max_of_le_left zero_le_one)
+      (prod_map_nonneg fun q _ => le_max_of_le_left zero_le_one) d8 e8) (rup_mul _ _)⟩
+
+lemma MH_mul {v E : ℕ → ℝ} {d e : DD} {a b : GExpr} (ha : MH v E d a) (hb : MH v E e b) :
+    MH v E (d.mul e) (.mul a b) := by
+  obtain ⟨Q, fQ, hQ⟩ := ha
+  obtain ⟨R, fR, hR⟩ := hb
+  exact ⟨Q ++ R, by simp only [mulLeaves]; exact List.rel_append fQ fR, DDH_mul (Qd_nn fQ) (Qd_nn fR) hQ hR⟩
+
+end ProdComb2
+
+
+section ProdComb3
+open WgslReassoc
+
+lemma PH_mul {v E : ℕ → ℝ} {p q : PD} {a b : GExpr} (ha : PH v E p a) (hb : PH v E q b) :
+    PH v E (p.mul q) (.mul a b) := by
+  obtain ⟨na, Qa, fa, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12⟩ := ha
+  obtain ⟨nb, Qb, fb, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12⟩ := hb
+  have la := fa.length_eq
+  have qa := Q_nn fa; have qb := Q_nn fb
+  have eL : prodLeaves (.mul a b) = prodLeaves a ++ prodLeaves b := rfl
+  refine ⟨by rw [eL, List.length_append, na, nb]; rfl, Qa ++ Qb, by rw [eL]; exact List.rel_append fa fb, ?_⟩
+  simp only [eL, zN_append la, zD_append la, PD.mul, DD.mul, nd_append, a5, b5]
+  have zNn := fun (f : ℝ × ℝ × ℝ → ℝ) (L : List (Bool × GExpr)) (Q : List (ℝ × ℝ × ℝ))
+    (h : ∀ q ∈ Q, 0 ≤ f q) => zN_nonneg (L := L) h
+  have zDn := fun (f : ℝ × ℝ × ℝ → ℝ) (L : List (Bool × GExpr)) (Q : List (ℝ × ℝ × ℝ))
+    (h : ∀ q ∈ Q, 0 ≤ f q) => zD_nonneg (L := L) h
+  refine ⟨le_trans (up_mul (zNn _ _ _ fun q hq => add_nonneg (qa q hq).2.1 (qa q hq).2.2)
+      (zNn _ _ _ fun q hq => add_nonneg (qb q hq).2.1 (qb q hq).2.2) a1 b1) (rup_mul _ _),
+    le_trans (up_mul (zNn _ _ _ fun q _ => le_max_of_le_left zero_le_one) (zNn _ _ _ fun q _ => le_max_of_le_left zero_le_one) a2 b2) (rup_mul _ _),
+    rdn_mul_nonneg a3 b3, (rdn_mul _ _).trans (up_mul a3 b3 a4 b4), trivial,
+    rdn_mul_nonneg a6 b6, (rdn_mul _ _).trans (up_mul a6 b6 a7 b7),
+    le_trans (up_mul (zDn _ _ _ fun q hq => add_nonneg zero_le_one (div_nonneg (qa q hq).2.2 (qa q hq).1))
+      (zDn _ _ _ fun q hq => add_nonneg zero_le_one (div_nonneg (qb q hq).2.2 (qb q hq).1)) a8 b8)
+      (rup_mul _ _),
+    rdn_mul_nonneg a9 b9, (rdn_mul _ _).trans (up_mul a9 b9 a10 b10),
+    le_trans (up_mul (zDn _ _ _ fun q _ => le_max_of_le_left zero_le_one)
+      (zDn _ _ _ fun q _ => le_max_of_le_left zero_le_one) a11 b11) (rup_mul _ _),
+    le_trans (up_mul (zDn _ _ _ fun q _ => le_max_of_le_left zero_le_one)
+      (zDn _ _ _ fun q _ => le_max_of_le_left zero_le_one) a12 b12) (rup_mul _ _)⟩
+
+lemma PH_div {v E : ℕ → ℝ} {p : PD} {d : DD} {a b : GExpr} (ha : PH v E p a) (hb : MH v E d b) :
+    PH v E (p.div d) (.div a b) := by
+  obtain ⟨na, Qa, fa, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12⟩ := ha
+  obtain ⟨Qb, fb, b1, b2, b3, b4, b5, b6, b7, b8⟩ := hb
+  have la := fa.length_eq
+  have lb := fb.length_eq
+  have qa := Q_nn fa; have qb := Qd_nn fb
+  have eL : prodLeaves (.div a b) = prodLeaves a ++ (mulLeaves b).map fun x => (true, x) := rfl
+  refine ⟨by rw [eL, List.length_append, List.length_map, na, lb, b1]; rfl, Qa ++ Qb,
+    by rw [eL]; exact List.rel_append fa (List.forall₂_map_left_iff.mpr fb), ?_⟩
+  simp only [eL, zN_append la, zD_append la, zN_divs, zD_divs lb, PD.div, DD.mul, nd_append, nd_divs,
+    a5, mul_one]
+  refine ⟨a1, a2, a3, a4, by rw [lb, b1], rdn_mul_nonneg a6 b2, (rdn_mul _ _).trans (up_mul a6 b2 a7 b3),
+    le_trans (up_mul (zD_nonneg fun q hq => add_nonneg zero_le_one (div_nonneg (qa q hq).2.2 (qa q hq).1))
+      (prod_map_nonneg fun q hq => add_nonneg zero_le_one (div_nonneg (qb q hq).2.2 (qb q hq).1)) a8 b4)
+      (rup_mul _ _),
+    rdn_mul_nonneg a9 b5, (rdn_mul _ _).trans (up_mul a9 b5 a10 b6),
+    le_trans (up_mul (zD_nonneg fun q _ => le_max_of_le_left zero_le_one)
+      (prod_map_nonneg fun q _ => le_max_of_le_left zero_le_one) a11 b7) (rup_mul _ _),
+    le_trans (up_mul (zD_nonneg fun q _ => le_max_of_le_left zero_le_one)
+      (prod_map_nonneg fun q _ => le_max_of_le_left zero_le_one) a12 b8) (rup_mul _ _)⟩
+
+end ProdComb3
+
+
+section ProdChain
+open WgslReassoc
+
+lemma lp_perm {L L' : List (Bool × GExpr)} (σ : Fin L.length ≃ Fin L'.length) (f : Bool × GExpr → ℝ) :
+    lp L' f = ∏ i : Fin L.length, f L'[σ i] := by
+  unfold lp; rw [← List.ofFn_getElem_eq_map, List.prod_ofFn]
+  exact (Equiv.prod_comp σ (fun j => f L'[(j : ℕ)])).symm
+
+lemma zip_prod {L : List (Bool × GExpr)} {Q : List (ℝ × ℝ × ℝ)} (h : L.length = Q.length)
+    (g : (Bool × GExpr) × (ℝ × ℝ × ℝ) → ℝ) :
+    ((L.zip Q).map g).prod = ∏ i : Fin L.length, g (L[i], Q[(i : ℕ)]'(h ▸ i.2)) := by
+  have hl : (L.zip Q).length = L.length := by simp [List.length_zip, h]
+  rw [← List.ofFn_getElem_eq_map, List.prod_ofFn]
+  refine Fintype.prod_equiv (finCongr hl) _ _ fun i => ?_
+  simp [List.getElem_zip]
+
+/-- The factor data of a chain, at index `i`. -/
+lemma Q_get {v E : ℕ → ℝ} {L : List (Bool × GExpr)} {Q : List (ℝ × ℝ × ℝ)}
+    (hQ : List.Forall₂ (FacP v E) L Q) (i : Fin L.length) :
+    FacP v E L[i] (Q[(i : ℕ)]'(hQ.length_eq ▸ i.2)) :=
+  (List.forall₂_iff_get.mp hQ).2 i i.2 (hQ.length_eq ▸ i.2)
+
+lemma qU'_eq : (qU' : ℝ) = U' := by simp [qU', U', WgslPoly.U, u]; norm_num
+
+lemma nd_fin (L : List (Bool × GExpr)) :
+    (nd L : ℝ) = ∑ i : Fin L.length, (if L[i].1 then (1:ℝ) else 0) := by
+  have : (nd L : ℝ) = (L.map fun p => if p.1 then (1:ℝ) else 0).sum := by
+    induction L with
+    | nil => simp [nd]
+    | cons p L ih =>
+      simp only [nd, List.countP_cons, List.map_cons, List.sum_cons] at ih ⊢
+      push_cast; rw [ih]; split_ifs <;> ring
+  rw [this, list_sum_fin]
+
+lemma nd_perm {L L' : List (Bool × GExpr)} (σ : Fin L.length ≃ Fin L'.length)
+    (hs : ∀ i, (L'[σ i]).1 = (L[i]).1) : nd L' = nd L := by
+  have h : (nd L' : ℝ) = nd L := by
+    rw [nd_fin, nd_fin, ← Equiv.sum_comp σ]
+    exact Finset.sum_congr rfl fun i _ => by rw [hs i]
+  exact_mod_cast h
+
+/-- Products over a permuted chain compare factor by factor. -/
+lemma perm_le {L L' : List (Bool × GExpr)} {Q : List (ℝ × ℝ × ℝ)} (σ : Fin L.length ≃ Fin L'.length)
+    (hlQ : L.length = Q.length) (f : Bool × GExpr → ℝ) (g : (Bool × GExpr) × (ℝ × ℝ × ℝ) → ℝ)
+    (h0 : ∀ i : Fin L.length, 0 ≤ f L'[σ i]) (h : ∀ i : Fin L.length, f L'[σ i] ≤ g (L[i], Q[(i : ℕ)]'(hlQ ▸ i.2))) :
+    lp L' f ≤ ((L.zip Q).map g).prod := by
+  rw [lp_perm σ, zip_prod hlQ]
+  exact Finset.prod_le_prod₀ (fun i _ => h0 i) (fun i _ => h i)
+
+lemma perm_ge {L L' : List (Bool × GExpr)} {Q : List (ℝ × ℝ × ℝ)} (σ : Fin L.length ≃ Fin L'.length)
+    (hlQ : L.length = Q.length) (f : Bool × GExpr → ℝ) (g : (Bool × GExpr) × (ℝ × ℝ × ℝ) → ℝ)
+    (h0 : ∀ i : Fin L.length, 0 ≤ g (L[i], Q[(i : ℕ)]'(hlQ ▸ i.2)))
+    (h : ∀ i : Fin L.length, g (L[i], Q[(i : ℕ)]'(hlQ ▸ i.2)) ≤ f L'[σ i]) :
+    ((L.zip Q).map g).prod ≤ lp L' f := by
+  rw [lp_perm σ, zip_prod hlQ]
+  exact Finset.prod_le_prod₀ (fun i _ => h0 i) (fun i _ => h i)
+
+
+/-- `(1+x)ᵏ ≤ 1/(1 - kx)` for `0 ≤ x` and `kx < 1`. -/
+lemma pow_le_inv {x : ℝ} (hx : 0 ≤ x) {k : ℕ} (hk : (k:ℝ)*x < 1) : (1+x)^k ≤ 1/(1-(k:ℝ)*x) := by
+  have h1 : (1+x)^k ≤ Real.exp x^k :=
+    pow_le_pow_left₀ (by linarith) (by linarith [Real.add_one_le_exp x]) k
+  rw [← Real.exp_nat_mul] at h1
+  have h2 : 1-(k:ℝ)*x ≤ Real.exp (-((k:ℝ)*x)) := by linarith [Real.add_one_le_exp (-((k:ℝ)*x))]
+  have h3 : Real.exp ((k:ℝ)*x) = 1/Real.exp (-((k:ℝ)*x)) := by rw [Real.exp_neg, one_div, inv_inv]
+  rw [h3] at h1
+  exact h1.trans (one_div_le_one_div_of_le (by linarith) h2)
+
+/-- `prod_gap_mono` for families indexed by `Fin n`. -/
+lemma fin_gap {n : ℕ} (f1 f2 f3 f4 : Fin n → ℝ)
+    (h : ∀ i, 0 ≤ f1 i ∧ f1 i ≤ f2 i ∧ f1 i ≤ f3 i ∧ f3 i ≤ f4 i ∧ f2 i-f1 i ≤ f4 i-f3 i) :
+    0 ≤ ∏ i, f1 i ∧ ∏ i, f1 i ≤ ∏ i, f2 i ∧ ∏ i, f2 i ≤ ∏ i, f4 i ∧
+      ∏ i, f2 i-∏ i, f1 i ≤ ∏ i, f4 i-∏ i, f3 i := by
+  have := prod_gap_mono ((List.finRange n).map fun i => (f1 i, f2 i, f3 i, f4 i)) (by
+    intro q hq; obtain ⟨i, -, rfl⟩ := List.mem_map.mp hq; exact h i)
+  simp only [List.map_map, Function.comp_def] at this
+  simp only [Fin.prod_univ_def]
+  exact this
+
+set_option maxHeartbeats 4000000 in
+/-- The product-chain bound covers every role-preserving reassociation. -/
+lemma chainP_all {v E : ℕ → ℝ} {R : Av} {x : GExpr} (hx : IsProd x) {p : PD} (hp : PH v E p x)
+    {cb : ℚ} (hcb : chainPB p = some cb) (hlo : (R.lo : ℝ) ≤ x.exact v) (hhi : x.exact v ≤ R.hi)
+    (mc : Bool) (md : DD) :
+    ∀ x', RA x x' → x'.Safe v E ∧ (prodAv R cb p mc md).H (x'.exact v) (x'.bound v E) := by
+  intro x' hx'
+  obtain ⟨hx'', σ, hsg, hl⟩ := hx'.prod_inv hx
+  obtain ⟨hn, Q, hQ, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12⟩ := hp
+  simp only [chainPB] at hcb
+  split_ifs at hcb with hc
+  obtain ⟨c1, cn, c2, c3, c4, c5, c6⟩ := hc
+  simp only [Option.some.injEq] at hcb
+  subst hcb
+  have hlQ : (prodLeaves x).length = Q.length := hQ.length_eq
+  have hlen : (prodLeaves x').length = (prodLeaves x).length := by
+    rw [← Fintype.card_fin (prodLeaves x').length, ← Fintype.card_congr σ, Fintype.card_fin]
+  have fac := Q_get hQ
+  have ex : ∀ i : Fin (prodLeaves x).length, ((prodLeaves x')[σ i]).2.exact v = ((prodLeaves x)[i]).2.exact v := fun i => exact_RA v (hl i)
+  have bd : ∀ i : Fin (prodLeaves x).length, ((prodLeaves x')[σ i]).2.Safe v E ∧ 0 ≤ ((prodLeaves x')[σ i]).2.bound v E ∧
+      ((prodLeaves x')[σ i]).2.bound v E ≤ (Q[(i : ℕ)]'(hlQ ▸ i.2)).2.2 := fun i => (fac i).2.2.2.2 _ (hl i)
+  have hU := WgslPoly.U_pos; have hη := η_pos; have hU' := U'_pos
+  have hU1 : (1:ℝ) ≤ 1+WgslPoly.U := by linarith
+  -- the closed-form bounds of `chainPB`
+  have cn64 : (p.n:ℝ) ≤ 64 := by exact_mod_cast cn
+  have hUv : WgslPoly.U = 5/2^24 := by simp [WgslPoly.U, u]; norm_num
+  have hU'v : U' = 5/2^24+1/2^26 := by simp [U', hUv]
+  have cn' : (p.n:ℝ)*WgslPoly.U < 1/2 := by rw [hUv]; nlinarith
+  have cm' : (p.d.m:ℝ)*U' < 1/2 := by
+    have : (p.d.m:ℝ) ≤ p.n := by rw [← a5, ← hn]; exact_mod_cast nd_le _
+    rw [hU'v]; nlinarith
+  have P0 : (0:ℝ) ≤ p.d.P := le_trans (zD_nonneg fun q hq => add_nonneg zero_le_one
+    (div_nonneg (Q_nn hQ q hq).2.2 (Q_nn hQ q hq).1)) a8
+  have hm1 : ((p.d.m-1 : ℕ) : ℝ)*U' < 1 := by
+    have : ((p.d.m-1 : ℕ) : ℝ) ≤ p.d.m := by exact_mod_cast Nat.sub_le _ _
+    nlinarith
+  set Xr : ℝ := (p.d.P:ℝ)/(1-((p.d.m-1 : ℕ) : ℝ)*U')
+  have cX : ((p.d.P/(1-((p.d.m-1 : ℕ) : ℚ)*qU') : ℚ) : ℝ) = Xr := by push_cast; rw [qU'_eq]
+  set XU := (p.d.P:ℝ)*(1+U')^(p.d.m-1)
+  have XUr : XU ≤ Xr := by
+    have := pow_le_inv hU'.le hm1
+    calc XU ≤ (p.d.P:ℝ)*(1/(1-((p.d.m-1 : ℕ) : ℝ)*U')) := mul_le_mul_of_nonneg_left this P0
+      _ = Xr := by simp only [Xr]; ring
+  have c1' : (0:ℝ) < p.d.T := by exact_mod_cast c1
+  have Xr2 : Xr < 2 := by
+    have h := (Rat.cast_lt (K := ℝ)).mpr c2
+    rw [cX] at h; norm_num at h ⊢; linarith
+  have c2' : XU < 2 := by linarith
+  have c3' : (1:ℝ)/2^100 ≤ p.d.mn := by
+    have h1 : ((q2m100 : ℚ) : ℝ) ≤ p.d.mn := by exact_mod_cast c3
+    have h2 : ((q2m100 : ℚ) : ℝ) = 1/2^100 := by norm_num [q2m100]
+    linarith
+  have c4' : (1:ℝ)/2^126 ≤ p.d.mn*(2-XU) := by
+    have : ((qη : ℚ) : ℝ) ≤ ((p.d.mn*(2-p.d.P/(1-((p.d.m-1 : ℕ) : ℚ)*qU')) : ℚ) : ℝ) := by exact_mod_cast c4
+    rw [qη_eq] at this; push_cast at this; rw [qU'_eq] at this
+    exact this.trans (mul_le_mul_of_nonneg_left (by linarith) a9)
+  have mx0 : (0:ℝ) ≤ p.d.mx := le_trans (zD_nonneg fun q _ => le_max_of_le_left zero_le_one) a11
+  have c5' : (p.d.mx:ℝ)*XU ≤ 2^126 := by
+    have : ((p.d.mx*(p.d.P/(1-((p.d.m-1 : ℕ) : ℚ)*qU')) : ℚ) : ℝ) ≤ ((q2p126 : ℚ) : ℝ) := by exact_mod_cast c5
+    rw [q2p126_eq] at this; push_cast at this; rw [qU'_eq] at this
+    exact (mul_le_mul_of_nonneg_left XUr mx0).trans this
+  set cU := 2-XU
+  have cU0 : 0 < cU := by simp only [cU]; linarith
+  have cXr : 0 < 2-Xr := by linarith
+  have cUr : 2-Xr ≤ cU := by simp only [cU]; linarith
+  set MU := (p.M:ℝ)*p.d.im/cU^p.d.m
+  set Mr : ℝ := (p.M:ℝ)*p.d.im/(2-Xr)^p.d.m
+  have M0 : (0:ℝ) ≤ (p.M:ℝ)*p.d.im := mul_nonneg
+    (le_trans (zN_nonneg fun q _ => le_max_of_le_left zero_le_one) a2)
+    (le_trans (zD_nonneg fun q _ => le_max_of_le_left zero_le_one) a12)
+  have MUr : MU ≤ Mr := by
+    exact div_le_div_of_nonneg_left M0 (pow_pos cXr _) (pow_le_pow_left₀ cXr.le cUr _)
+  have Kn : (1+WgslPoly.U)^p.n ≤ 1/(1-(p.n:ℝ)*WgslPoly.U) := pow_le_inv hU.le (by linarith)
+  have c6' : 4*(p.n:ℝ)^2*η*(1+WgslPoly.U)^p.n*MU ≤ 1 := by
+    have hM90 : Mr ≤ 2^90 := by
+      have : ((p.M*p.d.im/(2-p.d.P/(1-((p.d.m-1 : ℕ) : ℚ)*qU'))^p.d.m : ℚ) : ℝ) ≤
+          ((1237940039285380274899124224 : ℚ) : ℝ) := by exact_mod_cast c6
+      simp only [Mr, Xr]; push_cast at this ⊢; rw [qU'_eq] at this; norm_num at this ⊢; linarith
+    have hK2 : (1+WgslPoly.U)^p.n ≤ 2 := Kn.trans (by
+      rw [div_le_iff₀ (by linarith)]; linarith)
+    have MU0 : 0 ≤ MU := div_nonneg M0 (pow_pos cU0 _).le
+    have hη' : η = 1/2^126 := rfl
+    have n2 : (p.n:ℝ)^2 ≤ 64^2 := pow_le_pow_left₀ (by positivity) cn64 2
+    calc 4*(p.n:ℝ)^2*η*(1+WgslPoly.U)^p.n*MU ≤ 4*64^2*η*2*2^90 := by
+          gcongr
+          exact MUr.trans hM90
+      _ ≤ 1 := by rw [hη']; norm_num
+  -- divisors are nonzero
+  have lam : ∀ i : Fin (prodLeaves x).length, ((prodLeaves x)[i]).1 = true → 0 < (Q[(i : ℕ)]'(hlQ ▸ i.2)).1 := by
+    intro i hi
+    have hpos : 0 < zD (prodLeaves x) Q (·.1) := c1'.trans_le a7
+    rw [zD, zip_prod hlQ] at hpos
+    have hne := (Finset.prod_ne_zero_iff.mp hpos.ne') i (Finset.mem_univ _)
+    simp only [hi, ↓reduceIte] at hne
+    exact lt_of_le_of_ne (fac i).1 (Ne.symm hne)
+  have tpos : ∀ i : Fin (prodLeaves x).length, ((prodLeaves x)[i]).1 = true → 0 < |((prodLeaves x')[σ i]).2.exact v| := fun i hi => by
+    rw [ex]; exact (lam i hi).trans_le (fac i).2.1
+  have memL' : ∀ r ∈ (prodLeaves x'), ∃ i : Fin (prodLeaves x).length, r = (prodLeaves x')[σ i] := fun r hr => by
+    obtain ⟨j, hj, rfl⟩ := List.mem_iff_getElem.mp hr
+    exact ⟨σ.symm ⟨j, hj⟩, by simp⟩
+  have H1 : LeafOK v E (prodLeaves x') := ⟨fun r hr => by
+      obtain ⟨i, rfl⟩ := memL' r hr; exact ⟨(bd i).1, (bd i).2.1⟩,
+    fun r hr hs => by obtain ⟨i, rfl⟩ := memL' r hr; rw [hsg] at hs; exact tpos i hs⟩
+  have ndL : nd (prodLeaves x') = p.d.m := by rw [nd_perm σ hsg, a5]
+  -- the divisor margins
+  have dPle : lp (prodLeaves x') (dP v E) ≤ (p.d.P:ℝ) := by
+    refine le_trans (perm_le σ hlQ _ (fun z => if z.1.1 then 1+z.2.2.2/z.2.1 else 1) ?_ ?_) a8
+    · intro i; unfold WgslReassoc.dP; split_ifs
+      · exact add_nonneg zero_le_one (div_nonneg (bd i).2.1 (abs_nonneg _))
+      · exact zero_le_one
+    · intro i; simp only [WgslReassoc.dP, hsg i]; split_ifs with hf
+      · rw [ex i]
+        have hl0 := lam i hf
+        have h1 := div_le_div_of_nonneg_right (bd i).2.2 (abs_nonneg ((prodLeaves x)[i].2.exact v))
+        have h2 := div_le_div_of_nonneg_left (fac i).2.2.2.1 hl0 (fac i).2.1
+        linarith
+      · exact le_rfl
+  have XDle : XD v E (prodLeaves x') ≤ XU := by
+    unfold XD; rw [ndL]; exact mul_le_mul_of_nonneg_right dPle (by positivity)
+  have H2 : XD v E (prodLeaves x') < 2 := XDle.trans_lt c2'
+  have dminge : (p.d.mn:ℝ) ≤ lp (prodLeaves x') (dmin v) := by
+    refine a10.trans (perm_ge σ hlQ _ (fun z => if z.1.1 then Min.min 1 z.2.1 else 1) ?_ ?_)
+    · intro i; dsimp only; split_ifs
+      · exact le_min zero_le_one (fac i).1
+      · exact zero_le_one
+    · intro i; simp only [WgslReassoc.dmin, hsg i]; split_ifs with hf
+      · rw [ex i]; exact min_le_min le_rfl (fac i).2.1
+      · exact le_rfl
+  have H3 : 1/2^100 ≤ lp (prodLeaves x') (dmin v) := c3'.trans dminge
+  have cDge : cU ≤ cD v E (prodLeaves x') := by unfold cD; simp only [cU]; linarith
+  have H4 : 1/2^126 ≤ lp (prodLeaves x') (dmin v)*cD v E (prodLeaves x') :=
+    c4'.trans (mul_le_mul dminge cDge cU0.le (a9.trans dminge))
+  have dmaxle : lp (prodLeaves x') (dmax v) ≤ (p.d.mx:ℝ) := by
+    refine le_trans (perm_le σ hlQ _ (fun z => if z.1.1 then Max.max 1 z.2.2.1 else 1) ?_ ?_) a11
+    · intro i; exact zero_le_one.trans (one_le_dmax _)
+    · intro i; simp only [WgslReassoc.dmax, hsg i]; split_ifs with hf
+      · rw [ex i]; exact max_le_max le_rfl (fac i).2.2.1
+      · exact le_rfl
+  have xd1 := one_le_XD H1
+  have dm1 : 1 ≤ lp (prodLeaves x') (dmax v) := lp_one_le fun r _ => one_le_dmax r
+  have H5 : lp (prodLeaves x') (dmax v)*XD v E (prodLeaves x') ≤ 2^126 :=
+    (mul_le_mul dmaxle XDle (by linarith) (by linarith)).trans c5'
+  -- the `η` weight
+  have nMle : lp (prodLeaves x') (nM v E) ≤ (p.M:ℝ) := by
+    refine le_trans (perm_le σ hlQ _ (fun z => if z.1.1 then 1 else Max.max 1 (z.2.2.1+z.2.2.2)) ?_ ?_) a2
+    · intro i; exact zero_le_one.trans (one_le_nM _)
+    · intro i; simp only [WgslReassoc.nM, hsg i]; split_ifs with hf
+      · exact le_rfl
+      · rw [ex i]; exact max_le_max le_rfl (add_le_add (fac i).2.2.1 (bd i).2.2)
+  have dIMle : lp (prodLeaves x') (dIM v) ≤ (p.d.im:ℝ) := by
+    refine le_trans (perm_le σ hlQ _ (fun z => if z.1.1 then Max.max 1 (1/z.2.1) else 1) ?_ ?_) a12
+    · intro i; exact zero_le_one.trans (one_le_dIM _)
+    · intro i; simp only [WgslReassoc.dIM, hsg i]; split_ifs with hf
+      · rw [ex i]; exact max_le_max le_rfl (one_div_le_one_div_of_le (lam i hf) (fac i).2.1)
+      · exact le_rfl
+  have nM1 : 1 ≤ lp (prodLeaves x') (nM v E) := lp_one_le fun r _ => one_le_nM r
+  have dI1 : 1 ≤ lp (prodLeaves x') (dIM v) := lp_one_le fun r _ => one_le_dIM r
+  have cD0 : 0 < cD v E (prodLeaves x') := cU0.trans_le cDge
+  have Mfle : Mf v E (prodLeaves x') ≤ MU := by
+    unfold Mf; rw [ndL]
+    exact div_le_div₀ (mul_nonneg (by linarith) (by linarith)) (mul_le_mul nMle dIMle (by linarith) (by linarith))
+      (pow_pos cU0 _) (pow_le_pow_left₀ cU0.le cDge _)
+  have hn' : (prodLeaves x').length = p.n := by rw [hlen, hn]
+  have H6 : 4*((prodLeaves x').length:ℝ)^2*η*(1+WgslPoly.U)^(prodLeaves x').length*
+      Mf v E (prodLeaves x') ≤ 1 := by
+    rw [hn']; exact le_trans (mul_le_mul_of_nonneg_left Mfle (by positivity)) c6'
+  obtain ⟨s', b0, hb⟩ := prod_bound v E x' H1 H2 H3 H4 H5 H6
+  have hex := exact_RA v hx'
+  refine ⟨s', by rw [hex]; exact hlo, by rw [hex]; exact hhi, b0, ?_⟩
+  simp only [prodAv]
+  refine le_trans ?_ (le_rup_real _ _)
+  set Kr : ℝ := 1/(1-((p.n-1 : ℕ) : ℝ)*WgslPoly.U)
+  have ecb : ((((1/(1-((p.n-1 : ℕ) : ℚ)*qU))/(2-p.d.P/(1-((p.d.m-1 : ℕ) : ℚ)*qU'))*p.ψ-p.T)/p.d.T+
+      2*((p.n:ℚ)-1)*(1/(1-((p.n-1 : ℕ) : ℚ)*qU))*qη*(p.M*p.d.im/(2-p.d.P/(1-((p.d.m-1 : ℕ) : ℚ)*qU'))^p.d.m) : ℚ) : ℝ) =
+      (Kr/(2-Xr)*p.ψ-p.T)/p.d.T+2*((p.n:ℝ)-1)*Kr*η*Mr := by
+    simp only [Kr, Xr, Mr]; push_cast; rw [qU_eq, qη_eq, qU'_eq]
+  refine le_trans ?_ ((Rat.cast_le (K := ℝ)).mpr (le_max_right R.b _))
+  rw [ecb]
+  rw [hn'] at hb
+  -- magnitudes of the reassociated chain
+  have dTge : (p.d.T:ℝ) ≤ lp (prodLeaves x') (dT v) := by
+    refine a7.trans (perm_ge σ hlQ _ (fun z => if z.1.1 then z.2.1 else 1) ?_ ?_)
+    · intro i; dsimp only; split_ifs
+      · exact (fac i).1
+      · exact zero_le_one
+    · intro i; simp only [WgslReassoc.dT, hsg i]; split_ifs with hf
+      · rw [ex i]; exact (fac i).2.1
+      · exact le_rfl
+  have dT0 : 0 < lp (prodLeaves x') (dT v) := c1'.trans_le dTge
+  have gap := fin_gap (fun i => nT v (prodLeaves x')[σ i]) (fun i => nψ v E (prodLeaves x')[σ i])
+    (fun i => if ((prodLeaves x)[i]).1 then 1 else (Q[(i : ℕ)]'(hlQ ▸ i.2)).2.1)
+    (fun i => if ((prodLeaves x)[i]).1 then 1 else (Q[(i : ℕ)]'(hlQ ▸ i.2)).2.1+(Q[(i : ℕ)]'(hlQ ▸ i.2)).2.2)
+    (fun i => by
+      simp only [WgslReassoc.nT, WgslReassoc.nψ, hsg i]
+      split_ifs with hf
+      · norm_num
+      · rw [ex i]
+        have := (fac i).2.2.1; have := (bd i).2.1; have := (bd i).2.2; have := (fac i).2.2.2.1
+        refine ⟨abs_nonneg _, by linarith, by linarith, by linarith, by linarith⟩)
+  rw [← lp_perm σ, ← lp_perm σ] at gap
+  have eTU : (∏ i : Fin (prodLeaves x).length,
+      (if ((prodLeaves x)[i]).1 then 1 else (Q[(i : ℕ)]'(hlQ ▸ i.2)).2.1)) = zN (prodLeaves x) Q (·.2.1) := by
+    rw [zN, zip_prod hlQ]
+  have ePU : (∏ i : Fin (prodLeaves x).length, (if ((prodLeaves x)[i]).1 then 1 else
+      (Q[(i : ℕ)]'(hlQ ▸ i.2)).2.1+(Q[(i : ℕ)]'(hlQ ▸ i.2)).2.2)) =
+      zN (prodLeaves x) Q (fun q => q.2.1+q.2.2) := by
+    rw [zN, zip_prod hlQ]
+  rw [eTU, ePU] at gap
+  obtain ⟨g0, g1, g2, g3⟩ := gap
+  set Ts := lp (prodLeaves x') (nT v); set Ps := lp (prodLeaves x') (nψ v E)
+  set TU := zN (prodLeaves x) Q (·.2.1); set PU := zN (prodLeaves x) Q (fun q => q.2.1+q.2.2)
+  set K := (1+WgslPoly.U)^(p.n-1)
+  have K1 : 1 ≤ K := one_le_pow₀ hU1
+  set cD' := cD v E (prodLeaves x')
+  have cD1 : cD' ≤ 1 := by simp only [cD', cD]; linarith
+  have A'1 : 1 ≤ K/cD' := by rw [le_div_iff₀ cD0]; nlinarith
+  have A'A : K/cD' ≤ K/cU := div_le_div_of_nonneg_left (by linarith) cU0 cDge
+  have hX0 : 0 ≤ K/cD'*Ps-Ts := by nlinarith
+  have hXY : K/cD'*Ps-Ts ≤ K/cU*p.ψ-p.T := by
+    have e1 : (K/cD'-1)*Ps ≤ (K/cU-1)*PU := mul_le_mul (by linarith) g2 (by linarith) (by linarith)
+    have e2 : K/cU*PU ≤ K/cU*p.ψ := mul_le_mul_of_nonneg_left a1 (by linarith)
+    nlinarith
+  have hexact : |x'.exact v| = Ts/lp (prodLeaves x') (dT v) := abs_prod_exact v x'
+  have hRf : Rf v E (prodLeaves x') = Ps/(lp (prodLeaves x') (dT v)*cD') := rfl
+  have hn1 : (0:ℝ) ≤ (p.n:ℝ)-1 := by
+    have : 1 ≤ p.n := by rw [← hn]; exact prodLeaves_length_pos x
+    have : (1:ℝ) ≤ p.n := by exact_mod_cast this
+    linarith
+  have hM : 2*((p.n:ℝ)-1)*η*Mf v E (prodLeaves x') ≤ 2*((p.n:ℝ)-1)*η*MU :=
+    mul_le_mul_of_nonneg_left Mfle (by positivity)
+  rw [hexact, hRf] at hb
+  have hsplit : K*(Ps/(lp (prodLeaves x') (dT v)*cD')) = K/cD'*Ps/lp (prodLeaves x') (dT v) := by
+    field_simp
+  have hX1 : (K/cD'*Ps-Ts)/lp (prodLeaves x') (dT v) ≤ (K/cU*p.ψ-p.T)/p.d.T :=
+    (div_le_div_of_nonneg_left hX0 c1' dTge).trans (div_le_div_of_nonneg_right hXY c1'.le)
+  have : x'.bound v E ≤ (K/cD'*Ps-Ts)/lp (prodLeaves x') (dT v)+K*(2*((p.n:ℝ)-1)*η*Mf v E (prodLeaves x')) := by
+    rw [sub_div]; nlinarith
+  have hKM := mul_le_mul_of_nonneg_left hM (by linarith : (0:ℝ) ≤ K)
+  -- the closed-form bounds of `chainPB` only enlarge the bound
+  have hn1' : ((p.n-1 : ℕ) : ℝ)*WgslPoly.U < 1 := by
+    have : ((p.n-1 : ℕ) : ℝ) ≤ p.n := by exact_mod_cast Nat.sub_le _ _
+    nlinarith
+  have KKr : K ≤ Kr := pow_le_inv hU.le hn1'
+  have Kr0 : 0 ≤ Kr := le_trans (by linarith) KKr
+  have ψ0 : (0:ℝ) ≤ p.ψ := le_trans (zN_nonneg fun q hq => add_nonneg (Q_nn hQ q hq).2.1 (Q_nn hQ q hq).2.2) a1
+  have e1 : K/cU ≤ Kr/(2-Xr) := div_le_div₀ Kr0 KKr cXr (by simp only [cU]; linarith)
+  have e2 : (K/cU*p.ψ-p.T)/p.d.T ≤ (Kr/(2-Xr)*p.ψ-p.T)/p.d.T :=
+    div_le_div_of_nonneg_right (by nlinarith) c1'.le
+  have e3 : K*(2*((p.n:ℝ)-1)*η*MU) ≤ 2*((p.n:ℝ)-1)*Kr*η*Mr := by
+    have := mul_le_mul KKr (mul_le_mul_of_nonneg_left MUr (by positivity : (0:ℝ) ≤ 2*((p.n:ℝ)-1)*η))
+      (by have := div_nonneg M0 (pow_pos cU0 p.d.m).le; positivity) Kr0
+    linarith
+  linarith
+
+end ProdChain
+
+
 /-! ### Every reassociation
 
 WGSL may evaluate each sum chain in any association (`WgslReassoc.RA`). The
@@ -1392,36 +2076,40 @@ open WgslReassoc WgslLets
 
 /-- `A` encloses every reassociation of `x`, which is `Safe`, and records
 `x`'s sum chain. -/
-def RH (v E : ℕ → ℝ) (A : Av) (x : GExpr) : Prop :=
-  (∀ x', RA x x' → x'.Safe v E ∧ A.H (x'.exact v) (x'.bound v E)) ∧
-  (A.sc = true ↔ IsSum x) ∧
-  (A.sc = true → (sumLeaves x).length = A.sn ∧ lmag v (sumLeaves x) ≤ A.sm ∧
+structure RH (v E : ℕ → ℝ) (A : Av) (x : GExpr) : Prop where
+  all : ∀ x', RA x x' → x'.Safe v E ∧ A.H (x'.exact v) (x'.bound v E)
+  sflag : A.sc = true ↔ IsSum x
+  sdata : A.sc = true → (sumLeaves x).length = A.sn ∧ lmag v (sumLeaves x) ≤ A.sm ∧
     ∃ bs : List ℝ, List.Forall₂ (fun p β => ∀ x', RA p.2 x' →
-      x'.Safe v E ∧ 0 ≤ x'.bound v E ∧ x'.bound v E ≤ β) (sumLeaves x) bs ∧ bs.sum ≤ A.sb)
+      x'.Safe v E ∧ 0 ≤ x'.bound v E ∧ x'.bound v E ≤ β) (sumLeaves x) bs ∧ bs.sum ≤ A.sb
+  pflag : A.pc = true ↔ IsProd x
+  pdata : A.pc = true → PH v E A.pd x
+  mflag : A.mc = true ↔ IsMul x
+  mdata : A.mc = true → MH v E A.md x
 
 /-- The leaf condition of a chain. -/
 abbrev LeafP (v E : ℕ → ℝ) (p : Bool × GExpr) (β : ℝ) : Prop :=
   ∀ x', RA p.2 x' → x'.Safe v E ∧ 0 ≤ x'.bound v E ∧ x'.bound v E ≤ β
 
 lemma RH.self {v E : ℕ → ℝ} {A : Av} {x : GExpr} (h : RH v E A x) :
-    x.Safe v E ∧ A.H (x.exact v) (x.bound v E) := h.1 x (RA.refl x)
+    x.Safe v E ∧ A.H (x.exact v) (x.bound v E) := h.all x (RA.refl x)
 
 /-- A value's chain data, whether or not it is a chain. -/
 lemma RH.sd {v E : ℕ → ℝ} {A : Av} {x : GExpr} (h : RH v E A x) :
     (sumLeaves x).length = sdn A ∧ lmag v (sumLeaves x) ≤ sdm A ∧
       ∃ bs : List ℝ, List.Forall₂ (LeafP v E) (sumLeaves x) bs ∧ bs.sum ≤ sdb A := by
   by_cases hs : A.sc = true
-  · obtain ⟨h1, h2, h3⟩ := h.2.2 hs
+  · obtain ⟨h1, h2, h3⟩ := h.sdata hs
     simp only [sdn, sdm, sdb, hs, ↓reduceIte]
     exact ⟨h1, h2, h3⟩
-  · have hns : ¬ IsSum x := fun hx => hs (h.2.1.mpr hx)
+  · have hns : ¬ IsSum x := fun hx => hs (h.sflag.mpr hx)
     simp only [sdn, sdm, sdb, hs, Bool.false_eq_true, ↓reduceIte, sumLeaves_of_not hns]
     obtain ⟨-, hH⟩ := h.self
     refine ⟨rfl, ?_, [A.b], List.Forall₂.cons ?_ List.Forall₂.nil, by simp⟩
     · simp only [lmag, List.map_cons, List.map_nil, List.sum_cons, List.sum_nil, add_zero]
       exact abs_le_mag hH
     · intro x' hx'
-      obtain ⟨s', h1, h2, h3, h4⟩ := h.1 x' hx'
+      obtain ⟨s', h1, h2, h3, h4⟩ := h.all x' hx'
       exact ⟨s', h3, h4⟩
 
 /-- The leaf bounds of a chain bound the leaf bounds of every reassociation. -/
@@ -1431,7 +2119,11 @@ lemma chain_RH {v E : ℕ → ℝ} {R : Av} {x : GExpr} (hx : IsSum x) {n : ℕ}
     (hlo : (R.lo : ℝ) ≤ x.exact v) (hhi : x.exact v ≤ R.hi) :
     RH v E (chainAv R n sm sb) x := by
   have hU := WgslPoly.U_pos; have hη := η_pos
-  refine ⟨fun x' hx' => ?_, by simp [chainAv, hx], fun _ => ⟨hn, hm, bs, hb, hs⟩⟩
+  have hnp : ¬ IsProd x := by cases x <;> simp_all [IsSum, IsProd]
+  have hnm : ¬ IsMul x := by cases x <;> simp_all [IsSum, IsMul]
+  refine ⟨fun x' hx' => ?_, by simp [chainAv, hx], fun _ => ⟨hn, hm, bs, hb, hs⟩,
+    by simp [chainAv, hnp], fun h => by simp [chainAv] at h, by simp [chainAv, hnm],
+    fun h => by simp [chainAv] at h⟩
   obtain ⟨hx'', σ, hsg, hl⟩ := hx'.sum_inv hx
   obtain ⟨hlen, hget⟩ := List.forall₂_iff_get.mp hb
   -- each leaf of `x'` is a reassociation of a leaf of `x`
@@ -1485,18 +2177,23 @@ def EnvR (env : ℕ → Option Av) (σ : ℕ → GExpr) (v E : ℕ → ℝ) : Pr
 
 lemma RH_leaf_input {v E : ℕ → ℝ} {A : Av} {i : ℕ} (h : A.H (v i) (E i)) :
     RH v E A.leaf (.input i) := by
-  refine ⟨fun x' hx' => ?_, by simp [IsSum], fun h => by simp at h⟩
+  refine ⟨fun x' hx' => ?_, by simp [IsSum], fun h => by simp at h, by simp [IsProd],
+    fun h => by simp at h, by simp [IsMul], fun h => by simp at h⟩
   cases hx' with
   | sum he => exact absurd he (by simp [IsSum])
+  | prod he => exact absurd he (by simp [IsProd])
   | input => exact ⟨trivial, h⟩
 
 lemma subst_input : ∀ e : GExpr, subst GExpr.input e = e := by
   intro e; induction e <;> simp_all [subst]
 
 /-- Programs whose root is not a sum chain: every reassociation keeps the root. -/
-lemma RH_of_root {v E : ℕ → ℝ} {R : Av} {x : GExpr} (hx : ¬ IsSum x) (hR : R.sc = false)
-    (h : ∀ x', RA x x' → x'.Safe v E ∧ R.H (x'.exact v) (x'.bound v E)) : RH v E R x :=
-  ⟨h, by simp [hR, hx], fun h' => by simp [hR] at h'⟩
+lemma RH_of_root {v E : ℕ → ℝ} {R : Av} {x : GExpr} (hx : ¬ IsSum x ∧ ¬ IsProd x)
+    (hR : R.sc = false ∧ R.pc = false ∧ R.mc = false)
+    (h : ∀ x', RA x x' → x'.Safe v E ∧ R.H (x'.exact v) (x'.bound v E)) : RH v E R x := by
+  have hm : ¬ IsMul x := by cases x <;> simp_all [IsProd, IsMul]
+  exact ⟨h, by simp [hR.1, hx.1], fun h' => by simp [hR.1] at h', by simp [hR.2.1, hx.2],
+    fun h' => by simp [hR.2.1] at h', by simp [hR.2.2, hm], fun h' => by simp [hR.2.2] at h'⟩
 
 lemma sq_H' {A : Av} {x y X Y : ℝ} (hA : A.H x X) (hB : A.H y Y) (hxy : x = y) :
     (sqAv A).H (x*y) (|x| * Y+|y| * X+X*Y+WgslPoly.U*((|x|+X)*(|y|+Y))+η) := by
@@ -1506,11 +2203,21 @@ lemma sq_H' {A : Av} {x y X Y : ℝ} (hA : A.H x X) (hB : A.H y Y) (hxy : x = y)
 
 end Robust
 
+lemma RH.pd {v E : ℕ → ℝ} {A : Av} {x : GExpr} (h : RH v E A x) : PH v E (pdOf A) x := by
+  unfold pdOf; split_ifs with hp
+  · exact h.pdata hp
+  · exact PH_leaf (fun hx => hp (h.pflag.mpr hx)) h.all
+
+lemma RH.md {v E : ℕ → ℝ} {A : Av} {x : GExpr} (h : RH v E A x) : MH v E (mdOf A) x := by
+  unfold mdOf; split_ifs with hm
+  · exact h.mdata hm
+  · exact MH_leaf (fun hx => hm (h.mflag.mpr hx)) h.all
+
 section Robust2
 open WgslReassoc WgslLets
 
 /-- Unpacks a non-chain node: every reassociation keeps the node. -/
-macro "root_tac" : tactic => `(tactic| (refine RH_of_root (by simp [IsSum, subst]) rfl ?_))
+macro "root_tac" : tactic => `(tactic| (refine RH_of_root (by simp [IsSum, IsProd, subst]) ⟨rfl, rfl, rfl⟩ ?_))
 
 /-- If the evaluator succeeds, every reassociation of the evaluated program
 (with slots substituted by `σ`) is `Safe` and enclosed by the result. -/
@@ -1533,6 +2240,7 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | const => exact ⟨trivial, le_rfl, le_rfl, by simp [bound], by simp [bound]⟩
   | add a b iha ihb =>
     intro env σ v E R henv h
@@ -1577,40 +2285,40 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     · simp only [subst, sumLeaves, lmag_flip]; exact ma
   | mul a b iha ihb =>
     intro env σ v E R henv h
-    simp only [ev, Option.bind_eq_some_iff, Option.some.injEq] at h
-    obtain ⟨A, ha, B, hb, rfl⟩ := h
+    simp only [ev, Option.bind_eq_some_iff, Option.map_eq_some_iff] at h
+    obtain ⟨A, ha, B, hb, cb, hcb, rfl⟩ := h
+    have hb' : ev d env b = some B := by
+      split_ifs at hb with hab
+      · subst hab; rw [ha]; exact hb
+      · exact hb
     have rA := iha env σ v E A henv ha
-    have rB := ihb env σ v E B henv hb
-    root_tac
-    intro x' hx'; simp only [subst] at hx'
-    cases hx' with
-    | sum he => exact absurd he (by simp [IsSum])
-    | mul ha' hb' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
-      obtain ⟨s2, h2⟩ := rB.1 _ hb'
-      refine ⟨⟨s1, s2⟩, ?_⟩
+    have rB := ihb env σ v E B henv hb'
+    have hx : IsProd (subst σ (.mul a b)) := by simp [subst, IsProd]
+    have hPH : PH v E ((pdOf A).mul (pdOf B)) (subst σ (.mul a b)) := PH_mul rA.pd rB.pd
+    have hR : (nrm (if a = b then sqAv A else mulAv A B)).H ((subst σ (.mul a b)).exact v)
+        ((subst σ (.mul a b)).bound v E) := by
       split_ifs with hab
       · subst hab
-        obtain rfl : B = A := by rw [ha] at hb; exact (Option.some.inj hb).symm
-        exact (sq_H' h1 h2 (by rw [exact_RA v ha', exact_RA v hb'])).nrm
-      · exact (mul_H h1 h2).nrm
+        obtain rfl : B = A := by rw [ha] at hb'; exact (Option.some.inj hb').symm
+        exact (sq_H' rA.self.2 rB.self.2 rfl).nrm
+      · exact (mul_H rA.self.2 rB.self.2).nrm
+    exact ⟨chainP_all hx hPH hcb hR.1 hR.2.1 true _, by simp [prodAv, IsSum, subst],
+      fun h => by simp [prodAv] at h, by simp [prodAv, hx], fun _ => hPH,
+      by simp [prodAv, IsMul, subst], fun _ => MH_mul rA.md rB.md⟩
   | div a b iha ihb =>
     intro env σ v E R henv h
     simp only [ev, Option.bind_eq_some_iff] at h
     obtain ⟨A, ha, B, hb, h⟩ := h
     split_ifs at h with ok
-    simp only [Option.some.injEq] at h; subst h
+    obtain ⟨cb, hcb, rfl⟩ := Option.map_eq_some_iff.mp h
     have rA := iha env σ v E A henv ha
     have rB := ihb env σ v E B henv hb
-    root_tac
-    intro x' hx'; simp only [subst] at hx'
-    cases hx' with
-    | sum he => exact absurd he (by simp [IsSum])
-    | div ha' hb' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
-      obtain ⟨s2, h2⟩ := rB.1 _ hb'
-      obtain ⟨hR, c1, c2, c3⟩ := div_H h1 h2 ok
-      exact ⟨⟨s1, s2, c1, c2, c3⟩, hR.nrm⟩
+    have hx : IsProd (subst σ (.div a b)) := by simp [subst, IsProd]
+    have hPH : PH v E ((pdOf A).div (mdOf B)) (subst σ (.div a b)) := PH_div rA.pd rB.md
+    have hR := (div_H rA.self.2 rB.self.2 ok).1.nrm
+    exact ⟨chainP_all hx hPH hcb hR.1 hR.2.1 false _, by simp [prodAv, IsSum, subst],
+      fun h => by simp [prodAv] at h, by simp [prodAv, hx], fun _ => hPH,
+      by simp [prodAv, IsMul, subst], fun h => by simp [prodAv] at h⟩
   | sqrt a iha =>
     intro env σ v E R henv h
     simp only [ev, Option.bind_eq_some_iff] at h
@@ -1622,8 +2330,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | sqrt ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       obtain ⟨hR, c1, c2⟩ := sqrt_H h1 ok
       exact ⟨⟨s1, c1, c2⟩, hR.nrm⟩
   | max a b iha ihb =>
@@ -1636,9 +2345,10 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | max ha' hb' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
-      obtain ⟨s2, h2⟩ := rB.1 _ hb'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
+      obtain ⟨s2, h2⟩ := rB.all _ hb'
       exact ⟨⟨s1, s2⟩, max_H h1 h2⟩
   | min a b iha ihb =>
     intro env σ v E R henv h
@@ -1650,9 +2360,10 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | min ha' hb' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
-      obtain ⟨s2, h2⟩ := rB.1 _ hb'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
+      obtain ⟨s2, h2⟩ := rB.all _ hb'
       exact ⟨⟨s1, s2⟩, min_H h1 h2⟩
   | lt c t a b ihc iha ihb =>
     intro env σ v E R henv h
@@ -1667,10 +2378,11 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
       intro x' hx'; simp only [subst] at hx'
       cases hx' with
       | sum he => exact absurd he (by simp [IsSum])
+      | prod he => exact absurd he (by simp [IsProd])
       | lt t hc' ha' hb' =>
         rename_i c' a' b'
-        obtain ⟨sc, c1, c2, c3, c4⟩ := rC.1 _ hc'
-        obtain ⟨sa, hA⟩ := rA.1 _ ha'
+        obtain ⟨sc, c1, c2, c3, c4⟩ := rC.all _ hc'
+        obtain ⟨sa, hA⟩ := rA.all _ ha'
         have hlt : exact v c' < (t:ℝ) := by linarith
         simp only [exact, bound, Safe, hlt, ↓reduceIte]
         exact ⟨⟨sc, sa, by rw [abs_of_neg (by linarith)]; linarith⟩, hA⟩
@@ -1681,10 +2393,11 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
       intro x' hx'; simp only [subst] at hx'
       cases hx' with
       | sum he => exact absurd he (by simp [IsSum])
+      | prod he => exact absurd he (by simp [IsProd])
       | lt t hc' ha' hb' =>
         rename_i c' a' b'
-        obtain ⟨sc, c1, c2, c3, c4⟩ := rC.1 _ hc'
-        obtain ⟨sb, hB⟩ := rB.1 _ hb'
+        obtain ⟨sc, c1, c2, c3, c4⟩ := rC.all _ hc'
+        obtain ⟨sb, hB⟩ := rB.all _ hb'
         have hlt : ¬ exact v c' < (t:ℝ) := by linarith
         simp only [exact, bound, Safe, hlt, ↓reduceIte]
         exact ⟨⟨sc, sb, by rw [abs_of_pos (by linarith)]; linarith⟩, hB⟩
@@ -1697,8 +2410,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | abs ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       exact ⟨s1, abs_H h1⟩
   | invsqrt a iha =>
     intro env σ v E R henv h
@@ -1711,8 +2425,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | invsqrt ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       obtain ⟨hR, c1⟩ := inv_H h1 ok
       exact ⟨⟨s1, c1⟩, hR.nrm⟩
   | exp a iha =>
@@ -1726,8 +2441,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | exp ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       exact ⟨s1, (exp_H h1).nrm⟩
   | exp2 a iha =>
     intro env σ v E R henv h
@@ -1740,8 +2456,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | exp2 ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       exact ⟨s1, (exp2_H h1).nrm⟩
   | log a iha =>
     intro env σ v E R henv h
@@ -1754,8 +2471,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | log ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       obtain ⟨hR, c1⟩ := log_H h1 ok
       exact ⟨⟨s1, c1⟩, hR.nrm⟩
   | log2 a iha =>
@@ -1769,8 +2487,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | log2 ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       obtain ⟨hR, c1⟩ := log2_H h1 ok
       exact ⟨⟨s1, c1⟩, hR.nrm⟩
   | inh f a ihf iha =>
@@ -1783,9 +2502,10 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | inh f ha' =>
       rename_i a'
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       obtain ⟨hR, sf⟩ := bisect_sound _ _ _ _ _ _ (fun A' R'' hA' h' => by
         have := ihf (fun _ => some A'.leaf) GExpr.input (fun _ => exact v a') (fun _ => bound v E a') R''
           (fun i A'' h'' => by
@@ -1805,9 +2525,10 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | tanh f ha' =>
       rename_i a'
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       obtain ⟨hR, sf⟩ := bisect_sound _ _ _ _ _ _ (fun A' R'' hA' h' => by
         have := ihf (fun _ => some A'.leaf) GExpr.input (fun _ => exact v a') (fun _ => bound v E a') R''
           (fun i A'' h'' => by
@@ -1835,11 +2556,12 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
       intro x' hx'; simp only [subst] at hx'
       cases hx' with
       | sum he => exact absurd he (by simp [IsSum])
+      | prod he => exact absurd he (by simp [IsProd])
       | lt2 ha' hb' hx' hy' =>
         rename_i a' b' x'' y''
-        obtain ⟨sa, a1, a2, a3, a4⟩ := rA.1 _ ha'
-        obtain ⟨sb, b1, b2, b3, b4⟩ := rB.1 _ hb'
-        obtain ⟨sx, hX⟩ := rX.1 _ hx'
+        obtain ⟨sa, a1, a2, a3, a4⟩ := rA.all _ ha'
+        obtain ⟨sb, b1, b2, b3, b4⟩ := rB.all _ hb'
+        obtain ⟨sx, hX⟩ := rX.all _ hx'
         have hlt : exact v a' < exact v b' := by linarith
         simp only [exact, bound, Safe, hlt, ↓reduceIte]
         exact ⟨⟨sa, sb, sx, by rw [abs_of_neg (by linarith)]; linarith⟩, hX⟩
@@ -1850,11 +2572,12 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
       intro x' hx'; simp only [subst] at hx'
       cases hx' with
       | sum he => exact absurd he (by simp [IsSum])
+      | prod he => exact absurd he (by simp [IsProd])
       | lt2 ha' hb' hx' hy' =>
         rename_i a' b' x'' y''
-        obtain ⟨sa, a1, a2, a3, a4⟩ := rA.1 _ ha'
-        obtain ⟨sb, b1, b2, b3, b4⟩ := rB.1 _ hb'
-        obtain ⟨sy, hY⟩ := rY.1 _ hy'
+        obtain ⟨sa, a1, a2, a3, a4⟩ := rA.all _ ha'
+        obtain ⟨sb, b1, b2, b3, b4⟩ := rB.all _ hb'
+        obtain ⟨sy, hY⟩ := rY.all _ hy'
         have hlt : ¬ exact v a' < exact v b' := by linarith
         simp only [exact, bound, Safe, hlt, ↓reduceIte]
         exact ⟨⟨sa, sb, sy, by rw [abs_of_pos (by linarith)]; linarith⟩, hY⟩
@@ -1869,8 +2592,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | sinS ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       obtain ⟨hR, c1⟩ := trig_H h1 ok _ (sinLo_le h1) (le_sinHi h1)
       exact ⟨⟨s1, c1⟩, hR.nrm⟩
   | cosS a iha =>
@@ -1884,8 +2608,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | cosS ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       obtain ⟨hR, c1⟩ := trig_H (hi := 1) h1 ok _ (cosLo_le h1)
         (by simpa using Real.cos_le_one _)
       exact ⟨⟨s1, c1⟩, hR.nrm⟩
@@ -1898,8 +2623,9 @@ theorem ev_robust (d : ℕ) (e : GExpr) : ∀ (env : ℕ → Option Av) (σ : �
     intro x' hx'; simp only [subst] at hx'
     cases hx' with
     | sum he => exact absurd he (by simp [IsSum])
+    | prod he => exact absurd he (by simp [IsProd])
     | scale k ha' =>
-      obtain ⟨s1, h1⟩ := rA.1 _ ha'
+      obtain ⟨s1, h1⟩ := rA.all _ ha'
       exact ⟨s1, (scale_H k h1).nrm⟩
   | round a _ => intro env σ v E R henv h; simp [ev] at h
   | qsel j k s c _ _ _ => intro env σ v E R henv h; simp [ev] at h
