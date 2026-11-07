@@ -20,6 +20,7 @@
 
 - Lean proofs for binary32 horizon/ISCO error bounds, unit and timing consistency, the energy-drift counterexample, equatorial radial stability, the full polarized matrix-exponential cell, a reassociation-independent WGSL summation bound, the WGSL `kerr_radius` error bound, the stable Faraday-cell series, and fourth-order local consistency of RK4 for the full nonlinear Kerr geodesic/screen field. Exhaustive all-input binary32 tests for the horizon, ISCO and `cbrtf`. GPU tests (lavapipe-compatible) showing the adaptive controller misses the trajectory targets and misclassifies near-critical captured rays.
 - WGSL floating-point bounds for `transfer_cell`'s matrix exponential (`polarized_transfer.wesl`). For every cell the shader accepts, the 12-term loop's exponential is within 16u + 10⁻²⁰ of exp(−h·k) and its source within 16u·h‖j‖ plus a flush-to-zero term. Running bounds cover the squarings and the returned Stokes vector.
+- The Lean kernel now checks that naga's own expression trees, recorded before any normalization, are reassociations of the models for every translation-validated kernel (`NagaFixture`, with a checker proved sound). The domain theorems that hold for every reassociation therefore apply to the trees naga builds; the comparison's normalizing store is no longer trusted for that statement.
 
 ### Fixed
 

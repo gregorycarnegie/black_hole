@@ -4,10 +4,17 @@
 //! `kernels-branching.sexp`, which `BlackHole.KernelFixture` proves equal to
 //! the Lean definitions).
 //!
-//! Expressions are hash-consed into one store whose constructors normalize:
-//! sums are flattened and sorted, and the operands of products, `max` and `min`
-//! sorted. The `WgslPoly` bounds are unchanged by these and the `WgslExpr`
-//! bounds by the commutations. Sum reassociation, which WGSL permits and naga
+//! Each expression is kept in naga's own association (`Store`) and in a
+//! normal form (`NStore`) whose constructors normalize: sums are flattened and
+//! sorted, and the operands of products, `max` and `min` sorted. The
+//! comparison below uses the normal forms. `naga_raw_fixture_is_current`
+//! records the raw trees in `verification/fixtures/naga-raw.sexp`, and
+//! `BlackHole.NagaFixture` checks in the Lean kernel that each is a
+//! `WgslReassoc.RA`-reassociation of its model, so that statement does not
+//! rely on the normalization here, only on this evaluator's reading of the IR.
+//!
+//! The `WgslPoly` bounds are unchanged by the normalizations and the
+//! `WgslExpr` bounds by the commutations. Sum reassociation, which WGSL permits and naga
 //! leaves to the backend for `dot` and matrix products, changes the `WgslExpr`
 //! running bounds; `WgslReassoc` and the checked domains of obligation F2
 //! cover every sum reassociation and every product reassociation that keeps
@@ -53,12 +60,12 @@ enum Node {
 
 /// Hash-consed expressions with normalizing constructors.
 #[derive(Default)]
-struct Store {
+struct NStore {
     nodes: Vec<Node>,
     index: HashMap<Node, Id>,
 }
 
-impl Store {
+impl NStore {
     fn intern(&mut self, n: Node) -> Id {
         if let Some(&id) = self.index.get(&n) {
             return id;
@@ -81,13 +88,6 @@ impl Store {
             }
         }
         self.intern(Node::C(m, e))
-    }
-    fn zero(&mut self) -> Id {
-        self.dyadic(0, 0)
-    }
-    fn f32(&mut self, x: f32) -> Id {
-        let (m, e) = f32_parts(x);
-        self.dyadic(m, e)
     }
     fn add(&mut self, a: Id, b: Id) -> Id {
         let mut cs = Vec::new();
@@ -134,6 +134,99 @@ impl Store {
         };
         self.intern(Node::Sel([l, r, x, y]))
     }
+    fn show(&self, t: Id, depth: usize) -> String {
+        show(&self.nodes, t, depth)
+    }
+}
+
+/// naga's own expression trees: hash-consed but not reassociated, each with
+/// its normal form in `n`. The comparison uses the normal forms; a branch
+/// collapses only when both sides are the same tree. `dump` prints the raw
+/// trees, which `verification/fixtures/naga-raw.sexp` records.
+#[derive(Default)]
+struct Store {
+    nodes: Vec<Node>,
+    index: HashMap<Node, Id>,
+    norm: Vec<Id>,
+    n: NStore,
+}
+
+impl Store {
+    fn intern(&mut self, node: Node, norm: Id) -> Id {
+        if let Some(&id) = self.index.get(&node) {
+            return id;
+        }
+        let id = self.nodes.len() as Id;
+        self.nodes.push(node.clone());
+        self.index.insert(node, id);
+        self.norm.push(norm);
+        id
+    }
+    fn nf(&self, t: Id) -> Id {
+        self.norm[t as usize]
+    }
+    /// Equal normal forms: the same value up to the comparison's rewrites.
+    fn same(&self, a: Id, b: Id) -> bool {
+        self.nf(a) == self.nf(b)
+    }
+    fn input(&mut self, i: u32) -> Id {
+        let n = self.n.input(i);
+        self.intern(Node::In(i), n)
+    }
+    fn dyadic(&mut self, m: i128, e: i32) -> Id {
+        let n = self.n.dyadic(m, e);
+        let node = self.n.nodes[n as usize].clone();
+        self.intern(node, n)
+    }
+    fn zero(&mut self) -> Id {
+        self.dyadic(0, 0)
+    }
+    fn f32(&mut self, x: f32) -> Id {
+        let (m, e) = f32_parts(x);
+        self.dyadic(m, e)
+    }
+    fn add(&mut self, a: Id, b: Id) -> Id {
+        let n = self.n.add(self.nf(a), self.nf(b));
+        self.intern(Node::Add(vec![a, b]), n)
+    }
+    fn sum(&mut self, terms: Vec<Id>) -> Id {
+        terms
+            .into_iter()
+            .reduce(|a, b| self.add(a, b))
+            .expect("nonempty sum")
+    }
+    fn mul(&mut self, a: Id, b: Id) -> Id {
+        let n = self.n.mul(self.nf(a), self.nf(b));
+        self.intern(Node::Mul(vec![a, b]), n)
+    }
+    fn sub(&mut self, a: Id, b: Id) -> Id {
+        let n = self.n.sub(self.nf(a), self.nf(b));
+        self.intern(Node::Sub(a, b), n)
+    }
+    fn div(&mut self, a: Id, b: Id) -> Id {
+        let n = self.n.div(self.nf(a), self.nf(b));
+        self.intern(Node::Div(a, b), n)
+    }
+    fn neg(&mut self, a: Id) -> Id {
+        let n = self.n.neg(self.nf(a));
+        self.intern(Node::Neg(a), n)
+    }
+    fn f(&mut self, name: &str, args: Vec<Id>) -> Id {
+        let n = self.n.f(name, args.iter().map(|&a| self.nf(a)).collect());
+        self.intern(Node::F(name.into(), args), n)
+    }
+    fn sel(&mut self, l: Id, r: Id, x: Id, y: Id) -> Id {
+        if x == y {
+            return x;
+        }
+        // `-a < c` as `-c < a`: negation is exact, so the two select alike.
+        let (l, r) = match (&self.nodes[l as usize], &self.nodes[r as usize]) {
+            (&Node::Neg(a), &Node::C(m, e)) => (self.dyadic(-m, e), a),
+            _ => (l, r),
+        };
+        let n = self.n.sel(self.nf(l), self.nf(r), self.nf(x), self.nf(y));
+        self.intern(Node::Sel([l, r, x, y]), n)
+    }
     /// `if k mod 4 == n { x } else { y }`, read back as `GExpr.qsel` when a
     /// chain of these is exactly the shader's quadrant selection.
     fn quad(&mut self, k: Id, n: i64, x: Id, y: Id) -> Id {
@@ -162,9 +255,8 @@ impl Store {
                 return self.f("qsel1", vec![k, d, x]);
             }
         }
-        self.intern(Node::F("quad".into(), vec![k, nn, x, y]))
+        self.f("quad", vec![k, nn, x, y])
     }
-
     /// `k` when `t` is `min(max(k, -2^31), 2^31 - 128)` for `k` a `round`.
     fn saturated_round(&self, t: Id) -> Option<Id> {
         let Node::F(f, a) = &self.nodes[t as usize] else {
@@ -200,31 +292,35 @@ impl Store {
         }
     }
     fn show(&self, t: Id, depth: usize) -> String {
-        let n = &self.nodes[t as usize];
-        let kids: Vec<Id> = match n {
-            Node::In(i) => return format!("in{i}"),
-            Node::C(m, e) => return format!("{m}*2^{e}"),
-            Node::Add(cs) | Node::Mul(cs) | Node::F(_, cs) => cs.clone(),
-            Node::Sel(cs) => cs.to_vec(),
-            Node::Sub(a, b) | Node::Div(a, b) => vec![*a, *b],
-            Node::Neg(a) => vec![*a],
-        };
-        let head = match n {
-            Node::Add(_) => "add".into(),
-            Node::Mul(_) => "mul".into(),
-            Node::Sub(..) => "sub".into(),
-            Node::Div(..) => "div".into(),
-            Node::Neg(_) => "neg".into(),
-            Node::Sel(_) => "sel".into(),
-            Node::F(name, _) => name.clone(),
-            _ => unreachable!(),
-        };
-        if depth == 0 {
-            return format!("({head} …)");
-        }
-        let inner: Vec<String> = kids.iter().map(|&k| self.show(k, depth - 1)).collect();
-        format!("({head} {})", inner.join(" "))
+        show(&self.nodes, t, depth)
     }
+}
+
+fn show(nodes: &[Node], t: Id, depth: usize) -> String {
+    let n = &nodes[t as usize];
+    let kids: Vec<Id> = match n {
+        Node::In(i) => return format!("in{i}"),
+        Node::C(m, e) => return format!("{m}*2^{e}"),
+        Node::Add(cs) | Node::Mul(cs) | Node::F(_, cs) => cs.clone(),
+        Node::Sel(cs) => cs.to_vec(),
+        Node::Sub(a, b) | Node::Div(a, b) => vec![*a, *b],
+        Node::Neg(a) => vec![*a],
+    };
+    let head = match n {
+        Node::Add(_) => "add".into(),
+        Node::Mul(_) => "mul".into(),
+        Node::Sub(..) => "sub".into(),
+        Node::Div(..) => "div".into(),
+        Node::Neg(_) => "neg".into(),
+        Node::Sel(_) => "sel".into(),
+        Node::F(name, _) => name.clone(),
+        _ => unreachable!(),
+    };
+    if depth == 0 {
+        return format!("({head} …)");
+    }
+    let inner: Vec<String> = kids.iter().map(|&k| show(nodes, k, depth - 1)).collect();
+    format!("({head} {})", inner.join(" "))
 }
 
 fn f32_parts(x: f32) -> (i128, i32) {
@@ -360,7 +456,7 @@ fn lean(s: &mut Store, fixture: &Fixture, name: &str, rename: &dyn Fn(u32) -> u3
         .collect()
 }
 
-fn compare(s: &Store, computed: &[Id], lean: &[Id], name: &str) {
+fn compare(s: &NStore, computed: &[Id], lean: &[Id], name: &str) {
     assert_eq!(computed.len(), lean.len(), "{name}: output count");
     for (i, (&a, &b)) in computed.iter().zip(lean).enumerate() {
         if a != b {
@@ -375,7 +471,7 @@ fn compare(s: &Store, computed: &[Id], lean: &[Id], name: &str) {
 }
 
 /// The innermost pair of differing nodes along matching structure.
-fn first_difference(s: &Store, a: Id, b: Id) -> (Id, Id) {
+fn first_difference(s: &NStore, a: Id, b: Id) -> (Id, Id) {
     let kids = |t: Id| -> Option<(std::mem::Discriminant<Node>, String, Vec<Id>)> {
         let n = &s.nodes[t as usize];
         let (name, cs) = match n {
@@ -962,6 +1058,10 @@ fn global(s: &mut Store, module: &Module, h: Handle<Expression>) -> Value {
 /// A call the Lean model treats as a primitive or an input.
 type Primitive = fn(&mut Store, Vec<Value>) -> Value;
 
+/// A value the model reads as an input: the expected expressions, the
+/// replacement, and the raw computed value once found.
+type LetValue = (Vec<Id>, Value, std::cell::RefCell<Option<Vec<Id>>>);
+
 /// What a kernel is evaluated on, and the parts of it the Lean model
 /// abstracts.
 #[derive(Default)]
@@ -971,8 +1071,9 @@ struct Env {
     /// Calls whose results the Lean model reads as inputs or primitives.
     opaque_calls: HashMap<&'static str, Primitive>,
     /// Values the Lean model reads as inputs: a computed value equal to the
-    /// expected expressions is replaced, and each must be found.
-    lets: Vec<(Vec<Id>, Value, std::cell::Cell<bool>)>,
+    /// expected expressions (up to normal form) is replaced, and each must be
+    /// found; the raw computed value is recorded.
+    lets: Vec<LetValue>,
     /// Values the model assumes positive; the other branch is outside it.
     positive: Vec<Id>,
 }
@@ -1056,10 +1157,10 @@ impl<'a> Frame<'a> {
         if self.top && matches!(v, Value::Vector(_) | Value::Scalar(_)) {
             let mut computed = Vec::new();
             v.clone().flatten(&mut computed);
-            if let Some((_, replacement, found)) =
-                self.env.lets.iter().find(|(e, _, _)| *e == computed)
-            {
-                found.set(true);
+            if let Some((_, replacement, found)) = self.env.lets.iter().find(|(e, _, _)| {
+                e.len() == computed.len() && e.iter().zip(&computed).all(|(a, b)| s.same(*a, *b))
+            }) {
+                *found.borrow_mut() = Some(computed);
                 v = replacement.clone();
             }
         }
@@ -1583,6 +1684,115 @@ fn polarized_cell_setup(s: &mut Store, _: &Ctx) -> Env {
 
 type Setup = fn(&mut Store, &Ctx) -> Env;
 
+/// The children a dump prints with slots; the program inside `inh` and
+/// `tanh` reads its own argument as input 0 and is printed inline.
+fn slotted_kids(s: &Store, t: Id) -> Vec<Id> {
+    match &s.nodes[t as usize] {
+        Node::In(_) | Node::C(..) => vec![],
+        Node::Add(cs) | Node::Mul(cs) => cs.clone(),
+        Node::F(f, cs) if f == "inh" || f == "tanh" => cs[1..].to_vec(),
+        Node::F(_, cs) => cs.clone(),
+        Node::Sel(cs) => cs.to_vec(),
+        Node::Sub(a, b) | Node::Div(a, b) => vec![*a, *b],
+        Node::Neg(a) => vec![*a],
+    }
+}
+
+/// `GExpr` text for `t`; nodes in `slots` other than `root` print as their slot.
+fn gexpr(s: &Store, t: Id, slots: &HashMap<Id, usize>, root: Option<Id>) -> String {
+    if Some(t) != root
+        && let Some(k) = slots.get(&t)
+    {
+        return format!("(in {})", LET_BASE as usize + k);
+    }
+    let g = |c: Id| gexpr(s, c, slots, None);
+    match &s.nodes[t as usize] {
+        Node::In(i) => format!("(in {i})"),
+        &Node::C(m, e) if e >= 0 => format!("(c {} 1)", m << e),
+        &Node::C(m, e) => {
+            assert!(e > -128, "constant 2^{e} out of range");
+            format!("(c {m} {})", 1u128 << -e)
+        }
+        Node::Add(cs) => format!("(add {} {})", g(cs[0]), g(cs[1])),
+        Node::Mul(cs) => format!("(mul {} {})", g(cs[0]), g(cs[1])),
+        Node::Sub(a, b) => format!("(sub {} {})", g(*a), g(*b)),
+        Node::Div(a, b) => format!("(div {} {})", g(*a), g(*b)),
+        Node::Neg(a) => format!("(neg {})", g(*a)),
+        Node::F(f, cs) if f == "inh" || f == "tanh" => {
+            format!(
+                "({f} {} {})",
+                gexpr(s, cs[0], &HashMap::new(), None),
+                g(cs[1])
+            )
+        }
+        Node::F(f, cs) if f == "qsel0" || f == "qsel1" => {
+            format!("(qsel {} {} {} {})", &f[4..], g(cs[0]), g(cs[1]), g(cs[2]))
+        }
+        Node::F(f, _) if f == "quad" => panic!("unresolved quadrant selection"),
+        Node::F(f, cs) => {
+            let args: Vec<String> = cs.iter().map(|&c| g(c)).collect();
+            format!("({f} {})", args.join(" "))
+        }
+        Node::Sel([l, r, x, y]) => match s.nodes[*r as usize] {
+            Node::C(..) => {
+                let t = gexpr(s, *r, slots, None);
+                let nd = t.trim_start_matches("(c ").trim_end_matches(')');
+                format!("(lt {} {nd} {} {})", g(*l), g(*x), g(*y))
+            }
+            _ => format!("(lt2 {} {} {} {})", g(*l), g(*r), g(*x), g(*y)),
+        },
+    }
+}
+
+/// naga's raw trees for `outs` as a `WgslLets` slot program: every inner
+/// node becomes a `name:let` slot, so the Lean checker can remember each
+/// matched pair of shared values.
+fn dump(s: &Store, name: &str, outs: &[Id]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = outs.to_vec();
+    while let Some(t) = stack.pop() {
+        if seen.insert(t) {
+            stack.extend(slotted_kids(s, t));
+        }
+    }
+    let mut shared: Vec<Id> = seen
+        .into_iter()
+        .filter(|&t| !slotted_kids(s, t).is_empty())
+        .collect();
+    // Children are interned before their parents.
+    shared.sort_unstable();
+    let slots: HashMap<Id, usize> = shared.iter().enumerate().map(|(k, &t)| (t, k)).collect();
+    let lets = shared
+        .iter()
+        .map(|&t| format!("{name}:let {}", gexpr(s, t, &slots, Some(t))));
+    let rows = outs
+        .iter()
+        .map(|&t| format!("{name} {}", gexpr(s, t, &slots, None)));
+    lets.chain(rows).collect()
+}
+
+/// Every compared kernel, as in `naga_ir_matches_lean_model`.
+const CASES: [(&str, Setup); 18] = [
+    ("geodesic_rhs", geodesic_rhs_setup),
+    ("atan_poly", scalar_setup),
+    ("tonemap", tonemap_setup),
+    ("heatmap_color", scalar_setup),
+    ("polarization_color", polarization_setup),
+    ("spatial_unit", spatial_unit_setup),
+    ("add_kerr", add_kerr_setup),
+    ("screen_frame", screen_frame_setup),
+    ("sample_plasma.0", thin_setup),
+    ("sample_plasma.1", truncated_setup),
+    ("sample_plasma.2", slim_setup),
+    ("sample_plasma.3", warped_setup),
+    ("atan2_arith", atan2_setup),
+    ("kerr_radius", kerr_radius_setup),
+    ("sincos", sincos_setup),
+    ("transfer_phi", transfer_phi_setup),
+    ("faraday_rotation", faraday_rotation_setup),
+    ("polarized_cell", polarized_cell_setup),
+];
+
 /// Where the compared IR comes from: naga's WGSL front end, or the SPIR-V
 /// that naga's backend writes from it, read back by naga's SPIR-V front end.
 /// The second checks the SPIR-V backend for these kernels, trusting only the
@@ -1655,11 +1865,56 @@ fn naga_ir_matches_lean_model(
     let mut out = Vec::new();
     run(&mut s, &module, func, env.args.clone(), &env, true).flatten(&mut out);
     assert!(
-        env.lets.iter().all(|(_, _, found)| found.get()),
+        env.lets
+            .iter()
+            .all(|(_, _, found)| found.borrow().is_some()),
         "{model}: a value the model reads as an input was not computed"
     );
     let expected = lean(&mut s, &fixture, model, &|i| i);
-    compare(&s, &out, &expected, model);
+    let nf = |v: &[Id]| v.iter().map(|&t| s.nf(t)).collect::<Vec<_>>();
+    compare(&s.n, &nf(&out), &nf(&expected), model);
+}
+
+/// `verification/fixtures/naga-raw.sexp`: naga's own trees (WGSL front end)
+/// for every compared kernel, before any normalization, as `GExpr` slot
+/// programs; `NagaFixture` checks in Lean that each is a reassociation of
+/// its model. A value the model reads as an input is recorded under
+/// `name.letK`. Regenerate with `UPDATE_NAGA_RAW=1`.
+#[test]
+fn naga_raw_fixture_is_current() {
+    let module = Stage::Wgsl.module();
+    let fixture = fixture();
+    let mut text = String::new();
+    for (model, setup) in CASES {
+        let func = function(&module, model.split('.').next().unwrap());
+        let cx = Ctx {
+            module: &module,
+            func,
+            fixture: &fixture,
+        };
+        let mut s = Store::default();
+        let env = setup(&mut s, &cx);
+        let mut out = Vec::new();
+        run(&mut s, &module, func, env.args.clone(), &env, true).flatten(&mut out);
+        let mut rows = dump(&s, model, &out);
+        for (k, (_, _, found)) in env.lets.iter().enumerate() {
+            let raw = found.borrow().clone().expect("let value computed");
+            rows.extend(dump(&s, &format!("{model}.let{k}"), &raw));
+        }
+        rows.iter().for_each(|r| text += &(r.clone() + "\n"));
+    }
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/verification/fixtures/naga-raw.sexp"
+    );
+    if std::env::var_os("UPDATE_NAGA_RAW").is_some() {
+        std::fs::write(path, &text).unwrap();
+    }
+    let committed = std::fs::read_to_string(path).unwrap_or_default();
+    assert!(
+        committed.replace("\r\n", "\n") == text,
+        "fixtures/naga-raw.sexp is stale; regenerate with UPDATE_NAGA_RAW=1"
+    );
 }
 
 #[test]
@@ -1719,7 +1974,7 @@ proptest::proptest! {
     /// grouping get one node.
     #[test]
     fn sums_are_order_independent(perm in Just((0u32..6).collect::<Vec<_>>()).prop_shuffle()) {
-        let mut s = Store::default();
+        let mut s = NStore::default();
         let terms: Vec<Id> = (0..6).map(|i| s.input(i)).collect();
         let a = s.sum(terms.clone());
         let b = perm.iter().map(|&i| terms[i as usize]).reduce(|x, y| s.add(y, x)).unwrap();

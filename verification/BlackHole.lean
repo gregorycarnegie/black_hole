@@ -85,6 +85,10 @@ public import BlackHole.WgslPlasma
 public import BlackHole.WgslCounterexamples
 public import BlackHole.WgslAtan2
 public import BlackHole.KernelFixture
+public import BlackHole.WgslRAChk
+public import BlackHole.NagaFixture
+public import BlackHole.NagaFixtureKerr
+public import BlackHole.NagaFixturePlasma
 public import BlackHole.WgslSafe
 public import BlackHole.WgslSafeDomains
 public import BlackHole.WgslSafeSpin

@@ -21,7 +21,9 @@ commutation of sums and products that the error bounds already allow.
 
 Grammar: `(in i)`, `(c num den)`, `(add a b)`, `(sub a b)`, `(mul a b)`,
 `(neg a)`, `(divc a num den)`. Regenerate both fixture files with
-`lake env lean --run KernelFixtureGen.lean`. -/
+`lake env lean --run KernelFixtureGen.lean`; `fixtures/naga-raw.sexp` (naga's
+own trees, read by `nagaFixture`) with `UPDATE_NAGA_RAW=1 cargo test --release
+--test translation`. -/
 
 @[expose] public section
 
@@ -263,6 +265,24 @@ macro "branching_fixture" : term => do
 set_option maxHeartbeats 20000000 in
 set_option maxRecDepth 100000 in
 def branchingFixture : List (String × WgslExpr.GExpr) := branching_fixture
+
+private meta def nagaText : String := include_str ".."/"fixtures"/"naga-raw.sexp"
+
+/-- `fixtures/naga-raw.sexp`: naga's own trees for every compared kernel,
+written by `tests/translation.rs`; `NagaFixture` checks them. -/
+macro "naga_fixture" : term => do
+  let rows := (nagaText.trimAscii.toString.splitOn "
+").map fun r => r.trimAscii.toString
+  let entries ← rows.toArray.mapM fun row => do
+    let name :: toks := tokens row | Lean.Macro.throwError "empty row"
+    let (e, rest) ← gparse toks
+    unless rest.isEmpty do Lean.Macro.throwError s!"trailing tokens in {name}"
+    `(Prod.mk $(Lean.quote name) $e)
+  `([$entries,*])
+
+set_option maxHeartbeats 20000000 in
+set_option maxRecDepth 100000 in
+def nagaFixture : List (String × WgslExpr.GExpr) := naga_fixture
 
 set_option maxHeartbeats 20000000 in
 set_option maxRecDepth 100000 in
