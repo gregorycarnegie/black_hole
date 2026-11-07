@@ -88,6 +88,7 @@ public import BlackHole.KernelFixture
 public import BlackHole.WgslRAChk
 public import BlackHole.NagaFixture
 public import BlackHole.NagaFixtureKerr
+public import BlackHole.NagaFixtureKerrSpirv
 public import BlackHole.NagaFixturePlasma
 public import BlackHole.WgslSafe
 public import BlackHole.WgslSafeDomains

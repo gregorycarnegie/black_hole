@@ -14,10 +14,12 @@ trees with the documented exact rewrites for branches (`a <= b` as
 `s`, the quadrant selection as `qsel`), inlines calls other than `sincos`,
 and unrolls loops; that evaluator and the fixture writer remain trusted.
 
-`check m n` runs `WgslRAChk.chkProg` on model `m` (after `std`) and naga's
+`check F m n` runs `WgslRAChk.chkProg` on model `m` (after `std`) and naga's
 program `n`; `check_sound` turns an accepted check into `RA` between every
-expanded output. The kernel checks every compared kernel: `naga_small` here,
-`add_kerr` in `NagaFixtureKerr` and `sample_plasma` in `NagaFixturePlasma`.
+expanded output. The kernel checks every compared kernel, for the trees of
+naga's WGSL front end and for those read back from the SPIR-V naga writes
+(`naga-raw-spirv.sexp`): `naga_small` here, `add_kerr` in `NagaFixtureKerr`
+and `NagaFixtureKerrSpirv`, and `sample_plasma` in `NagaFixturePlasma`.
 So each domain theorem stated for every reassociation of a model holds for
 the tree naga builds, read with `std`'s rewrites (`exact_withLets_std`: they
 do not change the exact value). -/
@@ -48,18 +50,21 @@ def models : List (String × GExpr) := (fixture.map fun p => (p.1, toG p.2)) ++ 
 def modelSlots (m : String) : List GExpr := (rowsOf models (m ++ ":let")).map std
 def modelOuts (m : String) (σ : ℕ → GExpr) : List GExpr :=
   (rowsOf models m).map fun e => std (subst σ e)
-def nagaSlots (n : String) : List GExpr := rowsOf nagaFixture (n ++ ":let")
-def nagaOuts (n : String) : List GExpr := rowsOf nagaFixture n
+def nagaSlots (F : List (String × GExpr)) (n : String) : List GExpr := rowsOf F (n ++ ":let")
+def nagaOuts (F : List (String × GExpr)) (n : String) : List GExpr := rowsOf F n
 
-/-- Model `m`, with inputs renamed by `σ`, against naga's program `n`. -/
-def check (m n : String) (σ : ℕ → GExpr := .input) : Bool :=
-  chkProg (modelSlots m) (nagaSlots n) (modelOuts m σ) (nagaOuts n)
+/-- Model `m`, with inputs renamed by `σ`, against naga's program `n` in the
+fixture `F` (`nagaFixture` for the WGSL front end, `nagaSpirvFixture` for
+the SPIR-V round trip). -/
+def check (F : List (String × GExpr)) (m n : String) (σ : ℕ → GExpr := .input) : Bool :=
+  chkProg (modelSlots m) (nagaSlots F n) (modelOuts m σ) (nagaOuts F n)
 
-theorem check_sound {m n : String} {σ : ℕ → GExpr} (h : check m n σ = true) :
-    (modelOuts m σ).length = (nagaOuts n).length ∧ ∀ i (h1 : i < (modelOuts m σ).length)
-      (h2 : i < (nagaOuts n).length),
+theorem check_sound {F : List (String × GExpr)} {m n : String} {σ : ℕ → GExpr}
+    (h : check F m n σ = true) :
+    (modelOuts m σ).length = (nagaOuts F n).length ∧ ∀ i (h1 : i < (modelOuts m σ).length)
+      (h2 : i < (nagaOuts F n).length),
       WgslReassoc.RA (withLets (modelSlots m) (modelOuts m σ)[i])
-        (withLets (nagaSlots n) (nagaOuts n)[i]) :=
+        (withLets (nagaSlots F n) (nagaOuts F n)[i]) :=
   chkProg_sound h
 
 /-! #### `std` keeps the exact value of a slot program -/
@@ -128,6 +133,11 @@ def small : List String :=
 
 set_option maxHeartbeats 1000000 in
 set_option maxRecDepth 100000 in
-theorem naga_small : small.all (fun n => check n n) = true := by decide +kernel
+theorem naga_small : small.all (fun n => check nagaFixture n n) = true := by decide +kernel
+
+set_option maxHeartbeats 1000000 in
+set_option maxRecDepth 100000 in
+theorem naga_small_spirv : small.all (fun n => check nagaSpirvFixture n n) = true := by
+  decide +kernel
 
 end BlackHole.NagaFixture

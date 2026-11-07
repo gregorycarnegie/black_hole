@@ -8,7 +8,8 @@
 //! normal form (`NStore`) whose constructors normalize: sums are flattened and
 //! sorted, and the operands of products, `max` and `min` sorted. The
 //! comparison below uses the normal forms. `naga_raw_fixture_is_current`
-//! records the raw trees in `verification/fixtures/naga-raw.sexp`, and
+//! records the raw trees in `verification/fixtures/naga-raw.sexp` (and
+//! `naga-raw-spirv.sexp` for the SPIR-V round trip), and
 //! `BlackHole.NagaFixture` checks in the Lean kernel that each is a
 //! `WgslReassoc.RA`-reassociation of its model, so that statement does not
 //! rely on the normalization here, only on this evaluator's reading of the IR.
@@ -1875,14 +1876,15 @@ fn naga_ir_matches_lean_model(
     compare(&s.n, &nf(&out), &nf(&expected), model);
 }
 
-/// `verification/fixtures/naga-raw.sexp`: naga's own trees (WGSL front end)
-/// for every compared kernel, before any normalization, as `GExpr` slot
+/// `verification/fixtures/naga-raw.sexp` and `naga-raw-spirv.sexp`: naga's
+/// own trees for every compared kernel, from the WGSL front end and read back
+/// from the SPIR-V naga writes, before any normalization, as `GExpr` slot
 /// programs; `NagaFixture` checks in Lean that each is a reassociation of
 /// its model. A value the model reads as an input is recorded under
 /// `name.letK`. Regenerate with `UPDATE_NAGA_RAW=1`.
-#[test]
-fn naga_raw_fixture_is_current() {
-    let module = Stage::Wgsl.module();
+#[rstest::rstest]
+fn naga_raw_fixture_is_current(#[values(Stage::Wgsl, Stage::Spirv)] stage: Stage) {
+    let module = stage.module();
     let fixture = fixture();
     let mut text = String::new();
     for (model, setup) in CASES {
@@ -1903,17 +1905,21 @@ fn naga_raw_fixture_is_current() {
         }
         rows.iter().for_each(|r| text += &(r.clone() + "\n"));
     }
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/verification/fixtures/naga-raw.sexp"
+    let file = match stage {
+        Stage::Wgsl => "naga-raw.sexp",
+        Stage::Spirv => "naga-raw-spirv.sexp",
+    };
+    let path = format!(
+        "{}/verification/fixtures/{file}",
+        env!("CARGO_MANIFEST_DIR")
     );
     if std::env::var_os("UPDATE_NAGA_RAW").is_some() {
-        std::fs::write(path, &text).unwrap();
+        std::fs::write(&path, &text).unwrap();
     }
-    let committed = std::fs::read_to_string(path).unwrap_or_default();
+    let committed = std::fs::read_to_string(&path).unwrap_or_default();
     assert!(
         committed.replace("\r\n", "\n") == text,
-        "fixtures/naga-raw.sexp is stale; regenerate with UPDATE_NAGA_RAW=1"
+        "fixtures/{file} is stale; regenerate with UPDATE_NAGA_RAW=1"
     );
 }
 

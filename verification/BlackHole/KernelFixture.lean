@@ -21,9 +21,10 @@ commutation of sums and products that the error bounds already allow.
 
 Grammar: `(in i)`, `(c num den)`, `(add a b)`, `(sub a b)`, `(mul a b)`,
 `(neg a)`, `(divc a num den)`. Regenerate both fixture files with
-`lake env lean --run KernelFixtureGen.lean`; `fixtures/naga-raw.sexp` (naga's
-own trees, read by `nagaFixture`) with `UPDATE_NAGA_RAW=1 cargo test --release
---test translation`. -/
+`lake env lean --run KernelFixtureGen.lean`; `fixtures/naga-raw.sexp` and
+`naga-raw-spirv.sexp` (naga's own trees, read by `nagaFixture` and
+`nagaSpirvFixture`) with `UPDATE_NAGA_RAW=1 cargo test --release --test
+translation`. -/
 
 @[expose] public section
 
@@ -267,12 +268,10 @@ set_option maxRecDepth 100000 in
 def branchingFixture : List (String × WgslExpr.GExpr) := branching_fixture
 
 private meta def nagaText : String := include_str ".."/"fixtures"/"naga-raw.sexp"
+private meta def nagaSpirvText : String := include_str ".."/"fixtures"/"naga-raw-spirv.sexp"
 
-/-- `fixtures/naga-raw.sexp`: naga's own trees for every compared kernel,
-written by `tests/translation.rs`; `NagaFixture` checks them. -/
-macro "naga_fixture" : term => do
-  let rows := (nagaText.trimAscii.toString.splitOn "
-").map fun r => r.trimAscii.toString
+private meta def gfixture (text : String) : Lean.MacroM Lean.Term := do
+  let rows := (text.trimAscii.toString.splitOn "\n").map fun r => r.trimAscii.toString
   let entries ← rows.toArray.mapM fun row => do
     let name :: toks := tokens row | Lean.Macro.throwError "empty row"
     let (e, rest) ← gparse toks
@@ -280,9 +279,19 @@ macro "naga_fixture" : term => do
     `(Prod.mk $(Lean.quote name) $e)
   `([$entries,*])
 
+/-- `fixtures/naga-raw.sexp` and `naga-raw-spirv.sexp`: naga's own trees for
+every compared kernel, from the WGSL front end and read back from naga's
+SPIR-V, written by `tests/translation.rs`; `NagaFixture` checks them. -/
+macro "naga_fixture" : term => gfixture nagaText
+macro "naga_spirv_fixture" : term => gfixture nagaSpirvText
+
 set_option maxHeartbeats 20000000 in
 set_option maxRecDepth 100000 in
 def nagaFixture : List (String × WgslExpr.GExpr) := naga_fixture
+
+set_option maxHeartbeats 20000000 in
+set_option maxRecDepth 100000 in
+def nagaSpirvFixture : List (String × WgslExpr.GExpr) := naga_spirv_fixture
 
 set_option maxHeartbeats 20000000 in
 set_option maxRecDepth 100000 in
