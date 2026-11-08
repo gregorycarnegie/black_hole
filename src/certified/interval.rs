@@ -231,6 +231,7 @@ mod tests {
     use super::*;
     use num_rational::BigRational;
     use proptest::prelude::*;
+    use rstest::rstest;
 
     fn rat(x: f64) -> BigRational {
         BigRational::from_float(x).unwrap()
@@ -297,17 +298,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn invalid_domains_never_become_certificates() {
-        assert!(!(Interval::ONE / Interval::new(-1.0, 1.0)).valid());
-        assert!(!Interval::new(-1.0, 4.0).sqrt().valid());
-        assert!(!(Interval::point(f64::MAX) * Interval::point(2.0)).valid());
-        assert!(!(Interval::ZERO * Interval::point(f64::NAN)).valid());
-        assert!(!Interval::new(2.0, 1.0).valid());
-        assert_eq!(Interval::ZERO.sqrt(), Interval::ZERO);
-        assert_eq!(
-            Interval::ONE * Interval::point(f64::MAX),
-            Interval::point(f64::MAX)
-        );
+    #[rstest]
+    #[case::division_through_zero(Interval::ONE / Interval::new(-1.0, 1.0))]
+    #[case::negative_sqrt(Interval::new(-1.0, 4.0).sqrt())]
+    #[case::overflow(Interval::point(f64::MAX) * Interval::point(2.0))]
+    #[case::nan_product(Interval::ZERO * Interval::point(f64::NAN))]
+    #[case::reversed_endpoints(Interval::new(2.0, 1.0))]
+    fn invalid_domains_never_become_certificates(#[case] result: Interval) {
+        assert!(!result.valid(), "{result:?}");
+    }
+
+    #[rstest]
+    #[case::sqrt_of_zero(Interval::ZERO.sqrt(), Interval::ZERO)]
+    #[case::one_times_max(Interval::ONE * Interval::point(f64::MAX), Interval::point(f64::MAX))]
+    fn exact_identities_preserve_boundary_values(
+        #[case] actual: Interval,
+        #[case] expected: Interval,
+    ) {
+        assert_eq!(actual, expected);
     }
 }

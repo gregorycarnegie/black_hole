@@ -258,6 +258,7 @@ fn sync_camera_transform(
 mod tests {
     use super::*;
     use bevy::time::TimeUpdateStrategy;
+    use googletest::{assert_that, matchers::near};
     use proptest::prelude::*;
     use rstest::rstest;
     use std::time::Duration;
@@ -296,7 +297,7 @@ mod tests {
             fov_degrees,
             ..OrbitalCamera::default()
         };
-        assert!((cam.tan_half_fov() - expected).abs() < 1e-5 * expected);
+        assert_that!(cam.tan_half_fov(), near(expected, 1e-5 * expected));
     }
 
     proptest! {
@@ -515,10 +516,11 @@ mod tests {
         let start = OrbitalCamera::default();
         let cam = app.world().resource::<OrbitalCamera>();
         let dt = 0.1;
-        assert!((cam.azimuth - (start.azimuth + 0.5 * GAMEPAD_ORBIT_SPEED * dt)).abs() < 1e-6);
-        assert!((cam.elevation - (start.elevation + 0.25 * GAMEPAD_ORBIT_SPEED * dt)).abs() < 1e-6);
+        let orbit = GAMEPAD_ORBIT_SPEED * dt;
+        assert_that!(cam.azimuth, near(start.azimuth + 0.5 * orbit, 1e-6));
+        assert_that!(cam.elevation, near(start.elevation + 0.25 * orbit, 1e-6));
         let zoom = 0.5 * start.zoom_speed * GAMEPAD_ZOOM_SPEED_MULTIPLIER * dt;
-        assert!((cam.radius - (start.radius - zoom)).abs() < 1e-6);
+        assert_that!(cam.radius, near(start.radius - zoom, 1e-6));
         assert!(cam.is_moving);
 
         // Input inside the deadzone leaves the camera alone.

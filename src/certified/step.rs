@@ -288,37 +288,47 @@ impl Kerr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use googletest::prelude::*;
+    use rstest::{fixture, rstest};
 
-    #[test]
-    fn step_encloses_the_exact_radial_schwarzschild_ray() {
+    #[fixture]
+    fn start() -> State {
+        State::exact([4.0, 0.0, 0.0, 1.0, -3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]).unwrap()
+    }
+
+    #[rstest]
+    fn step_encloses_the_exact_radial_schwarzschild_ray(start: State) {
         let kerr = Kerr::new([0.0; 3]).unwrap();
-        let start = State::exact([4.0, 0.0, 0.0, 1.0, -3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]).unwrap();
         let step = kerr.try_step(start, TICKS_PER_UNIT / 1024).unwrap();
         let t = step.end.affine();
         let r = 4.0 - t;
         let p = -(r + 2.0) / (r - 2.0);
-        assert!((step.end.phase[0] - r).abs() <= step.end.error[0]);
-        assert!((step.end.phase[4] - p).abs() <= step.end.error[4]);
-        assert!(step.end.error[0] > 0.0 && step.end.error[0] < 1e-6);
+        assert_that!(step.end.phase[0], near(r, step.end.error[0]));
+        assert_that!(step.end.phase[4], near(p, step.end.error[4]));
+        assert_that!(step.end.error[0], all!(gt(0.0), lt(1e-6)));
         assert_eq!(step.end.error[3], 0.0);
         assert_eq!(step.end.phase[3], 1.0);
     }
 
-    #[test]
-    fn rejects_invalid_inputs_and_exhausted_accuracy() {
+    #[rstest]
+    #[case::zero_ticks(0, 0.0)]
+    #[case::non_dyadic_ticks(3, 0.0)]
+    #[case::oversized_step(2 * MAX_STEP_TICKS, 0.0)]
+    #[case::nan_error(1, f64::NAN)]
+    #[case::negative_error(1, -1.0)]
+    fn rejects_invalid_inputs(mut start: State, #[case] ticks: u64, #[case] error: f64) {
         let kerr = Kerr::new([0.0; 3]).unwrap();
-        let mut start =
-            State::exact([4.0, 0.0, 0.0, 1.0, -3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]).unwrap();
-        assert!(matches!(
-            kerr.try_step(start, 3),
-            Err(Unresolved::InvalidInput)
-        ));
+        start.error[0] = error;
+        assert_that!(
+            kerr.try_step(start, ticks),
+            err(eq(&Unresolved::InvalidInput))
+        );
+    }
+
+    #[rstest]
+    fn rejects_exhausted_accuracy(mut start: State) {
+        let kerr = Kerr::new([0.0; 3]).unwrap();
         start.error[0] = 1.0;
-        assert!(kerr.try_step(start, TICKS_PER_UNIT / 1024).is_err());
-        start.error[0] = f64::NAN;
-        assert!(matches!(
-            kerr.try_step(start, 1),
-            Err(Unresolved::InvalidInput)
-        ));
+        assert_that!(kerr.try_step(start, TICKS_PER_UNIT / 1024), err(anything()));
     }
 }

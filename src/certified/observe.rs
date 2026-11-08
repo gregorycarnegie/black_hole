@@ -90,34 +90,47 @@ impl Kerr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use googletest::prelude::*;
+    use rstest::{fixture, rstest};
 
-    #[test]
-    fn includes_output_rounding_and_the_exact_static_redshift() {
-        let kerr = Kerr::new([0.0; 3]).unwrap();
-        let initial = kerr
-            .initialize([100.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
-            .unwrap();
-        let observation = kerr.observe(initial, [0.0; 3]).unwrap();
-        assert_eq!(observation.direction, [1.0, 0.0, 0.0]);
-        let expected = (0.98f64).sqrt() / initial.phase[3];
-        assert!(
-            (f64::from(observation.redshift) / expected - 1.0).abs()
-                <= observation.redshift_relative_error
-        );
-        assert!(observation.screen_norm_error < 1e-10 && observation.transversality_error < 1e-10);
+    #[fixture]
+    fn kerr() -> Kerr {
+        Kerr::new([0.0; 3]).unwrap()
     }
 
-    #[test]
-    fn rejects_spacelike_fluid_and_excessive_screen_error() {
-        let kerr = Kerr::new([0.0; 3]).unwrap();
-        let mut initial = kerr
-            .initialize([100.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
-            .unwrap();
-        assert!(kerr.observe(initial, [4.0, 0.0, 0.0]).is_err());
+    #[fixture]
+    fn initial(kerr: Kerr) -> State {
+        kerr.initialize([100.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+            .unwrap()
+    }
+
+    #[rstest]
+    fn includes_output_rounding_and_the_exact_static_redshift(kerr: Kerr, initial: State) {
+        let observation = kerr.observe(initial, [0.0; 3]).unwrap();
+        assert_that!(observation.direction, eq([1.0, 0.0, 0.0]));
+        let expected = 0.98f64.sqrt() / initial.phase[3];
+        assert_that!(
+            f64::from(observation.redshift) / expected,
+            near(1.0, observation.redshift_relative_error)
+        );
+        assert_that!(observation.screen_norm_error, lt(1e-10));
+        assert_that!(observation.transversality_error, lt(1e-10));
+    }
+
+    #[rstest]
+    fn rejects_spacelike_fluid(kerr: Kerr, initial: State) {
+        assert_that!(
+            kerr.observe(initial, [4.0, 0.0, 0.0]),
+            err(eq(Unresolved::Arithmetic))
+        );
+    }
+
+    #[rstest]
+    fn rejects_excessive_screen_error(kerr: Kerr, mut initial: State) {
         initial.error[9] = 1e-4;
-        assert!(matches!(
+        assert_that!(
             kerr.observe(initial, [0.0; 3]),
-            Err(Unresolved::AccuracyBudget)
-        ));
+            err(eq(Unresolved::AccuracyBudget))
+        );
     }
 }

@@ -79,58 +79,71 @@ impl Kerr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use googletest::prelude::*;
+    use rstest::rstest;
 
-    #[test]
-    fn initializes_null_unit_energy_and_transverse_screen_for_arbitrary_spin() {
-        for spin in [[0.0; 3], [0.2, -0.7, 0.3]] {
-            let kerr = Kerr::new(spin).unwrap();
-            let initial = kerr
-                .initialize([7.0, 3.0, -4.0], [-1.0, -0.2, 0.4], [0.0, 1.0, 0.0])
-                .unwrap();
-            let s = initial.enclosure();
-            let m = kerr.geometry([s[0], s[1], s[2]]);
-            let p: [I; 4] = std::array::from_fn(|i| s[i + 3]);
-            let f: [I; 4] = std::array::from_fn(|i| s[i + 7]);
-            let k: [I; 4] =
-                std::array::from_fn(|i| (0..4).fold(I::ZERO, |s, j| s + m.inv[i][j] * p[j]));
-            let dot = |a: [I; 4], b: [I; 4]| {
-                (0..4).fold(I::ZERO, |s, i| {
-                    s + (0..4).fold(I::ZERO, |s, j| s + m.g[i][j] * a[i] * b[j])
-                })
-            };
-            let alpha = I::ONE / (-m.inv[0][0]).sqrt();
-            let n = std::array::from_fn(|i| {
-                if i == 0 {
-                    I::ONE / alpha
-                } else {
-                    -alpha * m.inv[0][i]
-                }
-            });
-            for (value, expected) in [
-                (dot(k, k), 0.0),
-                (dot(f, f), 1.0),
-                (dot(k, f), 0.0),
-                (dot(k, n), 1.0),
-            ] {
-                assert!(
-                    value.valid() && value.lo <= expected && expected <= value.hi,
-                    "{value:?} expected {expected}"
-                );
-                assert!(value.hi - value.lo < 1e-10);
+    #[rstest]
+    #[case::schwarzschild([0.0; 3])]
+    #[case::rotated_kerr([0.2, -0.7, 0.3])]
+    fn initializes_null_unit_energy_and_transverse_screen_for_arbitrary_spin(
+        #[case] spin: [f64; 3],
+    ) {
+        let kerr = Kerr::new(spin).unwrap();
+        let initial = kerr
+            .initialize([7.0, 3.0, -4.0], [-1.0, -0.2, 0.4], [0.0, 1.0, 0.0])
+            .unwrap();
+        let s = initial.enclosure();
+        let m = kerr.geometry([s[0], s[1], s[2]]);
+        let p: [I; 4] = std::array::from_fn(|i| s[i + 3]);
+        let f: [I; 4] = std::array::from_fn(|i| s[i + 7]);
+        let k: [I; 4] =
+            std::array::from_fn(|i| (0..4).fold(I::ZERO, |s, j| s + m.inv[i][j] * p[j]));
+        let dot = |a: [I; 4], b: [I; 4]| {
+            (0..4).fold(I::ZERO, |s, i| {
+                s + (0..4).fold(I::ZERO, |s, j| s + m.g[i][j] * a[i] * b[j])
+            })
+        };
+        let alpha = I::ONE / (-m.inv[0][0]).sqrt();
+        let n = std::array::from_fn(|i| {
+            if i == 0 {
+                I::ONE / alpha
+            } else {
+                -alpha * m.inv[0][i]
             }
+        });
+        for (value, expected) in [
+            (dot(k, k), 0.0),
+            (dot(f, f), 1.0),
+            (dot(k, f), 0.0),
+            (dot(k, n), 1.0),
+        ] {
+            assert!(value.valid());
+            assert_that!(
+                value,
+                pat!(I {
+                    lo: le(expected),
+                    hi: ge(expected)
+                })
+            );
+            assert_that!(value.hi - value.lo, lt(1e-10));
         }
     }
 
-    #[test]
-    fn rejects_degenerate_camera_data() {
+    #[rstest]
+    #[case::zero_direction([4.0, 0.0, 0.0], [0.0; 3], [0.0, 1.0, 0.0], Unresolved::InvalidInput)]
+    #[case::parallel_screen([4.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0], Unresolved::InvalidInput)]
+    #[case::near_horizon([2.001, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], Unresolved::OutsideDomain)]
+    #[case::nonfinite_position([f64::NAN, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], Unresolved::InvalidInput)]
+    fn rejects_degenerate_camera_data(
+        #[case] position: [f64; 3],
+        #[case] direction: [f64; 3],
+        #[case] hint: [f64; 3],
+        #[case] expected: Unresolved,
+    ) {
         let kerr = Kerr::new([0.0; 3]).unwrap();
-        for (position, direction, hint) in [
-            ([4.0, 0.0, 0.0], [0.0; 3], [0.0, 1.0, 0.0]),
-            ([4.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
-            ([2.001, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
-            ([f64::NAN, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
-        ] {
-            assert!(kerr.initialize(position, direction, hint).is_err());
-        }
+        assert_that!(
+            kerr.initialize(position, direction, hint),
+            err(eq(expected))
+        );
     }
 }

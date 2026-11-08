@@ -196,13 +196,20 @@ impl<const N: usize> Div for Jet<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use googletest::prelude::*;
+    use rstest::rstest;
 
-    fn contains(i: Interval, x: f64) -> bool {
-        i.valid() && i.lo <= x && x <= i.hi
-    }
-
-    #[test]
-    fn jets_enclose_known_analytic_coefficients() {
+    #[rstest]
+    #[case::constant(0, 1.0, 1.0)]
+    #[case::linear(1, 0.5, -1.0)]
+    #[case::quadratic(2, -0.125, 1.0)]
+    #[case::cubic(3, 0.0625, -1.0)]
+    #[case::quartic(4, -5.0 / 128.0, 1.0)]
+    fn jets_enclose_known_analytic_coefficients(
+        #[case] i: usize,
+        #[case] root_coefficient: f64,
+        #[case] inverse_coefficient: f64,
+    ) {
         let x = Jet([
             Interval::ONE,
             Interval::ONE,
@@ -212,17 +219,21 @@ mod tests {
         ]);
         let root = x.sqrt();
         let inverse = Jet::constant(1.0) / x;
-        for (i, expected) in [1.0, 0.5, -0.125, 0.0625, -5.0 / 128.0]
-            .into_iter()
-            .enumerate()
-        {
-            assert!(
-                contains(root.0[i], expected),
-                "sqrt coefficient {i}: {:?}",
-                root.0[i]
-            );
-            assert!(contains(inverse.0[i], if i % 2 == 0 { 1.0 } else { -1.0 }));
-        }
+        assert!(root.0[i].valid() && inverse.0[i].valid());
+        assert_that!(
+            root.0[i],
+            pat!(Interval {
+                lo: le(root_coefficient),
+                hi: ge(root_coefficient)
+            })
+        );
+        assert_that!(
+            inverse.0[i],
+            pat!(Interval {
+                lo: le(inverse_coefficient),
+                hi: ge(inverse_coefficient)
+            })
+        );
     }
 
     #[test]
@@ -230,8 +241,15 @@ mod tests {
         let x = Dual::<2>::variable(Interval::point(4.0), 0);
         let y = Dual::<2>::variable(Interval::point(2.0), 1);
         let z = (x / y).sqrt();
-        assert!(contains(z.value, 2.0f64.sqrt()));
-        assert!(contains(z.derivative[0], 1.0 / (4.0 * 2.0f64.sqrt())));
-        assert!(contains(z.derivative[1], -1.0 / (2.0 * 2.0f64.sqrt())));
+        let encloses = |x: f64| {
+            pat!(Interval {
+                lo: le(x),
+                hi: ge(x)
+            })
+        };
+        assert!(z.value.valid() && z.derivative.iter().all(|d| d.valid()));
+        assert_that!(z.value, encloses(2.0f64.sqrt()));
+        assert_that!(z.derivative[0], encloses(1.0 / (4.0 * 2.0f64.sqrt())));
+        assert_that!(z.derivative[1], encloses(-1.0 / (2.0 * 2.0f64.sqrt())));
     }
 }

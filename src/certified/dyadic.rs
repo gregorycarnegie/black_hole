@@ -139,23 +139,29 @@ pub(super) fn scaled_integer(value: f64, denominator: u64, numerator: u64) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use googletest::{expect_that, gtest, matchers::eq};
     use num_rational::BigRational as R;
+    use proptest::prelude::*;
+    use rstest::rstest;
 
-    #[test]
-    fn rejects_an_endpoint_on_the_wrong_side_of_the_exact_result() {
-        let tiny = f64::from_bits(1);
-        assert!(!sum_upper(1.0, tiny, 1.0));
-        assert!(!sum_lower(1.0, tiny, 1.0f64.next_up()));
-        assert!(!product_upper(
-            1.0f64.next_up(),
-            1.0f64.next_up(),
-            1.0f64.next_up()
-        ));
-        assert!(scaled_integer(0.125, 1 << 30, 1 << 27));
-        assert!(!scaled_integer(0.125f64.next_up(), 1 << 30, 1 << 27));
+    #[rstest]
+    #[case::sum_one_ulp_above(sum_upper(1.0, f64::from_bits(1), 1.0), false)]
+    #[case::sum_one_ulp_below(sum_lower(1.0, f64::from_bits(1), 1.0f64.next_up()), false)]
+    #[case::product_one_ulp_above(
+        product_upper(1.0f64.next_up(), 1.0f64.next_up(), 1.0f64.next_up()),
+        false
+    )]
+    #[case::exact_scaled_integer(scaled_integer(0.125, 1 << 30, 1 << 27), true)]
+    #[case::scaled_integer_one_ulp_off(scaled_integer(0.125f64.next_up(), 1 << 30, 1 << 27), false)]
+    fn rejects_an_endpoint_on_the_wrong_side_of_the_exact_result(
+        #[case] decision: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(decision, expected);
     }
 
-    #[test]
+    // expect_that! reports every mismatching (a, b, bound) triple, not just the first.
+    #[gtest]
     fn exact_comparisons_cover_extreme_exponents_and_cancellation() {
         let values = [
             0.0,
@@ -176,12 +182,65 @@ mod tests {
                     let ra = R::from_float(a).unwrap();
                     let rb = R::from_float(b).unwrap();
                     let rbound = R::from_float(bound).unwrap();
-                    assert_eq!(sum_lower(a, b, bound), &ra + &rb >= rbound);
-                    assert_eq!(sum_upper(a, b, bound), &ra + &rb <= rbound);
-                    assert_eq!(product_lower(a, b, bound), &ra * &rb >= rbound);
-                    assert_eq!(product_upper(a, b, bound), &ra * &rb <= rbound);
+                    let sum = &ra + &rb;
+                    let product = &ra * &rb;
+                    expect_that!(
+                        sum_lower(a, b, bound),
+                        eq(sum >= rbound),
+                        "{a:e} + {b:e} >= {bound:e}"
+                    );
+                    expect_that!(
+                        sum_upper(a, b, bound),
+                        eq(sum <= rbound),
+                        "{a:e} + {b:e} <= {bound:e}"
+                    );
+                    expect_that!(
+                        product_lower(a, b, bound),
+                        eq(product >= rbound),
+                        "{a:e} * {b:e} >= {bound:e}"
+                    );
+                    expect_that!(
+                        product_upper(a, b, bound),
+                        eq(product <= rbound),
+                        "{a:e} * {b:e} <= {bound:e}"
+                    );
                 }
             }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn comparisons_match_exact_rationals(a in any::<f64>(), b in any::<f64>(), bound in any::<f64>()) {
+            prop_assume!(a.is_finite() && b.is_finite() && bound.is_finite());
+            let ra = R::from_float(a).unwrap();
+            let rb = R::from_float(b).unwrap();
+            let rbound = R::from_float(bound).unwrap();
+            prop_assert_eq!(sum_lower(a, b, bound), &ra + &rb >= rbound);
+            prop_assert_eq!(sum_upper(a, b, bound), &ra + &rb <= rbound);
+            prop_assert_eq!(product_lower(a, b, bound), &ra * &rb >= rbound);
+            prop_assert_eq!(product_upper(a, b, bound), &ra * &rb <= rbound);
+            if a != 0.0 {
+                let reciprocal = ra.recip();
+                prop_assert_eq!(reciprocal_lower(a, bound), reciprocal >= rbound);
+                prop_assert_eq!(reciprocal_upper(a, bound), reciprocal <= rbound);
+            }
+        }
+
+        #[test]
+        fn scaled_integer_matches_exact_rationals(
+            value in any::<f64>(), denominator in any::<u64>(), numerator in any::<u64>(),
+        ) {
+            let expected = R::from_float(value)
+                .is_some_and(|v| v * R::from_integer(denominator.into()) == R::from_integer(numerator.into()));
+            prop_assert_eq!(scaled_integer(value, denominator, numerator), expected);
+        }
+
+        #[test]
+        fn scaled_integer_accepts_exact_binary_fractions(numerator in any::<u32>(), exponent in 0..=32u32) {
+            let denominator = 1u64 << exponent;
+            let value = f64::from(numerator) / denominator as f64;
+            prop_assert!(scaled_integer(value, denominator, u64::from(numerator)));
         }
     }
 }

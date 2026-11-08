@@ -128,9 +128,19 @@ impl Kerr {
 mod tests {
     use super::*;
     use crate::certified::scalar::Dual;
+    use googletest::prelude::*;
+    use rstest::rstest;
 
-    #[test]
-    fn source_and_jacobian_match_the_exact_radial_reduction() {
+    #[rstest]
+    #[case::radial_velocity_position(0, 0, -0.5)]
+    #[case::radial_velocity_momentum(0, 4, 0.5)]
+    #[case::radial_force_position(4, 0, 0.5)]
+    #[case::radial_force_momentum(4, 4, 0.5)]
+    fn source_and_jacobian_match_the_exact_radial_reduction(
+        #[case] i: usize,
+        #[case] j: usize,
+        #[case] value: f64,
+    ) {
         let kerr = Kerr::new([0.0; 3]).unwrap();
         let state = [4.0, 0.0, 0.0, 1.0, -3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         assert_eq!(
@@ -140,12 +150,14 @@ mod tests {
         let jac = kerr.rhs(std::array::from_fn(|i| {
             Dual::<11>::variable(Interval::point(state[i]), i)
         }));
-        for (i, j, value) in [(0, 0, -0.5), (0, 4, 0.5), (4, 0, 0.5), (4, 4, 0.5)] {
-            let d = jac[i].derivative[j];
-            assert!(
-                d.valid() && d.lo <= value && value <= d.hi,
-                "J[{i},{j}]={d:?}"
-            );
-        }
+        let d = jac[i].derivative[j];
+        assert!(d.valid());
+        assert_that!(
+            d,
+            pat!(Interval {
+                lo: le(value),
+                hi: ge(value)
+            })
+        );
     }
 }

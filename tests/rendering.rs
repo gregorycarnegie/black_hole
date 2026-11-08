@@ -1,4 +1,5 @@
 use black_hole::physics::*;
+use googletest::{assert_that, matchers::near};
 use rstest::rstest;
 
 mod common;
@@ -21,12 +22,12 @@ mod image;
 #[path = "common/controller.rs"]
 mod controller;
 
-#[path = "common/sincos.rs"]
-mod sincos;
 #[path = "common/atan2.rs"]
 mod atan2;
 #[path = "common/geodesic_gpu.rs"]
 mod geodesic_gpu;
+#[path = "common/sincos.rs"]
+mod sincos;
 
 #[path = "common/energy.rs"]
 mod energy;
@@ -67,6 +68,9 @@ fn gravitational_units_preserve_kerr_radii(#[values(-0.999, -0.5, 0.0, 0.5, 0.99
     let horizon = kerr_horizon_radius_rg(spin);
     let isco = kerr_isco_radius_rg(spin);
     assert!(horizon > 0.0 && isco > horizon);
-    assert!((kerr_horizon_radius(spin) / (SAGA_RS * 0.5) - horizon).abs() < 1e-6);
-    assert!((kerr_isco_radius(spin) / (SAGA_RS * 0.5) - isco).abs() < 1e-6);
+    assert_that!(
+        kerr_horizon_radius(spin) / (SAGA_RS * 0.5),
+        near(horizon, 1e-6)
+    );
+    assert_that!(kerr_isco_radius(spin) / (SAGA_RS * 0.5), near(isco, 1e-6));
 }

@@ -118,6 +118,8 @@ impl Kerr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use googletest::prelude::*;
+    use rstest::rstest;
 
     #[test]
     fn multiple_steps_enclose_the_radial_solution() {
@@ -125,11 +127,13 @@ mod tests {
         let initial =
             State::exact([4.0, 0.0, 0.0, 1.0, -3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]).unwrap();
         let trace = kerr.trace(initial, TICKS_PER_UNIT / 4);
-        assert_eq!(trace.outcome, Outcome::AffineLimit, "{trace:?}");
-        assert!(trace.accepted > 1 && trace.rejected > 0);
+        assert_that!(trace.outcome, eq(Outcome::AffineLimit), "{trace:?}");
+        assert_that!(trace.accepted, gt(1));
+        assert_that!(trace.rejected, gt(0));
         let r = 4.0 - trace.state.affine();
-        assert!((trace.state.phase[0] - r).abs() <= trace.state.error[0]);
-        assert!((trace.state.phase[4] + (r + 2.0) / (r - 2.0)).abs() <= trace.state.error[4]);
+        assert_that!(trace.state.phase[0], near(r, trace.state.error[0]));
+        let p = -(r + 2.0) / (r - 2.0);
+        assert_that!(trace.state.phase[4], near(p, trace.state.error[4]));
     }
 
     #[test]
@@ -139,20 +143,29 @@ mod tests {
         let initial =
             State::exact([1599.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]).unwrap();
         let trace = kerr.trace(initial, 4 * TICKS_PER_UNIT);
-        assert_eq!(trace.outcome, Outcome::Escaped, "{trace:?}");
+        assert_that!(trace.outcome, eq(Outcome::Escaped), "{trace:?}");
         let r = 1599.0 + trace.state.affine();
-        assert!((trace.state.phase[0] - r).abs() <= trace.state.error[0]);
-        assert!(trace.state.phase[0] - trace.state.error[0] > 1600.0);
+        assert_that!(trace.state.phase[0], near(r, trace.state.error[0]));
+        assert_that!(trace.state.phase[0] - trace.state.error[0], gt(1600.0));
     }
 
-    #[test]
-    fn traces_an_admitted_camera_outwards() {
-        let kerr = Kerr::new([0.0; 3]).unwrap();
+    #[rstest]
+    #[case::schwarzschild([0.0; 3], [100.0, 0.0, 0.0], [1.0, 0.0, 0.0])]
+    #[case::arbitrary_spin([0.2, -0.7, 0.3], [100.0, 10.0, -20.0], [1.0, 0.4, 0.2])]
+    fn admitted_cameras_escape_with_checked_observables(
+        #[case] spin: [f64; 3],
+        #[case] position: [f64; 3],
+        #[case] direction: [f64; 3],
+    ) {
+        let kerr = Kerr::new(spin).unwrap();
         let initial = kerr
-            .initialize([100.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+            .initialize(position, direction, [0.0, 1.0, 0.0])
             .unwrap();
         let trace = kerr.trace(initial, 2000 * TICKS_PER_UNIT);
-        assert_eq!(trace.outcome, Outcome::Escaped, "{trace:?}");
+        assert_that!(trace.outcome, eq(Outcome::Escaped), "{trace:?}");
+        let observation = trace.observation.unwrap();
+        assert_that!(observation.direction_error_radians, le(1e-6));
+        assert_that!(observation.redshift_relative_error, le(1e-6));
     }
 
     #[test]
@@ -162,30 +175,21 @@ mod tests {
             .initialize([3.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0])
             .unwrap();
         let trace = kerr.trace(initial, 4 * TICKS_PER_UNIT);
-        assert!(
-            matches!(trace.outcome, Outcome::Captured | Outcome::Unresolved(_)),
+        assert_that!(
+            trace.outcome,
+            any![
+                eq(Outcome::Captured),
+                matches_pattern!(Outcome::Unresolved(_))
+            ],
             "{trace:?}"
         );
-        assert!(trace.accepted > 0);
+        assert_that!(trace.accepted, gt(0));
         let r = 3.0 - initial.phase[3] * trace.state.affine();
         let p = -initial.phase[3] * (r + 2.0) / (r - 2.0);
-        assert!((trace.state.phase[0] - r).abs() <= trace.state.error[0]);
-        assert!((trace.state.phase[4] - p).abs() <= trace.state.error[4]);
+        assert_that!(trace.state.phase[0], near(r, trace.state.error[0]));
+        assert_that!(trace.state.phase[4], near(p, trace.state.error[4]));
         if trace.outcome == Outcome::Captured {
-            assert!(r < 2.002);
+            assert_that!(r, lt(2.002));
         }
-    }
-
-    #[test]
-    fn escapes_with_arbitrary_spin_and_checked_observables() {
-        let kerr = Kerr::new([0.2, -0.7, 0.3]).unwrap();
-        let initial = kerr
-            .initialize([100.0, 10.0, -20.0], [1.0, 0.4, 0.2], [0.0, 1.0, 0.0])
-            .unwrap();
-        let trace = kerr.trace(initial, 2000 * TICKS_PER_UNIT);
-        assert_eq!(trace.outcome, Outcome::Escaped, "{trace:?}");
-        let observation = trace.observation.unwrap();
-        assert!(observation.direction_error_radians <= 1e-6);
-        assert!(observation.redshift_relative_error <= 1e-6);
     }
 }

@@ -672,6 +672,7 @@ fn animate_binary_black_holes(
 mod tests {
     use super::*;
     use bevy::time::TimeUpdateStrategy;
+    use googletest::{assert_that, matchers::near};
     use proptest::prelude::*;
     use rstest::rstest;
     use std::time::Duration;
@@ -777,8 +778,8 @@ mod tests {
     fn massless_tracer_falls_toward_the_hole() {
         // One half-unit step at r=10 from a unit mass: a = 1/100.
         let objects = step_gravity(vec![body(Vec3::ZERO, 1.0), body(Vec3::X * 10.0, 0.0)], 0.5);
-        assert!((objects[1].velocity.x + 0.005).abs() < 1e-7);
-        assert!((objects[1].position.x - 9.9975).abs() < 1e-6);
+        assert_that!(objects[1].velocity.x, near(-0.005, 1e-7));
+        assert_that!(objects[1].position.x, near(9.9975, 1e-6));
         assert_eq!(objects[0].velocity, Vec3::ZERO);
     }
 

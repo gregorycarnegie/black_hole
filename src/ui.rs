@@ -868,6 +868,7 @@ fn step_button_colors(mut query: StepButtonColorQuery<'_, '_>) {
 mod tests {
     use super::*;
     use crate::simulation::{BinarySpin, DiskModel};
+    use googletest::{assert_that, matchers::near};
     use proptest::prelude::*;
     use rstest::rstest;
 
@@ -1159,10 +1160,10 @@ mod tests {
         click(&mut app, UiAction::BinaryHoleNext);
         assert_eq!(binary(&app).selected, 1);
         click(&mut app, UiAction::SpinDown);
-        assert!((binary(&app).spins[1].magnitude - 0.45).abs() < 1e-6);
+        assert_that!(binary(&app).spins[1].magnitude, near(0.45, 1e-6));
         click(&mut app, UiAction::SpinUp);
         click(&mut app, UiAction::SpinUp);
-        assert!((binary(&app).spins[1].magnitude - 0.55).abs() < 1e-6);
+        assert_that!(binary(&app).spins[1].magnitude, near(0.55, 1e-6));
         assert_eq!(disk(&app).spin, 0.82, "disk spin untouched");
         assert_eq!(scene_len(&app), 2);
         click(&mut app, UiAction::BinaryHolePrev);

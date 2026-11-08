@@ -4,6 +4,7 @@
 
 ### Added
 
+- Exact-rational property tests for certified arithmetic, table-driven certification cases, and GPU regression cases for redshift clamping in the truncated hot flow and slim disk.
 - The translation-validation test also checks naga's SPIR-V backend for every compared kernel, by reading the written SPIR-V back with naga's SPIR-V front end. A GPU test checks the proved `geodesic_rhs` error bound on the driver, with exact values taken from the Lean fixture.
 - Unconditional WGSL error bounds for `heatmap_color` (every input) and `tonemap` (input error at most 1/10): their safety conditions are now proved instead of assumed. A matching lower bound shows that near a branch threshold no all-input error bound can be smaller than half the branch jump.
 - A checked interval evaluator in Lean decides the WGSL safety conditions on input boxes. It proves closed-form domains for `polarization_color`, `spin_scale` and `spatial_unit`, and neighbourhoods of a Kerr configuration for every output of `add_kerr`, `screen_frame` and all four `sample_plasma` models. These hold for every association of the sums, and of the products and quotients with each factor kept in its role, which WGSL lets an implementation choose.
@@ -16,7 +17,7 @@
 - Lean 4 verification package, pinned Mathlib dependencies, axiom audit, independent kernel replay, and a GitHub Actions proof workflow. Exact-real results cover single-source Kerr vacuum curvature, metric derivatives, ISCO properties, camera frames, continuous transport, selected transfer models, and numerical bounds. Checked counterexamples document limits of binary superposition and exact discrete conservation.
 - Reproducible EHT snapshot acquisition/validation and pinned ipole reference workflows, with input hashes, physical conventions, measured results, and an explicit ledger of remaining proof obligations.
 - Optional WESL kernels for MKS snapshot interpolation, thermal synchrotron coefficients, polarized absorption/Faraday transfer, and a full 160x160 hybrid CPU/GPU image benchmark. Binary64 outer-ray transport is checked independently before handing off to the GPU.
-- Expanded numerical and shader regressions, including Schwarzschild trajectory refinement, adaptive-step rejection, local snapshot/transfer comparisons, and full-image diagnostics. Validation now includes 280 default Rust tests, seven Python tests, and separately enabled GPU checks.
+- Expanded numerical and shader regressions, including Schwarzschild trajectory refinement, adaptive-step rejection, local snapshot/transfer comparisons, and full-image diagnostics. Validation now includes 370 default Rust tests, seven Python tests, and separately enabled GPU checks.
 
 - Lean proofs for binary32 horizon/ISCO error bounds, unit and timing consistency, the energy-drift counterexample, equatorial radial stability, the full polarized matrix-exponential cell, a reassociation-independent WGSL summation bound, the WGSL `kerr_radius` error bound, the stable Faraday-cell series, and fourth-order local consistency of RK4 for the full nonlinear Kerr geodesic/screen field. Exhaustive all-input binary32 tests for the horizon, ISCO and `cbrtf`. GPU tests (lavapipe-compatible) showing the adaptive controller misses the trajectory targets and misclassifies near-critical captured rays.
 - WGSL floating-point bounds for `transfer_cell`'s matrix exponential (`polarized_transfer.wesl`). For every cell the shader accepts, the 12-term loop's exponential is within 16u + 10⁻²⁰ of exp(−h·k) and its source within 16u·h‖j‖ plus a flush-to-zero term. Running bounds cover the squarings and the returned Stokes vector.
@@ -31,6 +32,7 @@
 
 ### Changed
 
+- Added GoogleTest matchers for clearer numerical assertion failures and documented GPU-dependent rounding differences in the fluid-energy sweep.
 - Migrated production and test shaders from WGSL source files to WESL, updated Bevy asset paths, and added shared WESL compilation/validation helpers. Pinned verification files and WESL sources to LF endings for WSL scripts and stable provenance hashes.
 - Replaced null-residual-only step acceptance with RK4 step doubling over position, momentum, and transported screen, retaining null checks and rejecting invalid intermediate stages.
 - Updated Bevy to 0.20.1, proptest to 1.12.0, and rstest to 0.28.0; added WESL 0.6.0 for shader tests. Refreshed README shader references and the Bevy badge.

@@ -96,6 +96,6 @@ fn schwarzschild_radial_reference_is_affine() {
     initial[0] = 20.0;
     initial[8] = 0.5;
     let final_position = schwarzschild_reference(&initial, 80);
-    assert!((final_position[0] - 40.0).abs() < 1e-12);
+    googletest::assert_that!(final_position[0], googletest::matchers::near(40.0, 1e-12));
     assert_eq!(final_position[1], 0.0);
 }
