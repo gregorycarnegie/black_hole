@@ -1,4 +1,4 @@
-"""Build the large curvature proofs serially, audit axioms, replay the kernel.
+"""Build memory-heavy proofs serially, audit axioms, replay the kernel.
 
 `--build` runs the build and axiom audit only, `--replay` only the independent
 kernel replay of an existing build. With neither flag both phases run. CI uses
@@ -23,7 +23,7 @@ def run(*arguments):
 
 
 def build():
-    # Concurrent curvature checks exhausted a 64 GB workstation.
+    # Concurrent curvature and fixture checks exhaust RAM and thrash swap.
     for module in (
         "KerrVacuumTime",
         "KerrVacuumSpatial11",
@@ -33,6 +33,9 @@ def build():
         "KerrVacuumSpatial23",
         "KerrVacuumSpatial33",
         "KerrVacuumMixed",
+        "NagaFixtureKerr",
+        "NagaFixtureKerrSpirv",
+        "NagaFixturePlasma",
     ):
         run("--no-ansi", "build", f"BlackHole.{module}")
     run("--no-ansi", "build")

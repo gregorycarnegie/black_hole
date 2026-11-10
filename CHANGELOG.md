@@ -25,6 +25,7 @@
 
 ### Fixed
 
+- Serialized the memory-heavy naga fixture proof builds alongside the curvature proofs to reduce swap pressure behind the Lean CI timeout.
 - The WGSL safety conditions required both sides of a branch to be safe. Every `sample_plasma` error bound was therefore vacuous: `disk_radius`'s untaken branch divides by a floor that its own error exceeds everywhere on the disk. Only the branch taken is now required, which is all the error proof uses.
 - `kerr_isco_radius_rg` lost up to 4731 binary32 units of relative accuracy near zero spin (about 2.8e-4 at |a| = 5e-4). It now uses a cancellation-free form of the Bardeen formula (maximum 17 units over all inputs).
 - `polarized_cell` cancelled catastrophically for small optical depth with Faraday rotation (e.g. sin-component integral 1.3e-3 instead of 5.0e-6). Both cell integrals and `absorption_integral` now use one complex `(1 - exp(-z))/z` with a series branch.
