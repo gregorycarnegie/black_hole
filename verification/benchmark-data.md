@@ -1,4 +1,10 @@
-# EHT comparison input and reference solver
+# EHT comparison input and standalone Zig reference
+
+The current reference implementation is entirely Zig 0.17: no C sources,
+`@cImport`, libc, external solver, GSL, or HDF5 library is compiled or linked.
+The old `*_ipole.sh` filenames and probe output names remain for compatibility.
+The recorded ipole results below are historical measurements, retained as an
+external comparison rather than relabeled as Zig results.
 
 The required snapshot was found publicly and downloaded on 2026-11-03.
 Cora Prather's [Harvard Dataverse archive](https://doi.org/10.7910/DVN/XZECPF),
@@ -63,14 +69,44 @@ primitive conventions, finite primitives, and positive density/internal energy.
 The negative tests reject substituted times, spin, grid, coordinates and
 primitive order. A complete physical validation remains separate.
 
-## Independent polarized reference
+## Standalone polarized reference
 
-The reference solver is [AFD-Illinois/ipole](https://github.com/AFD-Illinois/ipole),
-pinned to commit `7f7a482cf91125aeeeb9c431485bba680e8941d7`. Its upstream
-license and attribution remain in the downloaded repository. The build uses
-`MODEL=iharm`, GCC `-O2` with OpenMP, GSL 2.8 and HDF5 1.14.6. It has been
-prepared under the existing Ubuntu 26.04 amd64 WSL environment; the scripts
-unpack pinned Ubuntu libraries locally and do not install system packages.
+`benchmarks/reference.zig` implements the fixed EHT/MKS benchmark in binary64.
+Its snapshot reconstruction, camera, midpoint geodesics and thermal conventions
+are adapted from [ipole](https://github.com/AFD-Illinois/ipole) commit
+`7f7a482cf91125aeeeb9c431485bba680e8941d7`; attribution and the BSD license are
+in `benchmarks/LICENSE`. It replaces that external solver rather than calling it.
+Native Bessel quadrature replaces GSL. Constant-cell polarized transfer uses
+an affine exponential with scaling and squaring, composed in foreground order.
+The CPU reference uses native MKS coordinates independently of the renderer's
+Cartesian CUDA kernels.
+
+Snapshot reading is deliberately limited to the exact archived file above:
+the reader verifies its size and full SHA-256 **before** accessing known
+contiguous dataset offsets. It rejects different files, including re-encodings
+of the same values. Supporting other snapshots requires extending the reader;
+this is not a general HDF5 parser. The existing Python validators/exporters
+remain separate tooling and still use their declared NumPy/h5py dependencies.
+
+Install Zig 0.17 in the environment where the executable will run. The native
+Windows commands, from the repository root, are:
+
+```powershell
+zig test verification/benchmarks/reference.zig -fno-llvm --cache-dir target/zig-cache --global-cache-dir target/zig-global-cache
+zig build-exe verification/benchmarks/reference.zig -O safe -fno-llvm -fno-emit-implib '-femit-bin=target/reference-zig.exe' --cache-dir target/zig-cache --global-cache-dir target/zig-global-cache
+target/reference-zig.exe camera verification/benchmarks/eht-ipole.par target/eht-benchmark/camera-ipole.f64
+target/reference-zig.exe outer verification/benchmarks/eht-ipole.par target/eht-benchmark/outer-ipole.f64
+target/reference-zig.exe snapshot verification/benchmarks/eht-ipole.par target/eht-benchmark/sample-queries.f64 target/eht-benchmark/sample-ipole.f64
+target/reference-zig.exe thermal target/eht-benchmark/thermal-queries.f64 target/eht-benchmark/thermal-ipole.f64 target/eht-benchmark/thermal-bessel.f32
+target/reference-zig.exe image verification/benchmarks/eht-ipole.par target/eht-benchmark/zig-reference.f64
+target/reference-zig.exe image verification/benchmarks/eht-ipole-refined.par target/eht-benchmark/zig-reference-refined.f64
+```
+
+`-fno-llvm -fno-emit-implib` avoids failures in the local Windows Zig 0.17.0
+installation. Linux Zig 0.17.1 was also checked with its default LLVM backend.
+For WSL, put a Linux Zig on `PATH` (or set `ZIG` to its path), then use the
+existing script entry points. They build/test Zig and run without downloads,
+APT, GCC, OpenMP, library paths, or an ipole checkout:
 
 From the repository root in PowerShell:
 
@@ -79,20 +115,67 @@ wsl -d Ubuntu -- bash verification/benchmarks/build_ipole.sh
 wsl -d Ubuntu -- bash verification/benchmarks/run_ipole.sh
 ```
 
-The local library paths are embedded in the executable. Rebuild after moving
-the checkout. Build and run logs are in `target/eht-reference/`.
+The executable and run logs are in `target/eht-reference/`.
 
 [benchmarks/eht-ipole.par](benchmarks/eht-ipole.par) sets the paper's 160×160
 image, 160 microarcsecond field, 230 GHz frequency, M87* mass/distance,
 camera at 10000 r_g and 163 degrees, mass unit 1.672×10²⁶ g, fixed ion/electron
 temperature ratio three and magnetization cutoff one. The regenerated Stokes
-image is `target/eht-benchmark/ipole-reference.h5`. This uses the pinned current
-solver; it is not an archived image from the original 2023 runs.
+images are `target/eht-benchmark/zig-reference.f64` and
+`zig-reference-refined.f64`: little-endian binary64 arrays of shape
+`(160,160,4)` in pixel Jy, with `.f64.json` metadata sidecars. No HDF5 writer is
+needed. The sidecar records stride, shape, step parameter, flux, snapshot hash
+and numerical residuals. `check_image.py` requires complete, finite images with
+the expected snapshot and step parameter, and rejects sparse diagnostics.
+An optional final integer argument to `image`, such as `40`, samples every
+40th pixel in each dimension for a 16-ray smoke check. Always use a distinct
+output filename for sparse runs.
 
-## Regenerated reference result
+Only the fixed physical model recorded here is supported. Unsupported model
+parameters, nonfinite queries, partial binary records and unresolved rays
+fail explicitly. Image convergence and physical accuracy remain empirical
+questions; a Zig port does not close those error budgets.
 
-[fixtures/eht-reference.json](fixtures/eht-reference.json) records the source,
-input/configuration hashes, software versions and measured totals. The original configuration hash records CRLF bytes; the fixture also records the checked-in LF hash. Only line endings changed; parameter names and values are identical. The first
+## Zig validation (2026-11-11)
+
+[fixtures/eht-zig-reference.json](fixtures/eht-zig-reference.json) records the
+source hashes, checks and new image results. Eight Zig tests and eight Python
+tests pass. All four compatibility probe modes were run. A same-size snapshot
+with one substituted byte and a partial query record were rejected without
+overwriting existing output. Linux `readelf` confirms no dynamic section.
+
+Against the saved historical probes, sampling's maximum scaled error is
+6.28e-15, camera error 4.07e-20, and outer-ray error 4.06e-11. On 319 thermal
+cases, maximum emission/absorption/Faraday family-scaled differences are
+1.42e-14 / 2.15e-14 / 7.37e-13, using the existing 1e-20 scale floor.
+The native quadrature reproduces every binary32 Bessel-table byte exactly.
+Unlike the old squaring-based norm, the native scaled polarization norm also
+enforces the 0.99 cap for negligible emissivities whose squares underflow.
+
+Both native images contain 25600 finite pixels with nonnegative intensity
+and no Stokes-cone violation above 1e-12 Jy numerical tolerance:
+
+| Step parameter | I (Jy) | Q (Jy) | U (Jy) | V (Jy) |
+| --- | --- | --- | --- | --- |
+| 0.01 | 0.4791338123 | -0.0066722798 | -0.0028553297 | 0.0030654178 |
+| 0.0025 | 0.4770290098 | -0.0076507838 | -0.0022905308 | 0.0031804553 |
+
+The refined Zig image differs from the archived refined ipole image by
+0.0922% in intensity L2 norm. Native baseline-to-refined intensity changes by
+5.93%; convergence remains unestablished. Null residuals in the image sidecars
+are absolute maxima at terminal states, not normalized or all-step bounds.
+The existing saved GPU image differs from the refined Zig reference by 0.656%
+in intensity L2 norm. `check_image.py compare` completes its comparison and
+**still exits unsuccessfully because the requested accuracy targets fail**.
+The GPU renderer and Lean proofs were not rerun for this migration.
+
+## Historical ipole reference result (2026-11-03)
+
+[fixtures/eht-reference.json](fixtures/eht-reference.json) records the old C run's source,
+input/configuration hashes, software versions and measured totals. The original
+configuration hash records CRLF bytes; the fixture also records its LF hash.
+These hashes describe the files at recording time; the current parameter files
+now select Zig output paths. The first
 checked run produced these integrated Stokes values in Jy:
 
 | I | Q | U | V |
@@ -101,7 +184,7 @@ checked run produced these integrated Stokes values in Jy:
 
 The separately computed unpolarized flux was 0.5046674123064179 Jy. Net linear
 and circular polarization were 1.5231865% and 0.6463652%. Multiply the first
-four components of the HDF5 `pol` dataset by `header/scale` to obtain Jy per
+four components of the historical HDF5 `pol` dataset by `header/scale` to obtain Jy per
 pixel; the remaining component is not a Stokes intensity. The file records
 EVPA zero at North. All Stokes pixels were finite, with positive intensity
 and no polarization-cone violation in this run. A second run through the saved build/run workflow reproduced all Stokes
@@ -127,7 +210,7 @@ interactive prescribed-plasma renderer:
   native vector basis are undefined; this lies inside the reference polar cut.
 - `assets/shaders/thermal.wesl` implements the pinned Dexter thermal emission
   and conversion fits, Shcherbakov rotation, polarized Kirchhoff absorption,
-  and the 0.99 polarization cap. Its interpolated GSL Bessel-ratio table and
+  and the 0.99 polarization cap. Its interpolated Bessel-ratio table and
   cold asymptotic branch avoid binary32 underflow. The source attribution and
   BSD license are retained in `assets/shaders/ipole-LICENSE.txt`.
 - `assets/shaders/polarized_transfer.wesl` solves the full constant-cell
@@ -151,8 +234,8 @@ target/verification-python/Scripts/python.exe verification/check_transfer.py
 cargo test --offline --test rendering -- --include-ignored --nocapture --test-threads=1
 ```
 
-The probe compiles the pinned solver's saved, unmodified source with a separate
-entry point; it does not use the Python sampler to generate its expected values.
+The probes execute the standalone Zig implementation; they do not call the
+Python sampler to generate expected values or compile upstream C sources.
 Generated grids, query sets, expected values, GPU outputs and detailed validation
 JSON stay under `target/eht-benchmark/`. The grid payloads total about 235 MB.
 The three storage bindings each fit WebGPU's default 128 MiB limit.
@@ -202,13 +285,14 @@ camera, fluid-frame frequency/path length, screen/pitch/Stokes conventions,
 and foreground matrix composition. The interactive renderer continues to use
 its prescribed plasma. The benchmark is a separate hybrid CPU/GPU path.
 
-## Full image benchmark (2026-11-04)
+## Current full image workflow
 
-Build the pinned reference first, then run:
+Build the Zig reference and run both baseline and refined images first, then:
 
 ```powershell
 wsl -d Ubuntu -- bash verification/benchmarks/sample_ipole.sh camera
 wsl -d Ubuntu -- bash verification/benchmarks/sample_ipole.sh outer
+wsl -d Ubuntu -- bash verification/benchmarks/run_ipole.sh
 wsl -d Ubuntu -- bash verification/benchmarks/run_ipole.sh refined
 target/verification-python/Scripts/python.exe verification/check_image.py prepare
 cargo test --offline --test rendering headless_snapshot_image -- --ignored --nocapture
@@ -222,11 +306,14 @@ that regression does not assert numerical accuracy. `prepare --stride 8` is
 a 400-ray diagnostic. `--cell-fraction 0.25`, `0.125`, and `0.0625` reproduce
 the full-image refinement sequence; the default is 0.0625.
 
-The independent camera probe checks all 25600 future tangents, native positions
+The independent Zig camera probe checks all 25600 future tangents, native positions
 and tetrad vectors. The camera uses the reference's normal observer,
 zero-angular-momentum centering and -0.01 horizontal pixel offset. A per-ray
 Jones matrix accounts for finite-field-angle projection onto the fixed camera
 axes. The saved North-EVPA convention negates camera Q and U.
+
+The measurements in the following paragraphs are historical results from
+2026-11-04 against the C reference; they are not claims about a new Zig image.
 
 `outer_ray.py` integrates the emission-free segment from the 10000 r_g camera
 to 120 r_g in binary64 Cartesian Kerr coordinates. On this machine the 229-step

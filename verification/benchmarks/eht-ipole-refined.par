@@ -1,6 +1,6 @@
-# Prather et al. 2023, section 3.3; pinned solver recorded in benchmark-data.md.
+# Prather et al. 2023, section 3.3; standalone Zig reference.
 dump target/eht-benchmark/sample_dump_SANE_a+0.94_MKS_0900.h5
-outfile target/eht-benchmark/ipole-reference-refined.h5
+outfile target/eht-benchmark/zig-reference-refined.f64
 nx 160
 ny 160
 rcam 1.e4

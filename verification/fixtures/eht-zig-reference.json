@@ -1,0 +1,167 @@
+{
+  "checked_on": "2026-11-11",
+  "solver": "standalone Zig binary64 MKS reference",
+  "zig_versions_checked": [
+    "0.17.0 (Windows, native backend)",
+    "0.17.1 (Linux, LLVM backend)"
+  ],
+  "external_runtime_libraries": [],
+  "linkage_check": "Linux readelf reports no dynamic section; no libc, ipole, GSL or HDF5 library is linked",
+  "input_scope": "Only the exact SHA-256-pinned contiguous EHT snapshot is supported; this is not a general HDF5 reader",
+  "convention_source_ipole_commit": "7f7a482cf91125aeeeb9c431485bba680e8941d7",
+  "historical_probe_comparison": {
+    "sample": {
+      "cases": 274,
+      "max_scaled_component_error": 6.2806657167999845e-15
+    },
+    "camera": {
+      "cases": 25600,
+      "max_scaled_component_error": 4.0657581468206416e-20
+    },
+    "outer": {
+      "cases": 16,
+      "max_scaled_component_error": 4.057187918959926e-11
+    },
+    "thermal": {
+      "cases": 319,
+      "max_family_scaled_errors": [
+        1.4181498637077049e-14,
+        2.153209220998905e-14,
+        7.372380806195549e-13
+      ],
+      "family_scale_floor": 1e-20,
+      "note": "Native scaled polarization norm fixes legacy underflow below negligible emissivities; exact bit equality is not claimed"
+    },
+    "bessel_table_bit_identical": true
+  },
+  "validation": {
+    "zig_tests_passed": 8,
+    "python_tests_passed": 8,
+    "compatibility_probe_modes": [
+      "snapshot",
+      "thermal",
+      "camera",
+      "outer"
+    ],
+    "corrupted_snapshot_rejected": true,
+    "truncated_query_rejected": true,
+    "failed_inputs_preserved_existing_outputs": true,
+    "python_sampling_comparison_passed": true,
+    "python_thermal_validation_passed": true,
+    "native_camera_and_outer_comparison_passed": true,
+    "gpu_tests_rerun": false,
+    "lean_proofs_rerun": false
+  },
+  "full_images": {
+    "baseline": {
+      "file": "zig-reference.f64",
+      "sha256": "5950f68aff9da96af37471c927f0f530954933d391b02a07832da686bfc5b8b8",
+      "metadata": {
+        "solver": "standalone Zig MKS midpoint / full polarized affine transfer",
+        "snapshot_sha256": "c2d1dfdc8c92320ec77d22953f55c2b5d71b685496f5199c73a1280f20a0d537",
+        "shape": [
+          160,
+          160,
+          4
+        ],
+        "stride": 1,
+        "eps": 0.01,
+        "Jy_per_CGS_intensity": 2.3504386381829065,
+        "summed_stokes_Jy": [
+          0.47913381230363933,
+          -0.006672279843760092,
+          -0.002855329662328196,
+          0.003065417779684281
+        ],
+        "max_steps": 9445,
+        "max_absolute_null_residual": 1.8799819946289062,
+        "scope": "finite numerical reference; convergence and physical accuracy require assessment"
+      },
+      "finite_positive_intensity_and_stokes_cone": true,
+      "archived_ipole_component_l2_errors_over_I_l2": [
+        0.003693187743419246,
+        0.003223557164770471,
+        0.002808423890654822,
+        0.0005249724009877863
+      ]
+    },
+    "refined": {
+      "file": "zig-reference-refined.f64",
+      "sha256": "87fb5ebf83cd63792e0aeb273c974d8bbc2d137c4c8914e7b1c79c89663849ea",
+      "metadata": {
+        "solver": "standalone Zig MKS midpoint / full polarized affine transfer",
+        "snapshot_sha256": "c2d1dfdc8c92320ec77d22953f55c2b5d71b685496f5199c73a1280f20a0d537",
+        "shape": [
+          160,
+          160,
+          4
+        ],
+        "stride": 1,
+        "eps": 0.0025,
+        "Jy_per_CGS_intensity": 2.3504386381829065,
+        "summed_stokes_Jy": [
+          0.4770290097717491,
+          -0.007650783802518372,
+          -0.00229053078159992,
+          0.003180455348899436
+        ],
+        "max_steps": 37909,
+        "max_absolute_null_residual": 0.11879920959472656,
+        "scope": "finite numerical reference; convergence and physical accuracy require assessment"
+      },
+      "finite_positive_intensity_and_stokes_cone": true,
+      "archived_ipole_component_l2_errors_over_I_l2": [
+        0.0009224718497559393,
+        0.0006123730952726963,
+        0.0005634561080872571,
+        9.344966075608134e-05
+      ]
+    }
+  },
+  "baseline_to_refined_component_l2_change_over_I_l2": [
+    0.05929426409021277,
+    0.030219846238786395,
+    0.029515689184941404,
+    0.005919226419686692
+  ],
+  "comparison_against_saved_gpu_output": {
+    "pixels": 25600,
+    "component_l2_error_over_reference_I_l2": [
+      0.0065559154452787954,
+      0.00213392958056367,
+      0.002677847186095918,
+      0.0006524185410268988
+    ],
+    "max_relative_I_error_above_floor": 0.24266360366804277,
+    "requested_numerical_targets_met": false,
+    "camera_and_outer_transport": {
+      "steps": 229,
+      "max_affine_length": 9886.969306908837,
+      "max_null": 5.004957837062562e-10,
+      "max_screen_norm_error": 2.504740859166077e-11,
+      "max_transversality": 2.837660662002861e-14,
+      "max_refinement_difference": 1.0676004080778512e-08,
+      "independent_zig_max_error": {
+        "position": 2.542328658705628e-06,
+        "momentum_screen": 3.256391600814368e-08
+      }
+    }
+  },
+  "scope": "Finite validation only. Baseline/refined images are not converged; requested numerical targets remain unmet. GPU comparison uses the pre-existing saved image, not a rerun. Image null diagnostics are maxima at terminal ray states, not all-step bounds.",
+  "source_sha256": {
+    "verification/benchmarks/geometry.zig": "3012a41542c5cbc5598baff94c170160d6ab73e7bdefa5479ea862358b4e85ee",
+    "verification/benchmarks/reference.zig": "810133445fbf0bcdfc39239c25cd5a72530edccadc7679e15575617f41e4dbc4",
+    "verification/benchmarks/snapshot.zig": "ac2e0a446ebbe01af4b411ea306e08c20cbe3d40f5489cc750b0e4dc1a10dc47",
+    "verification/benchmarks/thermal.zig": "e5a3a2952fba757dd610db2e3f3351dc5b808531b33d3f9ee96719e365c60c8d",
+    "verification/benchmarks/transfer.zig": "2547b84070f4eccac2db7b6591a6b9f86ca7109414a98695a472e2d80a22f322",
+    "verification/benchmarks/build_ipole.sh": "e6f979977061ab124b3fd55ce5601fc71c91046a6a87054e9f879281f8b5a48b",
+    "verification/benchmarks/run_ipole.sh": "2d3336ac973fd65a327412a0b7516adca463c1c4668395f423e190ecc573bc5d",
+    "verification/benchmarks/sample_ipole.sh": "b5ae3d10f196b9b4f48b29fd722085cbed2f024e21e35dd5cd4f9f151148e7b1",
+    "verification/benchmarks/eht-ipole-refined.par": "aedddf35ff58e988fdfeb799dd6291cf57f5acd4c28e6c08cba50e15199a2746",
+    "verification/benchmarks/eht-ipole.par": "fe858c690ecf4d700a8e0b203808fd5dfb2b6cbbf8a10a608ebd4e04331b74d5",
+    "verification/check_image.py": "4f3d94d523225d6c557db6f8c1e56d655c5549ec6cc5096327b1ca358bccb83d",
+    "verification/check_sampling.py": "d13ff4abe787822fdcbd8047539bfa535297521bbc51fa4b3023dd36ea785cd6",
+    "verification/check_thermal.py": "f92d821081714be2662ff41b1ffc9794f5e23ed3cdd52e59353380f2f0dd3e7c",
+    "verification/test_image.py": "91337c6c61237b9a3fc41a9754de9dd69b74a7dbefd4419ebdf3392c218c6ee8"
+  }
+}

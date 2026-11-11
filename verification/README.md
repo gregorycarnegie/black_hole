@@ -5,7 +5,9 @@ counterexamples, specification dependencies and external trust boundaries.
 The chosen reference systems, finite domains and error requirements are in
 [TARGETS.md](TARGETS.md). The exact EHT comparison snapshot has been obtained;
 [benchmark-data.md](benchmark-data.md) records its verified identity and the
-independent reference-solver workflow.
+standalone Zig reference-solver workflow. The benchmark executable has no
+C sources, external solver, GSL, HDF5 library or libc dependency; the older
+ipole measurements remain labeled as historical comparisons.
 
 This package checks exact-real identities, concrete binary32 executions, RK4
 error calculations, and an exact binary-metric counterexample. Read

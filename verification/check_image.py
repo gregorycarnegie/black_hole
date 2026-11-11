@@ -1,4 +1,4 @@
-"""Prepare matched camera rays and compare the GPU image to the pinned ipole image."""
+"""Prepare matched camera rays and compare the GPU image to the Zig reference."""
 
 import argparse
 import hashlib
@@ -6,13 +6,28 @@ import inspect
 import json
 from pathlib import Path
 
-import h5py
 import numpy as np
 from check_snapshot import check_snapshot
 from eht_snapshot import L_UNIT, default_path, jacobian, native_metric, theta, to_world
 from outer_ray import trace
 
 OUT = Path(__file__).resolve().parent.parent / "target/eht-benchmark"
+
+
+def read_reference(filename):
+    """Require a complete native reference, never a sparse diagnostic image."""
+    meta = json.loads((OUT / (filename + ".json")).read_text())
+    if meta.get("shape") != [160, 160, 4] or meta.get("stride") != 1:
+        raise ValueError("Zig reference must contain all 25600 pixels")
+    if meta.get("snapshot_sha256") != "c2d1dfdc8c92320ec77d22953f55c2b5d71b685496f5199c73a1280f20a0d537":
+        raise ValueError("Zig reference snapshot identity mismatch")
+    expected_eps = 0.0025 if filename == "zig-reference-refined.f64" else 0.01
+    if meta.get("eps") != expected_eps:
+        raise ValueError("Zig reference step parameter mismatch")
+    values = np.fromfile(OUT / filename, dtype="<f8")
+    if values.size != 25600 * 4 or not np.isfinite(values).all():
+        raise ValueError("Incomplete or nonfinite Zig reference")
+    return values.reshape(25600, 4)
 
 
 def camera():
@@ -96,16 +111,15 @@ def prepare(args):
         outer["max_refinement_difference"]=float(error)
         seeds=coarse
         np.savez(cache,seeds=seeds,report=json.dumps(outer))
-    outer["independent_ipole_max_error"]=check_outer(seeds)
+    outer["independent_zig_max_error"]=check_outer(seeds)
     if args.stride < 1 or args.stride > 160 or not 0 < args.cell_fraction <= 1:
         raise ValueError("Require stride in [1,160] and cell fraction in (0,1]")
     i, j = np.meshgrid(np.arange(0,160,args.stride), np.arange(0,160,args.stride), indexing="ij")
     indices = (160*i+j).ravel()
     seeds[indices].astype("<f4").tofile(OUT / "image-seeds.f32")
-    with h5py.File(OUT / "ipole-reference.h5", "r") as ref:
-        scale = float(ref["header/scale"][()])
+    scale = (160 / 2.06265e11 / 160)**2 / 1e-23
     np.array([args.cell_fraction, 50000, len(indices), scale], dtype="<f4").tofile(OUT / "image-settings.f32")
-    meta = {"snapshot_sha256": identity["sha256"], "indices": indices.tolist(), "shape": list(i.shape), "cell_fraction": args.cell_fraction, "camera_probe": "all 25600 camera positions, future tangents and tetrad vectors matched pinned ipole", "observer_frequency_hz": 230e9, "Jy_per_CGS_intensity": scale}
+    meta = {"snapshot_sha256": identity["sha256"], "indices": indices.tolist(), "shape": list(i.shape), "cell_fraction": args.cell_fraction, "camera_probe": "all 25600 camera positions, future tangents and tetrad vectors matched standalone Zig reference", "observer_frequency_hz": 230e9, "Jy_per_CGS_intensity": scale}
     meta["outer_transport"]=outer
     meta["outer_fraction"]=args.outer_fraction
     (OUT / "image-input.json").write_text(json.dumps(meta, indent=2)+"\n", encoding="utf-8")
@@ -120,11 +134,9 @@ def compare():
         raise ValueError("Incomplete/nonfinite image output")
     status, counts = np.unique(values[:, 5].astype(int), return_counts=True)
     statuses = dict(zip(map(str, status), map(int, counts)))
-    with h5py.File(OUT / "ipole-reference-refined.h5", "r") as ref:
-        full_reference = ref["pol"][..., :4].reshape(-1, 4) * float(ref["header/scale"][()])
-        expected = full_reference[indices]
-    with h5py.File(OUT / "ipole-reference.h5", "r") as ref:
-        baseline = ref["pol"][..., :4].reshape(-1, 4)[indices] * float(ref["header/scale"][()])
+    full_reference = read_reference("zig-reference-refined.f64")
+    expected = full_reference[indices]
+    baseline = read_reference("zig-reference.f64")[indices]
     actual = values[:, :4].astype(float)
     denominator = np.linalg.norm(expected[:, 0])
     error = actual-expected
@@ -133,12 +145,12 @@ def compare():
     bright=expected[:,0]>1e-6*reference_intensity
     relative_I=float(np.max(np.abs(error[bright,0])/expected[bright,0]))
     max_normalized=np.abs(error).max(axis=0)/reference_intensity
-    report.update({"reference_file":"ipole-reference-refined.h5", "reference_eps":0.0025,
+    report.update({"reference_file":"zig-reference-refined.f64", "reference_eps":0.0025,
         "fixed_reference_intensity_Jy":reference_intensity,
         "max_component_error_over_fixed_reference_I":max_normalized.tolist(),
         "max_relative_I_error_above_floor":relative_I,
         "requested_numerical_targets_met":bool(np.all(max_normalized<=1e-6) and relative_I<=1e-4),
-        "ipole_baseline_to_refined_l2_change_over_I_l2":(np.linalg.norm(expected-baseline,axis=0)/denominator).tolist(),
+        "zig_baseline_to_refined_l2_change_over_I_l2":(np.linalg.norm(expected-baseline,axis=0)/denominator).tolist(),
         "camera_and_outer_transport":meta["outer_transport"]})
     (OUT / "image-comparison.json").write_text(json.dumps(report,indent=2)+"\n",encoding="utf-8")
     print(json.dumps(report,indent=2))

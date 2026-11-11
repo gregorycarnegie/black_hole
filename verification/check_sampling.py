@@ -1,4 +1,4 @@
-"""Prepare snapshot sampling inputs, then compare with the pinned C solver.
+"""Prepare snapshot sampling inputs, then compare with the standalone Zig solver.
 
 Run with 'prepare', sample_ipole.sh, then 'compare'. GPU buffers are only
 exported after the independent double-precision comparison passes.
@@ -74,7 +74,7 @@ def compare():
     header.tofile(OUT / "sample-header.f32")
     # Output: world u, world b, physical (ne,Thetae,Bgauss,sigma), native x+mask.
     np.column_stack((uw, bw, physical, x, emitting)).astype("<f4").tofile(OUT / "sample-expected.f32")
-    report = {"samples": len(x), "snapshot_sha256": snapshot.identity["sha256"], "ipole_commit": "7f7a482cf91125aeeeb9c431485bba680e8941d7", "max_component_scaled_error": float(np.max(error)), "electron_density_nonzero_samples": int(np.count_nonzero(physical[:, 0])), "radiating_samples": int(np.count_nonzero(emitting)), "length_unit_cm": L_UNIT, "checks": ["8 interpolated primitives", "native velocity and magnetic four-vectors", "4 physical scalars and sigma cut", "native metric", "Cartesian positions and metric pullback", "timelike normalization and magnetic orthogonality", "radiating-region mask"]}
+    report = {"samples": len(x), "snapshot_sha256": snapshot.identity["sha256"], "reference_solver": "standalone Zig", "convention_source_ipole_commit": "7f7a482cf91125aeeeb9c431485bba680e8941d7", "max_component_scaled_error": float(np.max(error)), "electron_density_nonzero_samples": int(np.count_nonzero(physical[:, 0])), "radiating_samples": int(np.count_nonzero(emitting)), "length_unit_cm": L_UNIT, "checks": ["8 interpolated primitives", "native velocity and magnetic four-vectors", "4 physical scalars and sigma cut", "native metric", "Cartesian positions and metric pullback", "timelike normalization and magnetic orthogonality", "radiating-region mask"]}
     (OUT / "sampling-validation.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
 

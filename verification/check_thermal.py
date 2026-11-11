@@ -1,4 +1,4 @@
-"""Prepare physical coefficient queries and package pinned ipole references."""
+"""Prepare physical coefficient queries and package standalone Zig references."""
 
 import json
 import sys
@@ -37,7 +37,7 @@ def compare():
     if not np.isfinite(ref.astype("<f4")).all():
         raise ValueError("Reference cannot be represented in binary32")
     ref.astype("<f4").tofile(OUT / "thermal-expected.f32")
-    report = {"cases": len(q), "ipole_commit": "7f7a482cf91125aeeeb9c431485bba680e8941d7", "distribution": "Dexter 2016 thermal emissivity/conversion, Shcherbakov rotation", "units": "observer-scaled CGS intensity per r_g of fluid path; absorption and Faraday per r_g", "observer_frequency_hz": 230e9, "checks": ["finite coefficients", "0.99 emission/absorption cap above the 1e-20 intensity/opacity floor", "zero field", "parallel/antiparallel field", "temperature floor", "GSL cold underflow convention"]}
+    report = {"cases": len(q), "reference_solver": "standalone Zig", "convention_source_ipole_commit": "7f7a482cf91125aeeeb9c431485bba680e8941d7", "distribution": "Dexter 2016 thermal emissivity/conversion, Shcherbakov rotation", "units": "observer-scaled CGS intensity per r_g of fluid path; absorption and Faraday per r_g", "observer_frequency_hz": 230e9, "checks": ["finite coefficients", "0.99 emission/absorption cap above the 1e-20 intensity/opacity floor", "zero field", "parallel/antiparallel field", "temperature floor", "archived cold underflow convention (native Bessel quadrature)"]}
     (OUT / "thermal-validation.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
 
