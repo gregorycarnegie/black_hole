@@ -305,6 +305,80 @@ pub fn dispatch_geodesic(pipeline: Option<ResMut<GeodesicPipeline>>) {
 }
 
 #[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with -- --ignored --nocapture"]
+fn binary_render_stops_stagnating_rays() {
+    let cuda = shared_cuda();
+    let cam = crate::camera::OrbitalCamera::default();
+    let camera = GpuCameraUniform {
+        pos: cam.position().into(),
+        right: cam.right().into(),
+        up: cam.up().into(),
+        forward: cam.forward().into(),
+        tan_half_fov: cam.tan_half_fov(),
+        aspect: 4.0 / 3.0,
+        debug_heatmap: 1,
+        max_iter: cam.max_iter,
+        frequency_ghz: cam.frequency_ghz,
+        faraday_depth: cam.faraday_depth,
+        conversion_depth: cam.conversion_depth,
+        ..GpuCameraUniform::zeroed()
+    };
+    let scene = crate::simulation::SimObjects::default();
+    let mut objects = GpuObjectsUniform::zeroed();
+    objects.num_objects = scene.0.len() as i32;
+    for (i, object) in scene.0.iter().enumerate() {
+        objects.pos_radius[i] = object.position.extend(object.radius).into();
+        objects.color[i] = object.color.into();
+        objects.mass[i][0] = object.mass;
+        objects.spin[i] = object.spin.extend(0.0).into();
+    }
+    let disk = build_disk_uniform(&DiskConfigUniform::default());
+    let d_camera = cuda.clone_htod(bytemuck::bytes_of(&camera));
+    let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
+    let d_objects = cuda.clone_htod(bytemuck::bytes_of(&objects));
+    let d_skybox = cuda.clone_htod(&[1.0_f32; 4]);
+    let (width, height) = (64u32, 48u32);
+    let mut output = cuda.alloc_zeros::<f32>((width * height * 4) as usize);
+    cuda.stream.synchronize().unwrap();
+    let start = std::time::Instant::now();
+    let mut builder = cuda.stream.launch_builder(&cuda.geodesic);
+    builder.arg(&mut output);
+    builder.arg(&d_camera);
+    builder.arg(&d_disk);
+    builder.arg(&d_objects);
+    builder.arg(&d_skybox);
+    builder.arg(&width);
+    builder.arg(&height);
+    builder.arg(&1u32);
+    builder.arg(&1u32);
+    unsafe {
+        builder
+            .launch(LaunchConfig {
+                grid_dim: (width.div_ceil(16), height.div_ceil(16), 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            })
+            .unwrap();
+    }
+    drop(builder);
+    let pixels = cuda.clone_dtoh(&output);
+    assert!(pixels.iter().all(|value| value.is_finite()));
+    // The heatmap's RGB sum is 3 * iterations / max_iter.
+    let max_iterations = pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| (pixel[0] + pixel[1] + pixel[2]) * camera.max_iter as f32 / 3.0)
+        .fold(0.0_f32, f32::max);
+    eprintln!(
+        "binary render: {:?}, max {max_iterations:.0} iterations",
+        start.elapsed()
+    );
+    assert!(max_iterations > 0.0 && max_iterations < 2_000.0);
+}
+
+#[cfg(test)]
 pub(super) fn check_relativity() {
     let cuda = shared_cuda();
     cuda.bind_to_thread();
@@ -356,5 +430,9 @@ pub(super) fn check_relativity() {
             &data[112..124]
         );
     }
+    assert_eq!(
+        data[106], 1.0,
+        "intensity fast path changed the disk RGB, energy or opacity"
+    );
     super::verification::check_convergence(&data);
 }

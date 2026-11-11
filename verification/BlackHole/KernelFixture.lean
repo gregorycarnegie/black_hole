@@ -91,14 +91,16 @@ private meta partial def parse : List String → Lean.MacroM (Lean.Term × List 
 private meta def tokens (row : String) : List String :=
   (((row.replace "(" " ( ").replace ")" " ) ").splitOn " ").filter fun t => t ≠ ""
 
-macro "kernel_fixture" : term => do
-  let rows := (fixtureText.trimAscii.toString.splitOn "\n").map (·.trimAscii.toString)
+meta def parseFixture (contents : String) : Lean.MacroM Lean.Term := do
+  let rows := (contents.trimAscii.toString.splitOn "\n").map (·.trimAscii.toString)
   let entries ← rows.toArray.mapM fun row => do
     let name :: toks := tokens row | Lean.Macro.throwError "empty row"
     let (e, rest) ← parse toks
     unless rest.isEmpty do Lean.Macro.throwError s!"trailing tokens in {name}"
     `(Prod.mk $(Lean.quote name) $e)
   `([$entries,*])
+
+macro "kernel_fixture" : term => parseFixture fixtureText
 
 def fixture : List (String × PExpr) := kernel_fixture
 

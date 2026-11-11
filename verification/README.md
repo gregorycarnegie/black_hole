@@ -56,6 +56,16 @@ All lengths below are in gravitational radii, with G = c = M = 1. Theorems state
 their hypotheses explicitly; they do not establish that every runtime input
 satisfies them.
 
+`CudaGeodesic.lean` models the optimized CUDA geodesic contractions, proves
+their exact equivalence to the original equations, and retains the `3e-4`
+arithmetic error bound. It also checks the thermal intensity and power/reciprocal
+identities used by the disk optimizations. Its kernel-checked
+`fixtures/cuda-geodesic.sexp` is the oracle for
+`cargo test --test rendering geodesic_rhs_meets_the_proved_bound -- --ignored --nocapture`.
+Regenerate it with `lake env lean --run KernelFixtureGen.lean`. The archived
+WESL/naga fixtures remain checked separately; complete CUDA source/compiler
+correspondence and full metric/plasma rounding bounds remain open obligations.
+
 | Implementation | Lean declarations | What is established |
 | --- | --- | --- |
 | `src/physics.rs`: `kerr_horizon_radius_rg` | `horizon_*` | At zero spin r+ = 2; spin reversal symmetry; 1 ≤ r+ ≤ 2 and Δ(r+) = 0 when a² ≤ 1; shrinking radius as nonnegative spin increases; positive-mass scaling bounds. The specification takes spin after the runtime clamp. |

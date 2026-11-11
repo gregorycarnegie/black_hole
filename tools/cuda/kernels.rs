@@ -1224,7 +1224,8 @@ fn add_kerr(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
     if mass <= 0.0 {
         return m;
     }
-    let a = mass * spin / (spin.length() / 0.999).max(1.0);
+    let inv_spin_scale = 1.0 / (spin.length() / 0.999).max(1.0);
+    let a = mass * spin * inv_spin_scale;
     let a2 = a.dot(a);
     let ax = a.dot(x);
     let raw_r = kerr_radius(x, a);
@@ -1233,28 +1234,27 @@ fn add_kerr(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
     let r = raw_r.max(0.8 * horizon);
     let r2 = r * r;
     let den = r2 * r2 + ax * ax;
-    let h = mass * r * r2 / den;
-    let numerator = r * x - a.cross(x) + (ax / r) * a;
-    let ell = vec4_f_v3(1.0, numerator / (r2 + a2));
+    let inv_r = 1.0 / r;
+    let inv_r2 = 1.0 / r2;
+    let inv_den = 1.0 / den;
+    let inv_r2_a2 = 1.0 / (r2 + a2);
+    let h = mass * r * r2 * inv_den;
+    let numerator = r * x - a.cross(x) + (ax * inv_r) * a;
+    let ell = vec4_f_v3(1.0, numerator * inv_r2_a2);
     let ll = outer(ell, ell);
-    let dr = (r * x + (ax / r) * a) / (2.0 * r2 - x.dot(x) + a2).max(1.0e-12);
-    let mut deriv = [Mat4::default(); 3];
-    let mut j = 0u32;
-    while j < 3 {
-        let mut ej = vec3_splat(0.0);
-        ej[j] = 1.0;
-        let dr_j = dr[j];
-        let a_j = a[j];
-        let dh = h * (3.0 * dr_j / r - (4.0 * r * r2 * dr_j + 2.0 * ax * a_j) / den);
-        let dn = dr_j * x + r * ej - a.cross(ej) + (a_j / r - ax * dr_j / r2) * a;
-        let dl = vec4_f_v3(0.0, (dn - ell.yzw() * 2.0 * r * dr_j) / (r2 + a2));
-        deriv[j as usize] = 2.0 * dh * ll + 2.0 * h * (outer(dl, ell) + outer(ell, dl));
-        j += 1;
-    }
+    let inv_dr = 1.0 / (2.0 * r2 - x.dot(x) + a2).max(1.0e-12);
+    let dr = (r * x + (ax * inv_r) * a) * inv_dr;
+    // Constant axes keep the derivative matrices in registers instead of local memory.
+    let derivative = |ej: Vec3, dr_j: f32, a_j: f32| {
+        let dh = h * (3.0 * dr_j * inv_r - (4.0 * r * r2 * dr_j + 2.0 * ax * a_j) * inv_den);
+        let dn = dr_j * x + r * ej - a.cross(ej) + (a_j * inv_r - ax * dr_j * inv_r2) * a;
+        let dl = vec4_f_v3(0.0, (dn - ell.yzw() * 2.0 * r * dr_j) * inv_r2_a2);
+        2.0 * dh * ll + 2.0 * h * (outer(dl, ell) + outer(ell, dl))
+    };
     m.g += 2.0 * h * ll;
-    m.dx += deriv[0];
-    m.dy += deriv[1];
-    m.dz += deriv[2];
+    m.dx += derivative(vec3(1.0, 0.0, 0.0), dr.x, a.x);
+    m.dy += derivative(vec3(0.0, 1.0, 0.0), dr.y, a.y);
+    m.dz += derivative(vec3(0.0, 0.0, 1.0), dr.z, a.z);
     let raised = m.inv * ell;
     let divisor = 1.0 + 2.0 * h * ell.dot(raised);
     if divisor <= 1.0e-6 {
@@ -1339,18 +1339,26 @@ pub struct Derivs {
 #[cuda_device::device]
 fn geodesic_rhs(ray: Ray, m: Metric) -> Derivs {
     let k = m.inv * ray.p;
-    let dg_k = k.y * m.dx + k.z * m.dy + k.w * m.dz;
-    let dg_f = ray.screen.y * m.dx + ray.screen.z * m.dy + ray.screen.w * m.dz;
+    let dx_k = m.dx * k;
+    let dy_k = m.dy * k;
+    let dz_k = m.dz * k;
+    let dx_f = m.dx * ray.screen;
+    let dy_f = m.dy * ray.screen;
+    let dz_f = m.dz * ray.screen;
     let contracted = vec4(
         0.0,
-        k.dot(m.dx * ray.screen),
-        k.dot(m.dy * ray.screen),
-        k.dot(m.dz * ray.screen),
+        k.dot(dx_f),
+        k.dot(dy_f),
+        k.dot(dz_f),
     );
     Derivs {
         pos: k.yzw(),
-        p: 0.5 * vec4(0.0, k.dot(m.dx * k), k.dot(m.dy * k), k.dot(m.dz * k)),
-        screen: -0.5 * (m.inv * (dg_k * ray.screen + dg_f * k - contracted)),
+        p: 0.5 * vec4(0.0, k.dot(dx_k), k.dot(dy_k), k.dot(dz_k)),
+        screen: -0.5
+            * (m.inv
+                * ((k.y * dx_f + k.z * dy_f + k.w * dz_f)
+                    + (ray.screen.y * dx_k + ray.screen.z * dy_k + ray.screen.w * dz_k)
+                    - contracted)),
     }
 }
 
@@ -1526,7 +1534,7 @@ fn advance_ray(ray: Ray, requested_h: f32, m: Metric, objects: &Objects) -> Adap
 #[cuda_device::device]
 fn screen_frame(ray: Ray, m: Metric) -> Mat3 {
     let k = m.inv * ray.p;
-    let shift = -m.inv[0].yzw() / m.inv[0][0];
+    let shift = -m.inv[0].yzw() * (1.0 / m.inv[0][0]);
     let gamma = spatial_metric(m);
     let n = spatial_unit(k.yzw() + shift * k.x, gamma);
     let f = ray.screen.yzw() - k.yzw() * (ray.screen.x / k.x);
@@ -1579,7 +1587,7 @@ fn sincos(x: f32) -> Vec2 {
 #[cuda_device::device]
 fn faraday_rotation(rho: Vec3, ds: f32) -> Mat3 {
     let w = rho.length();
-    let axis = rho / w.max(1.0e-20);
+    let axis = rho * (1.0 / w.max(1.0e-20));
     let angle = w * ds;
     let sc = sincos(angle);
     let c = sc.y;
@@ -1643,7 +1651,7 @@ fn polarized_cell(j: Vec4, alpha: f32, rho: Vec3, ds: f32) -> Vec4 {
     if w * ds < 1.0e-5 {
         return j * integral;
     }
-    let axis = rho / w;
+    let axis = rho * (1.0 / w);
     let parallel = axis * axis.dot(j.yzw());
     let perpendicular = j.yzw() - parallel;
     let rotated = ds * transfer_phi(vec2(alpha * ds, -w * ds));
@@ -1869,7 +1877,7 @@ fn projected_evpa(bx: f32, by: f32) -> Vec2 {
 }
 
 #[cuda_device::device]
-fn sample_plasma(ray: Ray, m: Metric, cam: &Camera, disk: &Disk) -> Plasma {
+fn sample_plasma(ray: Ray, objects: &Objects, cam: &Camera, disk: &Disk) -> Plasma {
     let mut plasma = Plasma::default();
     let r = disk_radius(ray.pos, disk.spin, disk.binary_enabled != 0);
     if r <= disk.r1 || r >= disk.r2 {
@@ -1881,9 +1889,10 @@ fn sample_plasma(ray: Ray, m: Metric, cam: &Camera, disk: &Disk) -> Plasma {
     if z.abs() >= 4.0 {
         return plasma;
     }
+    let m = scene_metric(ray.pos, objects);
     let density = 0.4 * exp(-0.5 * z * z) * disk_edge_fade(r, disk) / height;
     let k = m.inv * ray.p;
-    let omega = sub_keplerian_factor(h_r) / (pow(r, 1.5) + disk.spin).max(1.0e-3);
+    let omega = sub_keplerian_factor(h_r) / (r * sqrt(r) + disk.spin).max(1.0e-3);
     let tangent = vec3(ray.pos.z, 0.0, -ray.pos.x);
     let mut fluid = vec4_f_v3(1.0, omega * tangent);
     let norm = fluid.dot(m.g * fluid);
@@ -1895,6 +1904,13 @@ fn sample_plasma(ray: Ray, m: Metric, cam: &Camera, disk: &Disk) -> Plasma {
     }
     plasma.energy = ray.p.dot(fluid).max(1.0e-5);
     let redshift = clamp_f32(1.0 / plasma.energy, 0.01, 20.0);
+    let boost = redshift * redshift * redshift;
+    plasma.alpha = 0.7 * density;
+    // Thermal intensity does not depend on the magnetic field or polarization frame.
+    if cam.polarization_view == 0 && disk.model != 1 {
+        plasma.rgb = density * boost * blackbody_color(nt_temp(r, disk) / 0.488);
+        return plasma;
+    }
     let freq_ratio = 230.0 / (cam.frequency_ghz / redshift).max(1.0);
     let frame = screen_frame(ray, m);
     let mut e1 = vec4_f_v3(0.0, frame[0]);
@@ -1906,9 +1922,7 @@ fn sample_plasma(ray: Ray, m: Metric, cam: &Camera, disk: &Disk) -> Plasma {
     b *= inverse_sqrt(b.dot(m.g * b).max(1.0e-12));
     let bx = b.dot(m.g * e1);
     let by = b.dot(m.g * e2);
-    let bparallel = -b.dot(m.g * k) / plasma.energy;
     let perpendicular2 = clamp_f32(bx * bx + by * by, 0.0, 1.0);
-    let evpa = projected_evpa(bx, by);
     let mut hot = 0.0;
     if disk.model == 1 {
         hot = 0.5
@@ -1917,15 +1931,19 @@ fn sample_plasma(ray: Ray, m: Metric, cam: &Camera, disk: &Disk) -> Plasma {
     let thermal = (1.0 - hot) * blackbody_color(nt_temp(r, disk) / 0.488);
     let synch =
         hot * hot_emissivity_t(r, disk) * perpendicular2 * freq_ratio * vec3(1.0, 0.65, 0.3);
-    let boost = redshift * redshift * redshift;
     plasma.rgb = density * boost * (thermal + synch);
+    if cam.polarization_view == 0 {
+        return plasma;
+    }
+    let evpa = projected_evpa(bx, by);
+    let bparallel = -b.dot(m.g * k) / plasma.energy;
     let luma = vec3(0.2126, 0.7152, 0.0722);
     let intensity = plasma.rgb.dot(luma);
     let synch_i = density * boost * synch.dot(luma);
     plasma.j = vec4_f_v2_f(intensity, 0.75 * synch_i * evpa, 0.0);
-    plasma.alpha = 0.7 * density;
     let rotation = 2.0 * cam.faraday_depth * density * bparallel * freq_ratio * freq_ratio;
-    let conversion = cam.conversion_depth * density * perpendicular2 * pow(freq_ratio, 3.0);
+    let conversion = cam.conversion_depth * density * perpendicular2
+        * (freq_ratio * freq_ratio * freq_ratio);
     plasma.rho = vec3_v2_f(conversion * evpa, rotation);
     plasma
 }
@@ -2020,6 +2038,7 @@ pub unsafe fn bh_geodesic(
     let mut transmission = 1.0_f32;
     let mut foreground = faraday_rotation(vec3_splat(0.0), 0.0);
     let mut iterations = 0u32;
+    let mut affine = 0.0_f32;
     let mut next_h = 1.0e8_f32;
     let mut i = 0u32;
     while i < cam.max_iter {
@@ -2030,9 +2049,9 @@ pub unsafe fn bh_geodesic(
         let velocity = (metric.inv * ray.p).yzw();
         let mut distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
         let radius = disk_radius(ray.pos, disk.spin, disk.binary_enabled != 0);
-        let r_clamped = radius.max(disk.r1);
-        let height_d = (get_h_over_r(r_clamped, disk) * r_clamped).max(0.001);
         if radius > disk.r1 - distance && radius < disk.r2 + distance {
+            let r_clamped = radius.max(disk.r1);
+            let height_d = (get_h_over_r(r_clamped, disk) * r_clamped).max(0.001);
             let mid = disk_midplane_y(radius.max(0.001), ray.pos.xz(), disk);
             let to_disk = ((ray.pos.y - mid).abs() - 4.0 * height_d).max(0.0);
             distance = distance.min((0.25 * height_d).max(0.5 * to_disk));
@@ -2043,9 +2062,11 @@ pub unsafe fn bh_geodesic(
             metric,
             objects,
         );
-        if !step.accepted {
+        // Stop when the affine parameter can no longer advance in binary32.
+        if !step.accepted || affine + step.h == affine {
             break;
         }
+        affine += step.h;
         let h = step.h;
         let next = step.ray;
         let next_metric = scene_metric(next.pos, objects);
@@ -2062,13 +2083,15 @@ pub unsafe fn bh_geodesic(
             p: 0.5 * (ray.p + next.p),
             screen: 0.5 * (ray.screen + next.screen),
         };
-        let plasma = sample_plasma(middle, scene_metric(middle.pos, objects), cam, disk);
+        let plasma = sample_plasma(middle, objects, cam, disk);
         let ds = h * plasma.energy;
         if ds > 0.0 {
-            let cell = polarized_cell(plasma.j, plasma.alpha, plasma.rho, ds);
-            stokes += transmission * vec4_f_v3(cell.x, foreground * cell.yzw());
+            if cam.polarization_view != 0 {
+                let cell = polarized_cell(plasma.j, plasma.alpha, plasma.rho, ds);
+                stokes += transmission * vec4_f_v3(cell.x, foreground * cell.yzw());
+                foreground = foreground * faraday_rotation(plasma.rho, ds);
+            }
             rgb += transmission * plasma.rgb * absorption_integral(plasma.alpha, ds);
-            foreground = foreground * faraday_rotation(plasma.rho, ds);
             transmission *= exp(-plasma.alpha * ds);
         }
         ray = next;
@@ -2307,7 +2330,7 @@ pub unsafe fn bh_check_relativity(
     checks: *mut f32,
 ) {
     let i = gid_x();
-    if i >= 35 {
+    if i >= 36 {
         return;
     }
     let cam = unsafe { &*cam };
@@ -2430,6 +2453,34 @@ pub unsafe fn bh_check_relativity(
                 *checks.add(base + 11) = elapsed;
             }
             passed = valid && elapsed == 40.0;
+        }
+        if i == 35 {
+            let mut intensity_cam = *cam;
+            intensity_cam.polarization_view = 0;
+            intensity_cam.frequency_ghz = 230.0;
+            let mut polarized_cam = intensity_cam;
+            polarized_cam.polarization_view = 1;
+            let mut disk = Disk {
+                r1: 6.0, r2: 30.0, h_thin: 0.03, h_hot: 0.5,
+                spin: 0.3, horizon_r: 2.0, isco_r: 6.0, r_trunc: 20.0,
+                tilt_deg: 30.0, r_bp: 6.0, twist_deg: 15.0,
+                model: 0, binary_enabled: 0, _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
+            };
+            passed = true;
+            while disk.model < 4 {
+                let mut pos = vec3(12.0, 0.0, 2.0);
+                let r = disk_radius(pos, disk.spin, false);
+                pos.y = disk_midplane_y(r, pos.xz(), &disk)
+                    + 0.1 * get_h_over_r(r, &disk) * r;
+                let ray = init_ray(pos, vec3(0.0, -1.0, 0.0),
+                    scene_metric(pos, objects), &intensity_cam);
+                let fast = sample_plasma(ray, objects, &intensity_cam, &disk);
+                let full = sample_plasma(ray, objects, &polarized_cam, &disk);
+                passed = passed && fast.energy == full.energy && fast.alpha == full.alpha
+                    && full.rgb.length() > 0.0
+                    && (fast.rgb - full.rgb).length() <= 1.0e-6 * full.rgb.length().max(1.0);
+                disk.model += 1;
+            }
         }
         unsafe { *checks.add((100 + i - 29) as usize) = if passed { 1.0 } else { 0.0 } };
         return;
@@ -2748,7 +2799,7 @@ pub unsafe fn bh_test_energy(
             ray = step.ray;
             metric = scene_metric(ray.pos, objects);
             ray.screen = vec4_f_v3(0.0, screen_frame(ray, metric)[0]);
-            let plasma = sample_plasma(ray, metric, cam, disk);
+            let plasma = sample_plasma(ray, objects, cam, disk);
             if plasma.alpha > 0.0 {
                 low = low.min(plasma.energy);
                 high = high.max(plasma.energy);

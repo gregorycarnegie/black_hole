@@ -1,8 +1,8 @@
 //! Production `geodesic_rhs` on the GPU against the proved bound
-//! `WgslGeodesic.geodesic_rhs_exact_inputs`: every output is within
+//! `CudaGeodesic.geodesic_rhs_exact_inputs`: every output is within
 //! `3·10⁻⁴` of the exact value, relative to the absolute evaluation of its
 //! program. The exact value and absolute evaluation come from the Lean
-//! fixture (`verification/fixtures/kernels.sexp`), not a transcription. This
+//! fixture (`verification/fixtures/cuda-geodesic.sexp`), not a transcription. This
 //! exercises the driver and hardware, which no proof here covers (F4).
 
 /// Unit roundoff `u` and flush-to-zero `η` of the WGSL model; `U = 5u`.
@@ -56,7 +56,7 @@ fn eval(tokens: &[&str], pos: &mut usize, v: &[f64]) -> (f64, f64) {
 #[test]
 #[ignore = "requires a GPU; run with --release -- --ignored"]
 fn geodesic_rhs_meets_the_proved_bound() {
-    let fixture = include_str!("../../verification/fixtures/kernels.sexp");
+    let fixture = include_str!("../../verification/fixtures/cuda-geodesic.sexp");
     let lines: Vec<String> = fixture
         .lines()
         .filter(|l| l.starts_with("geodesic_rhs "))
