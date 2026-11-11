@@ -1,4 +1,3 @@
-use bevy::render::render_resource::BufferUsages;
 use std::path::Path;
 
 #[test]
@@ -32,25 +31,16 @@ fn headless_snapshot_image() {
     objects[..4].copy_from_slice(&1i32.to_le_bytes());
     objects[528..532].copy_from_slice(&1f32.to_le_bytes());
     objects[788..792].copy_from_slice(&0.9375f32.to_le_bytes());
-    let data = crate::gpu::run_groups(
-        include_str!("../image.wesl"),
-        "render_snapshot",
-        &[
-            &[(3, &objects, BufferUsages::UNIFORM)],
-            &[
-                (0, &header, BufferUsages::UNIFORM),
-                (1, &grids[0], BufferUsages::STORAGE),
-                (2, &grids[1], BufferUsages::STORAGE),
-                (3, &grids[2], BufferUsages::STORAGE),
-            ],
-            &[(0, &table, BufferUsages::STORAGE)],
-            &[
-                (0, &seeds, BufferUsages::STORAGE),
-                (1, &settings, BufferUsages::UNIFORM),
-            ],
-        ],
-        (count * 64) as u64,
-        (count as u32).div_ceil(32),
+    let data = crate::gpu::image(
+        &objects,
+        &header,
+        &grids[0],
+        &grids[1],
+        &grids[2],
+        &table,
+        &seeds,
+        &settings,
+        count as u32,
     );
     std::fs::write(root.join("image-gpu.f32"), &data).unwrap();
     let values: &[f32] = bytemuck::cast_slice(&data);

@@ -2,10 +2,8 @@
 //! (`WgslSinCos.sincos_error`) is 128 u (1 + |x|) for |x| ≤ 2^18 under the
 //! WGSL accuracy model; every finite input stays within [-1.01, 1.01].
 
-use bevy::render::render_resource::BufferUsages;
-
 #[test]
-#[ignore = "requires a GPU (lavapipe works); run with --release -- --ignored"]
+#[ignore = "requires a GPU; run with --release -- --ignored"]
 fn sincos_meets_the_wgsl_bound() {
     const UNIT: f64 = 1.0 / 16_777_216.0;
     let mut angles: Vec<f32> = Vec::new();
@@ -25,18 +23,11 @@ fn sincos_meets_the_wgsl_bound() {
         angles.extend([edge, f32::from_bits(edge.to_bits() + 1), f32::from_bits(edge.to_bits() - 1)]);
     }
     angles.extend([f32::MAX, -f32::MAX, f32::MIN_POSITIVE, 0.0, -0.0]);
-    let input: Vec<u8> = angles.iter().flat_map(|a| a.to_le_bytes()).collect();
-    let data = crate::gpu::run_groups(
-        include_str!("../sincos.wesl"),
-        "evaluate",
-        &[&[(0, &input, BufferUsages::STORAGE)]],
-        (angles.len() * 8) as u64,
-        (angles.len() as u32).div_ceil(64),
-    );
-    let values: &[f32] = bytemuck::cast_slice(&data);
+    let values = crate::gpu::sincos(&angles);
     let mut worst = 0.0_f64;
     for (n, &a) in angles.iter().enumerate() {
-        let (s, c) = (f64::from(values[2 * n]), f64::from(values[2 * n + 1]));
+        let [s_f32, c_f32] = values[n];
+        let (s, c) = (f64::from(s_f32), f64::from(c_f32));
         assert!(s.abs() <= 1.01 && c.abs() <= 1.01, "unbounded sincos({a}) = ({s}, {c})");
         let x = f64::from(a);
         if x.abs() <= 262_144.0 {

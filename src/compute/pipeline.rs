@@ -1,29 +1,21 @@
-use std::borrow::Cow;
-
 use bevy::{
     ecs::system::SystemParam,
     prelude::*,
-    render::{
-        render_asset::RenderAssets,
-        render_resource::{
-            binding_types::{texture_2d, texture_storage_2d, uniform_buffer_sized},
-            *,
-        },
-        renderer::{RenderContext, RenderDevice, RenderQueue},
-        texture::GpuImage,
-    },
-    shader::ShaderCacheError,
+    render::{render_asset::RenderAssets, texture::GpuImage},
 };
 use bytemuck::Zeroable;
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
-use super::{CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform, SkyboxImage};
+use super::{
+    CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform, SkyboxData, cuda::shared_cuda,
+};
 use crate::simulation::{
     BINARY_DISK_INNER_RS, SCHWARZSCHILD_RADIUS, kerr_horizon_radius, kerr_isco_radius,
 };
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
 
-/// Matches the Camera uniform in geodesic.wesl (std140, 112 bytes).
+/// Matches `GpuCameraUniform` in `tools/cuda/kernels.rs` (112 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuCameraUniform {
@@ -49,7 +41,7 @@ struct GpuCameraUniform {
     _pad7: f32,
 }
 
-/// Matches the Disk uniform in geodesic.wesl (std140, 64 bytes).
+/// Matches `GpuDiskUniform` in `tools/cuda/kernels.rs` (64 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuDiskUniform {
@@ -71,8 +63,7 @@ struct GpuDiskUniform {
     _pad2: f32,
 }
 
-/// Matches the Objects uniform in geodesic.wesl.
-/// std140 pads f32 array elements to 16 bytes → use [f32;4].
+/// Matches `GpuObjectsUniform` in `tools/cuda/kernels.rs`.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuObjectsUniform {
@@ -88,83 +79,39 @@ struct GpuObjectsUniform {
 
 #[derive(Resource)]
 pub struct GeodesicPipeline {
-    layout: BindGroupLayoutDescriptor,
-    pipeline_id: CachedComputePipelineId,
-    camera_buf: Buffer,
-    disk_buf: Buffer,
-    objects_buf: Buffer,
-    /// Handles of textures currently bound in the active GeodesicBindGroup.
-    /// `None` until the first bind group is successfully created.
+    camera_buf: CudaSlice<u8>,
+    disk_buf: CudaSlice<u8>,
+    objects_buf: CudaSlice<u8>,
+    pub(super) geodesic_buf: CudaSlice<f32>,
+    skybox_buf: CudaSlice<u8>,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    sky_width: u32,
+    sky_height: u32,
     bound_geo_handle: Option<Handle<Image>>,
     bound_sky_handle: Option<Handle<Image>>,
-    /// Last values written to the GPU buffers; skip write when unchanged.
     last_objects: Option<GpuObjectsUniform>,
     last_disk: Option<GpuDiskUniform>,
 }
 
-pub fn init_geodesic_pipeline(
-    mut commands: Commands,
-    device: Res<RenderDevice>,
-    asset_server: Res<AssetServer>,
-    pipeline_cache: Res<PipelineCache>,
-) {
-    let layout = BindGroupLayoutDescriptor::new(
-        "geodesic_layout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                // binding 0 – output storage texture (write-only RGBA8)
-                texture_storage_2d(TextureFormat::Rgba8Unorm, StorageTextureAccess::WriteOnly),
-                // binding 1 – camera uniform (112 bytes)
-                uniform_buffer_sized(false, Some(GpuCameraUniform::SIZE)),
-                // binding 2 – disk/Kerr uniform
-                uniform_buffer_sized(false, Some(GpuDiskUniform::SIZE)),
-                // binding 3 – objects uniform
-                uniform_buffer_sized(false, Some(GpuObjectsUniform::SIZE)),
-                // binding 4 – skybox HDR (sampled via textureLoad, no filtering)
-                texture_2d(TextureSampleType::Float { filterable: false }),
-            ),
-        ),
-    );
-
-    let camera_buf = device.create_buffer(&BufferDescriptor {
-        label: Some("camera_buf"),
-        size: GpuCameraUniform::SIZE.get(),
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let disk_buf = device.create_buffer(&BufferDescriptor {
-        label: Some("disk_buf"),
-        size: GpuDiskUniform::SIZE.get(),
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let objects_buf = device.create_buffer(&BufferDescriptor {
-        label: Some("objects_buf"),
-        size: GpuObjectsUniform::SIZE.get(),
-        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let pipeline_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some(Cow::Borrowed("geodesic_pipeline")),
-        layout: vec![layout.clone()],
-        immediate_size: 0,
-        shader: asset_server.load("shaders/geodesic.wesl"),
-        shader_defs: vec![],
-        entry_point: Some(Cow::Borrowed("main")),
-        zero_initialize_workgroup_memory: false,
-        constants: vec![],
-    });
+pub fn init_geodesic_pipeline(mut commands: Commands) {
+    let cuda = shared_cuda();
+    let camera_buf = cuda.alloc_zeros::<u8>(std::mem::size_of::<GpuCameraUniform>());
+    let disk_buf = cuda.alloc_zeros::<u8>(std::mem::size_of::<GpuDiskUniform>());
+    let objects_buf = cuda.alloc_zeros::<u8>(std::mem::size_of::<GpuObjectsUniform>());
+    let geodesic_buf = cuda.alloc_zeros::<f32>(4);
+    let skybox_buf = cuda.alloc_zeros::<u8>(16);
 
     commands.insert_resource(GeodesicPipeline {
-        layout,
-        pipeline_id,
         camera_buf,
         disk_buf,
         objects_buf,
+        geodesic_buf,
+        skybox_buf,
+        width: 0,
+        height: 0,
+        sky_width: 0,
+        sky_height: 0,
         bound_geo_handle: None,
         bound_sky_handle: None,
         last_objects: None,
@@ -201,32 +148,6 @@ fn build_disk_uniform(cfg: &DiskConfigUniform) -> GpuDiskUniform {
     }
 }
 
-// ── Bind group size helpers ──────────────────────────────────────────────────
-
-trait GpuSize {
-    const SIZE: std::num::NonZeroU64;
-}
-
-impl GpuSize for GpuCameraUniform {
-    const SIZE: std::num::NonZeroU64 =
-        std::num::NonZeroU64::new(std::mem::size_of::<Self>() as u64).unwrap();
-}
-
-impl GpuSize for GpuDiskUniform {
-    const SIZE: std::num::NonZeroU64 =
-        std::num::NonZeroU64::new(std::mem::size_of::<Self>() as u64).unwrap();
-}
-
-impl GpuSize for GpuObjectsUniform {
-    const SIZE: std::num::NonZeroU64 =
-        std::num::NonZeroU64::new(std::mem::size_of::<Self>() as u64).unwrap();
-}
-
-// ── Bind group ───────────────────────────────────────────────────────────────
-
-#[derive(Resource)]
-pub struct GeodesicBindGroup(pub BindGroup);
-
 #[derive(SystemParam)]
 pub struct GeodesicSources<'w> {
     pipeline: Option<ResMut<'w, GeodesicPipeline>>,
@@ -234,36 +155,30 @@ pub struct GeodesicSources<'w> {
     camera_uniform: Option<Res<'w, CameraUniform>>,
     objects_uniform: Option<Res<'w, ObjectsUniform>>,
     disk_config: Option<Res<'w, DiskConfigUniform>>,
-    skybox: Option<Res<'w, SkyboxImage>>,
+    skybox_data: Option<Res<'w, SkyboxData>>,
 }
 
-#[derive(SystemParam)]
-pub struct RenderGpu<'w> {
-    gpu_images: Res<'w, RenderAssets<GpuImage>>,
-    device: Res<'w, RenderDevice>,
-    queue: Res<'w, RenderQueue>,
-    pipeline_cache: Res<'w, PipelineCache>,
-}
-
-pub fn prepare_bind_group(mut commands: Commands, sources: GeodesicSources, gpu: RenderGpu) {
+pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets<GpuImage>>) {
     let (
         Some(mut pipeline),
         Some(geodesic_image),
         Some(camera_uniform),
         Some(objects_uniform),
         Some(disk_config),
-        Some(skybox),
+        Some(skybox_data),
     ) = (
         sources.pipeline,
         sources.geodesic_image,
         sources.camera_uniform,
         sources.objects_uniform,
         sources.disk_config,
-        sources.skybox,
+        sources.skybox_data,
     )
     else {
         return;
     };
+
+    let cuda = shared_cuda();
 
     // Camera changes every still frame (jitter) — always write.
     let gpu_cam = GpuCameraUniform {
@@ -288,8 +203,7 @@ pub fn prepare_bind_group(mut commands: Commands, sources: GeodesicSources, gpu:
         conversion_depth: camera_uniform.conversion_depth,
         _pad7: 0.0,
     };
-    gpu.queue
-        .write_buffer(&pipeline.camera_buf, 0, bytemuck::bytes_of(&gpu_cam));
+    cuda.memcpy_htod(bytemuck::bytes_of(&gpu_cam), &mut pipeline.camera_buf);
 
     // Objects buffer — write only when data actually changed.
     let mut gpu_objs = GpuObjectsUniform::zeroed();
@@ -299,107 +213,102 @@ pub fn prepare_bind_group(mut commands: Commands, sources: GeodesicSources, gpu:
     gpu_objs.mass = objects_uniform.mass;
     gpu_objs.spin = objects_uniform.spin;
     if pipeline.last_objects != Some(gpu_objs) {
-        gpu.queue
-            .write_buffer(&pipeline.objects_buf, 0, bytemuck::bytes_of(&gpu_objs));
+        cuda.memcpy_htod(bytemuck::bytes_of(&gpu_objs), &mut pipeline.objects_buf);
         pipeline.last_objects = Some(gpu_objs);
     }
 
     // Disk/Kerr buffer — write only when any disk parameter changed.
     let gpu_disk = build_disk_uniform(&disk_config);
     if pipeline.last_disk != Some(gpu_disk) {
-        gpu.queue
-            .write_buffer(&pipeline.disk_buf, 0, bytemuck::bytes_of(&gpu_disk));
+        cuda.memcpy_htod(bytemuck::bytes_of(&gpu_disk), &mut pipeline.disk_buf);
         pipeline.last_disk = Some(gpu_disk);
     }
 
-    // Bind group — recreate only when output texture or skybox handle changes.
-    let geo_changed = pipeline.bound_geo_handle.as_ref() != Some(&geodesic_image.0);
-    let sky_changed = pipeline.bound_sky_handle.as_ref() != Some(&skybox.0);
-    if !geo_changed && !sky_changed {
-        return;
+    // Output geodesic buffer — reallocate when handle or resolution changes.
+    if let Some(gpu_image) = gpu_images.get(&geodesic_image.0) {
+        let w = gpu_image.texture_descriptor.size.width;
+        let h = gpu_image.texture_descriptor.size.height;
+        if pipeline.bound_geo_handle.as_ref() != Some(&geodesic_image.0)
+            || pipeline.width != w
+            || pipeline.height != h
+        {
+            pipeline.geodesic_buf = cuda.alloc_zeros::<f32>((w as usize) * (h as usize) * 4);
+            pipeline.width = w;
+            pipeline.height = h;
+            pipeline.bound_geo_handle = Some(geodesic_image.0.clone());
+        }
     }
 
-    let (Some(gpu_image), Some(skybox_gpu)) = (
-        gpu.gpu_images.get(&geodesic_image.0),
-        gpu.gpu_images.get(&skybox.0),
-    ) else {
-        return; // GPU textures not yet uploaded; retry next frame.
-    };
-
-    let layout = gpu.pipeline_cache.get_bind_group_layout(&pipeline.layout);
-    let bind_group = gpu.device.create_bind_group(
-        None,
-        &layout,
-        &BindGroupEntries::sequential((
-            &gpu_image.texture_view,
-            pipeline.camera_buf.as_entire_binding(),
-            pipeline.disk_buf.as_entire_binding(),
-            pipeline.objects_buf.as_entire_binding(),
-            &skybox_gpu.texture_view,
-        )),
-    );
-
-    commands.insert_resource(GeodesicBindGroup(bind_group));
-    pipeline.bound_geo_handle = Some(geodesic_image.0.clone());
-    pipeline.bound_sky_handle = Some(skybox.0.clone());
+    // Skybox buffer — upload when active skybox data is ready and changed.
+    if pipeline.bound_sky_handle != skybox_data.handle
+        && skybox_data.width > 0
+        && skybox_data.height > 0
+        && !skybox_data.bytes.is_empty()
+    {
+        pipeline.skybox_buf = cuda.clone_htod(&skybox_data.bytes);
+        pipeline.sky_width = skybox_data.width;
+        pipeline.sky_height = skybox_data.height;
+        pipeline.bound_sky_handle = skybox_data.handle.clone();
+    }
 }
 
 // ── Render graph node ────────────────────────────────────────────────────────
 
-pub fn dispatch_geodesic(
-    mut render_context: RenderContext,
-    pipeline: Option<Res<GeodesicPipeline>>,
-    group: Option<Res<GeodesicBindGroup>>,
-    image: Option<Res<GeodesicImage>>,
-    images: Res<RenderAssets<GpuImage>>,
-    cache: Res<PipelineCache>,
-) {
-    let (Some(pipeline), Some(group), Some(image)) = (pipeline, group, image) else {
+pub fn dispatch_geodesic(pipeline: Option<ResMut<GeodesicPipeline>>) {
+    let Some(mut pipeline) = pipeline else {
         return;
     };
-    if let CachedPipelineState::Err(err) = cache.get_compute_pipeline_state(pipeline.pipeline_id)
-        && !matches!(err, ShaderCacheError::ShaderNotLoaded(_))
+    if pipeline.width == 0
+        || pipeline.height == 0
+        || pipeline.sky_width == 0
+        || pipeline.sky_height == 0
     {
-        panic!("geodesic shader error: {err}");
-    }
-    let (Some(compute), Some(image)) = (
-        cache.get_compute_pipeline(pipeline.pipeline_id),
-        images.get(&image.0),
-    ) else {
         return;
+    }
+
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+
+    let GeodesicPipeline {
+        ref camera_buf,
+        ref disk_buf,
+        ref objects_buf,
+        ref mut geodesic_buf,
+        ref skybox_buf,
+        width,
+        height,
+        sky_width,
+        sky_height,
+        ..
+    } = *pipeline;
+
+    let cfg = LaunchConfig {
+        grid_dim: (width.div_ceil(16), height.div_ceil(16), 1),
+        block_dim: (16, 16, 1),
+        shared_mem_bytes: 0,
     };
-    let mut pass = render_context
-        .command_encoder()
-        .begin_compute_pass(&ComputePassDescriptor::default());
-    pass.set_bind_group(0, &group.0, &[]);
-    pass.set_pipeline(compute);
-    pass.dispatch_workgroups(
-        image.texture_descriptor.size.width.div_ceil(16),
-        image.texture_descriptor.size.height.div_ceil(16),
-        1,
-    );
+    let mut builder = cuda.stream.launch_builder(&cuda.geodesic);
+    builder.arg(geodesic_buf);
+    builder.arg(camera_buf);
+    builder.arg(disk_buf);
+    builder.arg(objects_buf);
+    builder.arg(skybox_buf);
+    builder.arg(&width);
+    builder.arg(&height);
+    builder.arg(&sky_width);
+    builder.arg(&sky_height);
+    unsafe {
+        builder
+            .launch(cfg)
+            .expect("CUDA bh_geodesic kernel launch failed");
+    }
 }
 
 #[cfg(test)]
-#[path = "../../tests/common/mod.rs"]
-mod test_shaders;
+pub(super) fn check_relativity() {
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
 
-#[cfg(test)]
-pub(super) fn check_relativity(device: &RenderDevice, queue: &RenderQueue) {
-    const RESULT_BYTES: u64 = 124 * 4;
-    let source = test_shaders::compile_wesl(test_shaders::GEODESIC_WITH_CHECKS);
-    let shader = device.create_and_validate_shader_module(ShaderModuleDescriptor {
-        label: Some("physics checks"),
-        source: ShaderSource::Wgsl(source.into()),
-    });
-    let pipeline = device.create_compute_pipeline(&RawComputePipelineDescriptor {
-        label: Some("physics checks"),
-        layout: None,
-        module: &shader,
-        entry_point: Some("check_physics"),
-        compilation_options: default(),
-        cache: None,
-    });
     let camera = GpuCameraUniform {
         right: [1.0, 0.0, 0.0],
         up: [0.0, 1.0, 0.0],
@@ -409,95 +318,43 @@ pub(super) fn check_relativity(device: &RenderDevice, queue: &RenderQueue) {
     let mut objects = GpuObjectsUniform::zeroed();
     objects.num_objects = 1;
     objects.mass[0][0] = 1.0;
-    let camera_buf = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::bytes_of(&camera),
-        usage: BufferUsages::UNIFORM,
-    });
-    let objects_buf = device.create_buffer_with_data(&BufferInitDescriptor {
-        label: None,
-        contents: bytemuck::bytes_of(&objects),
-        usage: BufferUsages::UNIFORM,
-    });
-    let uniform_group = device.create_bind_group(
-        None,
-        &pipeline.get_bind_group_layout(0).into(),
-        &[
-            BindGroupEntry {
-                binding: 1,
-                resource: camera_buf.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 3,
-                resource: objects_buf.as_entire_binding(),
-            },
-        ],
-    );
-    let results = device.create_buffer(&BufferDescriptor {
-        label: None,
-        size: RESULT_BYTES,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let readback = device.create_buffer(&BufferDescriptor {
-        label: None,
-        size: RESULT_BYTES,
-        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let result_group = device.create_bind_group(
-        None,
-        &pipeline.get_bind_group_layout(1).into(),
-        &BindGroupEntries::single(results.as_entire_binding()),
-    );
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &uniform_group, &[]);
-        pass.set_bind_group(1, &result_group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
+
+    let d_cam = cuda.clone_htod(bytemuck::bytes_of(&camera));
+    let d_obj = cuda.clone_htod(bytemuck::bytes_of(&objects));
+    let mut d_results = cuda.alloc_zeros::<f32>(124);
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = cuda.stream.launch_builder(&cuda.check_relativity);
+    builder.arg(&d_cam);
+    builder.arg(&d_obj);
+    builder.arg(&mut d_results);
+    unsafe {
+        builder
+            .launch(cfg)
+            .expect("CUDA bh_check_relativity kernel launch failed");
     }
-    encoder.copy_buffer_to_buffer(&results, 0, &readback, 0, RESULT_BYTES);
-    queue.submit([encoder.finish()]);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    readback
-        .slice(..)
-        .map_async(MapMode::Read, move |result| sender.send(result).unwrap());
-    device
-        .poll(PollType::Wait {
-            submission_index: None,
-            timeout: Some(std::time::Duration::from_secs(30)),
-        })
-        .unwrap();
-    receiver
-        .recv_timeout(std::time::Duration::from_secs(30))
-        .unwrap()
-        .unwrap();
-    let data = readback.slice(..).get_mapped_range().unwrap();
-    for (i, value) in bytemuck::cast_slice::<u8, f32>(&data)
-        .iter()
-        .take(24)
-        .enumerate()
-    {
+
+    let data = cuda.clone_dtoh(&d_results);
+    for (i, value) in data.iter().take(24).enumerate() {
         assert_eq!(
             *value,
             1.0,
-            "WESL physics check {i} failed (tests/relativity.wesl); capture/escape diagnostics: {:?}",
-            &bytemuck::cast_slice::<u8, f32>(&data)[24..40]
+            "CUDA physics check {i} failed (tools/cuda/kernels.rs); capture/escape diagnostics: {:?}",
+            &data[24..40]
         );
     }
-    for (i, value) in bytemuck::cast_slice::<u8, f32>(&data)[100..106]
-        .iter()
-        .enumerate()
-    {
+    for (i, value) in data[100..106].iter().enumerate() {
         assert_eq!(
             *value,
             1.0,
-            "adaptive WESL physics check {i} failed; statuses: {:?}; trajectory: {:?}",
-            &bytemuck::cast_slice::<u8, f32>(&data)[100..106],
-            &bytemuck::cast_slice::<u8, f32>(&data)[112..124]
+            "adaptive CUDA physics check {i} failed; statuses: {:?}; trajectory: {:?}",
+            &data[100..106],
+            &data[112..124]
         );
     }
-    super::verification::check_convergence(bytemuck::cast_slice(&data));
+    super::verification::check_convergence(&data);
 }

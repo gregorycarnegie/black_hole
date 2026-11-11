@@ -12,8 +12,6 @@
 //!   targets allow (`2 εx |p|∞ + 2 |x|∞ εp + 2 εx εp`) is too large for it to
 //!   certify a failure on these rays.
 
-use bevy::render::render_resource::BufferUsages;
-
 const MASS: f64 = 1.0;
 
 /// Inverse Kerr–Schild Schwarzschild metric `η - (2M/r) l l` with
@@ -82,7 +80,7 @@ fn max_abs(v: &[f64]) -> f64 {
 }
 
 #[test]
-#[ignore = "requires a GPU (lavapipe works); run with --release -- --ignored"]
+#[ignore = "requires a GPU; run with --release -- --ignored"]
 fn adaptive_controller_misses_trajectory_targets() {
     // (impact parameter, affine span): a wide deflection, two near-critical
     // passes around the photon sphere, and a direct long ray.
@@ -96,17 +94,7 @@ fn adaptive_controller_misses_trajectory_targets() {
     let mut objects = vec![0u8; 1040];
     objects[..4].copy_from_slice(&1i32.to_le_bytes());
     objects[528..532].copy_from_slice(&1f32.to_le_bytes());
-    let data = crate::gpu::run_groups(
-        include_str!("../controller.wesl"),
-        "trace",
-        &[
-            &[(3, &objects, BufferUsages::UNIFORM)],
-            &[(0, &input, BufferUsages::STORAGE)],
-        ],
-        (cases.len() * 64) as u64,
-        cases.len() as u32,
-    );
-    let values: &[f32] = bytemuck::cast_slice(&data);
+    let values = crate::gpu::controller_trace(&objects, &input, cases.len() as u32);
     let mut failures = 0;
     for (n, (impact, _)) in cases.iter().enumerate() {
         let v: Vec<f64> = values[16 * n..16 * n + 16].iter().map(|&x| f64::from(x)).collect();
@@ -158,7 +146,7 @@ fn adaptive_controller_misses_trajectory_targets() {
 /// `b = |L|/E` versus `3√3 M`). The renderer's rules must never return the
 /// opposite class; critical rays may only end unresolved.
 #[test]
-#[ignore = "requires a GPU (lavapipe works); run with --release -- --ignored"]
+#[ignore = "requires a GPU; run with --release -- --ignored"]
 fn classification_against_the_critical_impact_parameter() {
     let critical = 27.0_f64.sqrt() * MASS;
     let run = |impacts: &[f32]| {
@@ -171,17 +159,7 @@ fn classification_against_the_critical_impact_parameter() {
         let mut objects = vec![0u8; 1040];
         objects[..4].copy_from_slice(&1i32.to_le_bytes());
         objects[528..532].copy_from_slice(&1f32.to_le_bytes());
-        let data = crate::gpu::run_groups(
-            include_str!("../controller.wesl"),
-            "classify",
-            &[
-                &[(3, &objects, BufferUsages::UNIFORM)],
-                &[(0, &input, BufferUsages::STORAGE)],
-            ],
-            (impacts.len() * 64) as u64,
-            impacts.len() as u32,
-        );
-        let values: Vec<f64> = bytemuck::cast_slice::<u8, f32>(&data)
+        let values: Vec<f64> = crate::gpu::controller_classify(&objects, &input, impacts.len() as u32)
             .iter()
             .map(|&x| f64::from(x))
             .collect();

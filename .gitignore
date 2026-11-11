@@ -1,5 +1,8 @@
 ##### Rust
 /target/
+/tools/cuda/oxide/target/
+/tools/cuda/oxide/*.ll
+/tools/cuda/oxide/*.ptx
 
 ##### Claude Code
 .claude/

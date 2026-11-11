@@ -5,7 +5,6 @@
 //! [0.05, 100]. This sweep traces admitted scenes with the renderer's rules and
 //! reports the extreme energies of every disk sample.
 
-use bevy::render::render_resource::BufferUsages;
 use black_hole::physics::{kerr_horizon_radius_rg, kerr_isco_radius_rg};
 use googletest::prelude::*;
 use rstest::rstest;
@@ -74,21 +73,7 @@ fn disk_energies(
     objects[..4].copy_from_slice(&1i32.to_le_bytes());
     objects[528..532].copy_from_slice(&1f32.to_le_bytes());
     objects[788..792].copy_from_slice(&spin.to_le_bytes());
-    let data = crate::gpu::run_groups(
-        include_str!("../energy.wesl"),
-        "energies",
-        &[
-            &[
-                (1, &cam, BufferUsages::UNIFORM),
-                (2, &dsk, BufferUsages::UNIFORM),
-                (3, &objects, BufferUsages::UNIFORM),
-            ],
-            &[],
-        ],
-        32 * 32 * 16,
-        4,
-    );
-    let values: &[f32] = bytemuck::cast_slice(&data);
+    let values = crate::gpu::energies(&cam, &dsk, &objects);
     // Each pixel reports (min E, max E, disk sample count, _).
     values.chunks(4).filter(|px| px[2] > 0.0).fold(
         (f32::INFINITY, f32::NEG_INFINITY, 0.0),
@@ -102,7 +87,7 @@ fn disk_energies(
 #[case::spin_0_999_hot_flow_r8_el10(0.999, DISKS[1], 8.0, 10.0)]
 // Within 0.1% of the hot flow here; which of the two tops the sweep depends on the GPU.
 #[case::spin_0_999_slim_r8_el10(0.999, DISKS[2], 8.0, 10.0)]
-#[ignore = "requires a GPU (lavapipe works); run with --release -- --ignored"]
+#[ignore = "requires a GPU; run with --release -- --ignored"]
 fn admitted_scene_activates_the_redshift_clamp(
     #[case] spin: f32,
     #[case] disk: (u32, f32, f32, f32, f32),
@@ -116,7 +101,7 @@ fn admitted_scene_activates_the_redshift_clamp(
 
 /// Reproduces the sweep statistics quoted in verification/OBLIGATIONS.md (P1).
 #[test]
-#[ignore = "requires a GPU (lavapipe works); run with --release -- --ignored"]
+#[ignore = "requires a GPU; run with --release -- --ignored"]
 fn fluid_energy_extremes() {
     let mut low = (f32::INFINITY, String::new());
     let mut high = (f32::NEG_INFINITY, String::new());

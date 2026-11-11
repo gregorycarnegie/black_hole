@@ -1,4 +1,3 @@
-use bevy::render::render_resource::BufferUsages;
 use std::path::Path;
 
 #[test]
@@ -22,20 +21,7 @@ fn headless_thermal_coefficients() {
         cases.extend_from_slice(bytemuck::bytes_of(&invalid));
     }
     let count = cases.len() / 32;
-    let data = crate::gpu::run_groups(
-        include_str!("../thermal.wesl"),
-        "check_thermal",
-        &[
-            &[],
-            &[],
-            &[
-                (0, &table, BufferUsages::STORAGE),
-                (1, &cases, BufferUsages::STORAGE),
-            ],
-        ],
-        (count * 48) as u64,
-        (count as u32).div_ceil(64),
-    );
+    let data = crate::gpu::thermal(&table, &cases, count as u32);
     let actual: &[f32] = bytemuck::cast_slice(&data);
     let expected: Vec<_> = expected
         .as_chunks::<4>()

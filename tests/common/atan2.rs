@@ -2,10 +2,8 @@
 //! (`WgslAtan2.atan2_arith_error`) is 128 u absolute against `Complex.arg`
 //! under the WGSL accuracy model, for `max(|x|, |y|)` in `[2^-126, 2^126]`.
 
-use bevy::render::render_resource::BufferUsages;
-
 #[test]
-#[ignore = "requires a GPU (lavapipe works); run with --release -- --ignored"]
+#[ignore = "requires a GPU; run with --release -- --ignored"]
 fn atan2_arith_meets_the_wgsl_bound() {
     const UNIT: f64 = 1.0 / 16_777_216.0;
     let mut points: Vec<[f32; 2]> = Vec::new();
@@ -28,15 +26,7 @@ fn atan2_arith_meets_the_wgsl_bound() {
     for v in [1.0_f32, -1.0, 2.0e-38, -3.0e38] {
         points.extend([[0.0, v], [v, 0.0], [v, v], [v, -v]]);
     }
-    let input: Vec<u8> = points.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
-    let data = crate::gpu::run_groups(
-        include_str!("../atan2.wesl"),
-        "evaluate",
-        &[&[(0, &input, BufferUsages::STORAGE)]],
-        (points.len() * 4) as u64,
-        (points.len() as u32).div_ceil(64),
-    );
-    let values: &[f32] = bytemuck::cast_slice(&data);
+    let values = crate::gpu::atan2(&points);
     let mut worst = 0.0_f64;
     for (n, &[y, x]) in points.iter().enumerate() {
         let (y, x) = (f64::from(y), f64::from(x));

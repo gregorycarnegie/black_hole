@@ -1,8 +1,9 @@
-use black_hole::physics::*;
+use black_hole::{
+    cuda::{KERNEL_NAMES, PTX, kernels_source_sha256, ptx_recorded_sha256, shared_cuda},
+    physics::*,
+};
 use googletest::{assert_that, matchers::near};
 use rstest::rstest;
-
-mod common;
 
 #[path = "common/gpu.rs"]
 mod gpu;
@@ -32,29 +33,35 @@ mod sincos;
 #[path = "common/energy.rs"]
 mod energy;
 
-#[rstest]
-#[case::geodesic(include_str!("../assets/shaders/geodesic.wesl"))]
-#[case::relativity(common::GEODESIC_WITH_CHECKS)]
-#[case::accumulate(include_str!("../assets/shaders/accumulate.wesl"))]
-#[case::snapshot(include_str!("snapshot.wesl"))]
-#[case::transfer(include_str!("transfer.wesl"))]
-#[case::thermal(include_str!("thermal.wesl"))]
-#[case::image(include_str!("image.wesl"))]
-#[case::controller(include_str!("controller.wesl"))]
-#[case::sincos(include_str!("sincos.wesl"))]
-#[case::atan2(include_str!("atan2.wesl"))]
-#[case::geodesic_rhs(include_str!("geodesic_rhs.wesl"))]
-#[case::energy(include_str!("energy.wesl"))]
-fn shader_validates(#[case] source: &str) {
-    let source = common::compile_wesl(source);
-    let module = naga::front::wgsl::parse_str(&source)
-        .unwrap_or_else(|err| panic!("{}", err.emit_to_string(&source)));
-    naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .unwrap();
+#[test]
+fn ptx_matches_cuda_oxide_kernel_sources() {
+    assert_eq!(
+        ptx_recorded_sha256(),
+        Some(kernels_source_sha256().as_str()),
+        "src/compute/kernels.ptx is out of date with tools/cuda/kernels.rs; run `python tools/cuda/build.py`"
+    );
+    assert!(
+        !PTX.contains(".extern .func"),
+        "PTX must be self-contained without unresolved .extern .func symbols"
+    );
+    for kernel in KERNEL_NAMES {
+        let marker = format!(".visible .entry {kernel}(");
+        assert!(
+            PTX.contains(&marker),
+            "missing CUDA kernel entry `{kernel}` in src/compute/kernels.ptx"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU; run with -- --ignored"]
+fn cuda_module_loads_all_kernels() {
+    let cuda = shared_cuda();
+    for kernel in KERNEL_NAMES {
+        cuda.module
+            .load_function(kernel)
+            .unwrap_or_else(|err| panic!("failed to load `{kernel}`: {err}"));
+    }
 }
 
 #[test]

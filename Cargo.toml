@@ -6,17 +6,15 @@ edition = "2024"
 [dependencies]
 bevy = "0.20.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-12000"] }
 num-bigint = "0.5.1"
 
 [dev-dependencies]
 googletest = "0.14.4"
 num-rational = "0.4.2"
 mutants = "0.0.4"
-# Reuse Bevy's WESL compiler and shader validator for offline regression checks.
-naga = { version = "30.0.1", features = ["wgsl-in", "spv-in", "spv-out"] }
 proptest = "1.12.0"
 rstest = "0.28.0"
-wesl = "0.6.0"
 
 # Fast compiles in dev
 [profile.dev]

@@ -1,4 +1,3 @@
-use bevy::render::render_resource::BufferUsages;
 use std::path::Path;
 
 #[test]
@@ -24,13 +23,7 @@ fn headless_polarized_transfer() {
         cases.extend_from_slice(bytemuck::bytes_of(&invalid));
     }
     let count = cases.len() / 64;
-    let data = crate::gpu::run(
-        include_str!("../transfer.wesl"),
-        "check_transfer",
-        &[(&cases, BufferUsages::STORAGE)],
-        (count * 32) as u64,
-        (count as u32).div_ceil(64),
-    );
+    let data = crate::gpu::transfer(&cases, count as u32);
     let actual: &[f32] = bytemuck::cast_slice(&data);
     let expected: Vec<_> = expected
         .as_chunks::<4>()

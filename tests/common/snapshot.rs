@@ -1,4 +1,3 @@
-use bevy::render::render_resource::BufferUsages;
 use std::path::Path;
 
 #[test]
@@ -44,21 +43,13 @@ fn headless_snapshot_sampling() {
         assert_eq!(data.len(), 290 * 130 * 130 * 16);
         assert!(data.len() <= 128 * 1024 * 1024);
     }
-    let data = crate::gpu::run_groups(
-        include_str!("../snapshot.wesl"),
-        "check_snapshot",
-        &[
-            &[],
-            &[
-                (0, &header, BufferUsages::UNIFORM),
-                (1, &grids[0], BufferUsages::STORAGE),
-                (2, &grids[1], BufferUsages::STORAGE),
-                (3, &grids[2], BufferUsages::STORAGE),
-                (4, &positions, BufferUsages::STORAGE),
-            ],
-        ],
-        (count * 64) as u64,
-        (count as u32).div_ceil(64),
+    let data = crate::gpu::snapshot(
+        &header,
+        &grids[0],
+        &grids[1],
+        &grids[2],
+        &positions,
+        count as u32,
     );
     let values: &[f32] = bytemuck::cast_slice(&data);
     let expected: Vec<_> = expected_bytes

@@ -12,6 +12,7 @@ use bevy::{
     window::PrimaryWindow,
 };
 
+pub use black_hole::cuda;
 mod pipeline;
 #[cfg(test)]
 mod verification;
@@ -54,6 +55,16 @@ pub struct DisplayImage(pub Handle<Image>);
 #[derive(Resource, Clone, ExtractResource)]
 #[extract_app(RenderApp)]
 pub struct SkyboxImage(pub Handle<Image>);
+
+/// Raw RGBA32Float pixels of the active skybox extracted for the CUDA geodesic kernel.
+#[derive(Resource, Clone, Default, ExtractResource)]
+#[extract_app(RenderApp)]
+pub struct SkyboxData {
+    pub handle: Option<Handle<Image>>,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: std::sync::Arc<[u8]>,
+}
 
 /// All loaded skyboxes; main-world-only, drives the cycle-on-B-key UI.
 #[derive(Resource)]
@@ -207,6 +218,7 @@ impl Plugin for GeodesicComputePlugin {
             ExtractResourcePlugin::<FrameParity>::default(),
             ExtractResourcePlugin::<DiskConfigUniform>::default(),
             ExtractResourcePlugin::<SkyboxImage>::default(),
+            ExtractResourcePlugin::<SkyboxData>::default(),
         ));
 
         app.init_resource::<CameraUniform>()
@@ -214,6 +226,7 @@ impl Plugin for GeodesicComputePlugin {
             .init_resource::<RenderFrameCount>()
             .init_resource::<FrameParity>()
             .init_resource::<DiskConfigUniform>()
+            .init_resource::<SkyboxData>()
             .init_resource::<StillFrameCounter>()
             .init_resource::<RenderScale>();
 
@@ -232,6 +245,7 @@ impl Plugin for GeodesicComputePlugin {
                 sync_camera_uniform,
                 sync_objects_uniform,
                 sync_disk_config_uniform,
+                sync_skybox_data,
             ),
         );
 
@@ -441,6 +455,33 @@ fn sync_disk_config_uniform(
     uniform.binary_enabled = binary.enabled;
 }
 
+fn sync_skybox_data(
+    skybox: Option<Res<SkyboxImage>>,
+    images: Option<Res<Assets<Image>>>,
+    mut data: ResMut<SkyboxData>,
+) {
+    let (Some(skybox), Some(images)) = (skybox, images) else {
+        return;
+    };
+    if data.handle.as_ref() == Some(&skybox.0) && !data.bytes.is_empty() {
+        return;
+    }
+    let Some(img) = images.get(&skybox.0) else {
+        return;
+    };
+    let Some(raw) = img.data.as_ref() else {
+        return;
+    };
+    let expected_bytes = (img.width() as usize) * (img.height() as usize) * 16;
+    if raw.len() != expected_bytes {
+        return;
+    }
+    data.handle = Some(skybox.0.clone());
+    data.width = img.width();
+    data.height = img.height();
+    data.bytes = std::sync::Arc::from(raw.as_slice());
+}
+
 pub(crate) const SCALE_PRESETS: &[f32] = &[0.25, 0.5, 0.75, 1.0];
 
 /// Press `-` / `=` to step render scale down / up through 25 % → 50 % → 75 % → 100 %.
@@ -568,7 +609,7 @@ fn make_checker_skybox(images: &mut Assets<Image>) -> Handle<Image> {
         TextureDimension::D2,
         data,
         TextureFormat::Rgba32Float,
-        RenderAssetUsages::RENDER_WORLD,
+        RenderAssetUsages::default(),
     );
     img.texture_descriptor.usage = TextureUsages::COPY_DST | TextureUsages::TEXTURE_BINDING;
     images.add(img)
@@ -1053,13 +1094,7 @@ mod tests {
         }
         app.finish();
         app.cleanup();
-        {
-            let world = app.world();
-            pipeline::check_relativity(
-                world.resource::<bevy::render::renderer::RenderDevice>(),
-                world.resource::<bevy::render::renderer::RenderQueue>(),
-            );
-        }
+        pipeline::check_relativity();
         use crate::simulation::DiskModel;
         let mut previous = Vec::new();
         for (binary, model, view) in [

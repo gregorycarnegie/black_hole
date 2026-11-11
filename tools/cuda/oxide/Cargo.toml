@@ -1,0 +1,8 @@
+[package]
+name = "black-hole-cuda-kernels"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust.git", rev = "e027ac324f663e8408c13c116d7dddd58d5e8daf" }
+

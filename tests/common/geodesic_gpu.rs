@@ -5,8 +5,6 @@
 //! fixture (`verification/fixtures/kernels.sexp`), not a transcription. This
 //! exercises the driver and hardware, which no proof here covers (F4).
 
-use bevy::render::render_resource::BufferUsages;
-
 /// Unit roundoff `u` and flush-to-zero `η` of the WGSL model; `U = 5u`.
 const U: f64 = 5.0 / 16_777_216.0;
 const ETA: f64 = 1.0 / 85_070_591_730_234_615_865_843_651_857_942_052_864.0;
@@ -56,7 +54,7 @@ fn eval(tokens: &[&str], pos: &mut usize, v: &[f64]) -> (f64, f64) {
 }
 
 #[test]
-#[ignore = "requires a GPU (lavapipe works); run with --release -- --ignored"]
+#[ignore = "requires a GPU; run with --release -- --ignored"]
 fn geodesic_rhs_meets_the_proved_bound() {
     let fixture = include_str!("../../verification/fixtures/kernels.sexp");
     let lines: Vec<String> = fixture
@@ -81,15 +79,7 @@ fn geodesic_rhs_meets_the_proved_bound() {
     };
     let cases = 4096;
     let inputs: Vec<f32> = (0..cases * 72).map(|_| random()).collect();
-    let bytes: Vec<u8> = inputs.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let data = crate::gpu::run_groups(
-        include_str!("../geodesic_rhs.wesl"),
-        "evaluate",
-        &[&[(0, &bytes, BufferUsages::STORAGE)]],
-        (cases * 11 * 4) as u64,
-        (cases as u32).div_ceil(64),
-    );
-    let values: &[f32] = bytemuck::cast_slice(&data);
+    let values = crate::gpu::geodesic_rhs(&inputs, cases);
     let mut worst = 0.0_f64;
     for case in 0..cases {
         let v: Vec<f64> = inputs[case * 72..(case + 1) * 72]
