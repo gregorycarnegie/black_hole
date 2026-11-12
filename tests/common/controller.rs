@@ -226,7 +226,8 @@ fn classification_against_the_critical_impact_parameter() {
         );
     }
     println!("{} of 256 rays misclassified", wrong.len());
-    // Records the counterexample to sound classification; remove once the
-    // renderer leaves near-critical rays unresolved.
-    assert!(!wrong.is_empty(), "no near-critical ray was misclassified");
+    assert!(
+        wrong.is_empty(),
+        "resolved near-critical rays must match the reference"
+    );
 }

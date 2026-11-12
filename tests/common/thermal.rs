@@ -41,6 +41,19 @@ fn headless_thermal_coefficients() {
         .enumerate()
     {
         assert_eq!(row[11], 1.0, "thermal coefficient query {i} rejected");
+        let opacity = &row[4..8];
+        let scale = opacity.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+        if scale > 0.0 {
+            let polarized = opacity[1..]
+                .iter()
+                .map(|v| (v / scale).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            assert!(
+                polarized <= 0.99001 * opacity[0] / scale,
+                "nonpassive thermal query {i}"
+            );
+        }
         for (family, maximum) in maxima.iter_mut().enumerate() {
             let length = if family == 2 { 3 } else { 4 };
             let start = family * 4;

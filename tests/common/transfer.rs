@@ -12,6 +12,7 @@ fn headless_polarized_transfer() {
     assert_eq!(expected.len(), samples * 16);
     for (alpha, faraday, ds) in [
         ([1.0, 2.0, 0.0, 0.0], [0.0; 3], 1.0),
+        ([1.0e-23, 2.0e-23, 0.0, 0.0], [0.0; 3], 1.0),
         ([0.0; 4], [0.0; 3], -1.0),
         ([0.0; 4], [f32::NAN, 0.0, 0.0], 1.0),
         ([0.0; 4], [1.0e6, 0.0, 0.0], 1.0),
@@ -56,4 +57,24 @@ fn headless_polarized_transfer() {
     }
     std::fs::write(root.join("transfer-gpu.f32"), &data).unwrap();
     eprintln!("{samples} full polarized GPU cells: maximum scaled error = {maximum}");
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn subnormal_opacity_remains_passive() {
+    let mut cases = Vec::new();
+    // Squaring 0.99 * 3e-23 rounds upward past the passive bound.
+    for scale in [1e-30_f32, 3e-23, 1e-20, 1.0] {
+        let mut row = [0.0_f32; 16];
+        row[4..8].copy_from_slice(&[scale, 0.99 * scale, 0.0, 0.0]);
+        row[11] = 1.0;
+        row[12..16].copy_from_slice(&[1.0, 0.0, 0.0, 0.0]);
+        cases.extend_from_slice(bytemuck::bytes_of(&row));
+    }
+    let data = crate::gpu::transfer(&cases, 4);
+    let actual: &[f32] = bytemuck::cast_slice(&data);
+    for row in actual.as_chunks::<8>().0 {
+        assert_eq!(row[4], 1.0, "valid passive opacity rejected");
+        assert!(row[..4].iter().all(|v| v.is_finite()));
+    }
 }

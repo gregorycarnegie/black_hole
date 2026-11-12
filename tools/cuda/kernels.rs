@@ -843,10 +843,12 @@ fn transfer_cell(initial: Vec4, c: TransferCoefficients, ds: f32) -> TransferRes
     {
         return result;
     }
-    if c.absorption.x < c.absorption.yzw().length() {
+    let a = c.absorption;
+    let scale = a.x.max(a.y.abs()).max(a.z.abs().max(a.w.abs()));
+    // Normalize before squaring: subnormal opacities otherwise spuriously fail passivity.
+    if a.x < 0.0 || (scale > 0.0 && a.x / scale < (a.yzw() / scale).length()) {
         return result;
     }
-    let a = c.absorption;
     let r = c.faraday;
     let k = mat4(
         vec4(a.x, a.y, a.z, a.w),
@@ -869,7 +871,8 @@ fn transfer_cell(initial: Vec4, c: TransferCoefficients, ds: f32) -> TransferRes
     let mut term = IDENTITY4;
     let mut source = h * c.emission;
     let mut i = 1u32;
-    while i <= 12 {
+    // With ||hK|| <= 1/8, the ninth-order remainder is below 2.4e-14.
+    while i <= 8 {
         term = (1.0 / i as f32) * (m * term);
         exponential += term;
         source += (h / (i + 1) as f32) * (term * c.emission);
@@ -976,16 +979,19 @@ unsafe fn thermal_coefficients(
     let root = pow(x, 1.0 / 3.0);
     let inv = 1.0 / root;
     let cutoff = exp(-1.8899 * root);
-    let fi = 2.5651 * (1.0 + 1.92 * inv + 0.9977 * inv * inv) * cutoff;
-    let fq = 2.5651 * (1.0 + 0.93193 * inv + 0.499873 * inv * inv) * cutoff;
-    let fv = (1.81384 / x + 3.42319 * inv * inv + 0.0292545 / sqrt(x) + 2.03773 * inv) * cutoff;
+    let fi = 2.5651 * (1.0 + 1.92 * inv + 0.9977 * inv * inv);
+    let fq = 2.5651 * (1.0 + 0.93193 * inv + 0.499873 * inv * inv);
+    let fv = 1.81384 / x + 3.42319 * inv * inv + 0.0292545 / sqrt(x) + 2.03773 * inv;
     let g = 2.3e11 / nu;
     let scale = (2.034_396_2e-15 * ne * nu / (t * t)) * g * g * g;
-    let mut j = scale * vec4(fi, fq, 0.0, (4.0 / (3.0 * t)) * (mu / s) * fv);
-    let fraction = (j.yzw() / j.x.max(1.0e-30)).length();
+    // Cap the dimensionless polarization before the exponential can underflow.
+    let mut polarization = vec3(fq / fi, 0.0, (4.0 / (3.0 * t)) * (mu / s) * fv / fi);
+    let fraction = polarization.length();
     if fraction > 0.99 {
-        j = vec4_f_v3(j.x, j.yzw() * (0.99 / fraction));
+        polarization *= 0.99 / fraction;
     }
+    let intensity = scale * fi * cutoff;
+    let j = vec4_f_v3(intensity, intensity * polarization);
     let planck_x = 8.093_3e-21 * nu / t;
     let mut denominator = exp(planck_x) - 1.0;
     if planck_x < 0.002 {
@@ -994,7 +1000,8 @@ unsafe fn thermal_coefficients(
     let planck = 1.794_023_3e-13 / denominator;
     result.coefficients.emission = j;
     if planck > 0.0 {
-        result.coefficients.absorption = j / planck;
+        let alpha = intensity / planck;
+        result.coefficients.absorption = vec4_f_v3(alpha, alpha * polarization);
     }
     result.valid = j.abs().all_lt(1.0e30)
         && result.coefficients.absorption.abs().all_lt(1.0e30)

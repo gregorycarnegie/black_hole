@@ -226,6 +226,8 @@ pub fn image(
         block_dim: (32, 1, 1),
         shared_mem_bytes: 0,
     };
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let start = cuda.stream.record_event(timing).unwrap();
     let mut builder = cuda.stream.launch_builder(&cuda.test_image);
     builder.arg(&d_obj);
     builder.arg(&d_header);
@@ -241,5 +243,12 @@ pub fn image(
             .launch(cfg)
             .expect("CUDA bh_test_image launch failed");
     }
-    cuda.clone_dtoh(&d_out)
+    drop(builder);
+    let end = cuda.stream.record_event(timing).unwrap();
+    let data = cuda.clone_dtoh(&d_out);
+    eprintln!(
+        "snapshot image kernel: {:.3} ms",
+        start.elapsed_ms(&end).unwrap()
+    );
+    data
 }

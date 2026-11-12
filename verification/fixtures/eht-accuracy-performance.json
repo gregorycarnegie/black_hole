@@ -1,0 +1,176 @@
+{
+  "checked_on": "2026-11-11",
+  "scope": "Fresh CUDA runs on one RTX 4090. Accuracy targets unchanged and unmet; no global proof or guaranteed performance claim.",
+  "hardware": "NVIDIA GeForce RTX 4090",
+  "initial_current_cuda_status_counts": {
+    "captured": 857,
+    "escaped": 3934,
+    "failed": 20809
+  },
+  "fixed_current_cuda_status_counts": {
+    "captured": 990,
+    "escaped": 24610,
+    "failed": 0,
+    "exhausted": 0
+  },
+  "root_causes": [
+    "Unscaled squared norm rejected tiny passive opacity",
+    "Polarization was limited after exponential underflow and quantized emission was divided to obtain absorption"
+  ],
+  "transfer_optimization": {
+    "terms_before": 12,
+    "terms_after": 8,
+    "scaled_matrix_norm_bound": 0.125,
+    "exact_arithmetic_pre_squaring_tail_bound": 2.4e-14,
+    "twelve_term_gpu_ms": [
+      616.379,
+      604.999,
+      620.646
+    ],
+    "eight_term_gpu_ms": [
+      594.214,
+      597.949,
+      620.921
+    ],
+    "median_twelve_ms": 616.379,
+    "median_eight_ms": 597.949,
+    "median_reduction_fraction": 0.029900434635183992,
+    "complete_image_stokes_bit_identical": true,
+    "max_stokes_change_Jy": 0.0,
+    "timing_scope": "CUDA events around a single image launch per process, excludes transfers; three runs per version, overlapping ranges"
+  },
+  "runtime_settings_unchanged": {
+    "step_tolerance": 5e-08,
+    "cell_fraction": 0.0625,
+    "image_iteration_limit": 50000,
+    "acceptance_targets": "verification/TARGETS.md"
+  },
+  "reference_refinement": {
+    "samples": 400,
+    "stride": 8,
+    "coarse_eps": 0.0025,
+    "fine_eps": 0.00125,
+    "component_l2_change_over_fine_I_l2": [
+      0.0020893498370246136,
+      0.0010517326360426553,
+      0.0011508246761681815,
+      0.00016529407125061507
+    ],
+    "max_I_change_over_fine_peak": 0.002574718194666847,
+    "next_eps": 0.000625,
+    "next_result": "ImageStepBudgetExceeded; reference budget unchanged at 100000"
+  },
+  "production_trajectory_diagnostics": [
+    {
+      "impact": 5.3,
+      "steps": 128,
+      "position_error": 0.001646,
+      "position_target": 0.0001023,
+      "momentum_error": 1.5e-05,
+      "momentum_target": 1e-06
+    },
+    {
+      "impact": 5.25,
+      "steps": 137,
+      "position_error": 0.001584,
+      "position_target": 0.0001457,
+      "momentum_error": 1.056e-05,
+      "momentum_target": 1e-06
+    }
+  ],
+  "image_comparison": {
+    "pixels": 25600,
+    "cell_fraction": 0.0625,
+    "status_counts": {
+      "1": 990,
+      "2": 24610
+    },
+    "summed_stokes_Jy": [
+      0.47671444123505413,
+      -0.007645928567460104,
+      -0.002249410701891882,
+      0.0031886163275482164
+    ],
+    "reference_summed_stokes_Jy": [
+      0.4770290097717491,
+      -0.007650783802518372,
+      -0.00229053078159992,
+      0.003180455348899436
+    ],
+    "component_l2_error_over_reference_I_l2": [
+      0.007189711689364256,
+      0.00213338339762439,
+      0.0029177277103684196,
+      0.000660886327492119
+    ],
+    "max_absolute_error_Jy": [
+      6.454110167453727e-05,
+      1.5071492776891793e-05,
+      3.156951129180095e-05,
+      5.978537327804234e-06
+    ],
+    "max_steps": 16453,
+    "max_null_residual": 4.059929779032245e-05,
+    "max_affine_length": 10113.68359375,
+    "complete_image": true,
+    "scope": "empirical cross-code comparison; no universal accuracy claim",
+    "reference_file": "zig-reference-refined.f64",
+    "reference_eps": 0.0025,
+    "fixed_reference_intensity_Jy": 0.002344541026774427,
+    "max_component_error_over_fixed_reference_I": [
+      0.027528245800557235,
+      0.006428333991504876,
+      0.01346511361126986,
+      0.0025499819621537553
+    ],
+    "max_relative_I_error_above_floor": 0.24271526609916882,
+    "requested_numerical_targets_met": false,
+    "zig_baseline_to_refined_l2_change_over_I_l2": [
+      0.05929426409021277,
+      0.030219846238786395,
+      0.029515689184941404,
+      0.005919226419686692
+    ],
+    "camera_and_outer_transport": {
+      "steps": 229,
+      "max_affine_length": 9886.969306908837,
+      "max_null": 5.004957837062562e-10,
+      "max_screen_norm_error": 2.504740859166077e-11,
+      "max_transversality": 2.837660662002861e-14,
+      "max_refinement_difference": 1.0676004080778512e-08,
+      "independent_zig_max_error": {
+        "position": 2.542328658705628e-06,
+        "momentum_screen": 3.256391600814368e-08
+      }
+    }
+  },
+  "validation": {
+    "rendering_tests_including_gpu_passed": 21,
+    "compute_tests_including_headless_passed": 42,
+    "thermal_queries": 319,
+    "snapshot_queries": 274,
+    "transfer_queries": 128,
+    "geodesic_rhs_queries": 4096,
+    "lean_proofs_rerun": false,
+    "note": "The trajectory diagnostic passes by confirming known target violations; it is not an accuracy acceptance test. Full image comparison still exits unsuccessfully."
+  },
+  "source_sha256_lf_normalized": {
+    "tools/cuda/kernels.rs": "37fa01a26c4b3f050ecc8c64a9995f8e234ecda1870d858b5ef9b8b6d7b09ae0",
+    "src/compute/kernels.ptx": "191b1b075cfeca4cb06763da0d26d5348b9bc5357615371de246d1bdf748a6b9",
+    "tests/common/controller.rs": "9b0842deec42005ae798506052a8a71171f3b4c12e3b052b1d158fc21c6fad81",
+    "tests/common/gpu.rs": "acaaefdf4dc7aca8048c3e0c5ed0736c6b25a50d970f01daad4d25cda8c28cfd",
+    "tests/common/thermal.rs": "c7e7f2cff35bb2531f555e95a8e0362350cccf595ad9c42bf3f4fd2879873168",
+    "tests/common/transfer.rs": "be222fc3fcf58f951de8213b52e639ab93f443b2a821c80941541406aac32cb1"
+  },
+  "final_validation": {
+    "checked_on": "2026-11-12",
+    "clippy_all_targets_warnings_denied": "passed",
+    "standard_rust_test_suite": "passed",
+    "rendering_tests_including_gpu_passed": 21,
+    "python_tests_passed": 8,
+    "passive_regression_scale": 3e-23,
+    "complete_image_stokes_bit_identical_to_corrected_twelve_terms": true,
+    "snapshot_kernel_ms_single_revalidation": 594.533,
+    "accuracy_targets_met": false
+  }
+}

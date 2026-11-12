@@ -98,6 +98,11 @@ components now run in a full 160x160 hybrid snapshot benchmark. The recorded
 image comparison fails the numerical targets above; finite local tests and
 integrated-flux agreement do not replace trajectory, transfer or pixel bounds.
 
+The [2026-11-11 accuracy/performance audit](accuracy-performance.md) records
+fresh CUDA results, fixes for tiny-opacity rejection, a transfer optimization
+with unchanged measured Stokes output, and the remaining reference/trajectory
+limits. None of the numerical targets above were relaxed.
+
 Do not turn requested accuracy into an axiom. N1–N4 still require a nonlinear
 consistency proof, explicit derivative/Lipschitz bounds, arithmetic error
 bounds and event separation. The former null-only controller failed a checked radial target. The current
