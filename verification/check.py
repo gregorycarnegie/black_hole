@@ -23,6 +23,7 @@ def run(*arguments):
 
 
 def build():
+    # Prebuild each plasma case before Lake sees the aggregate's parallel imports.
     # Concurrent curvature and fixture checks exhaust RAM and thrash swap.
     for module in (
         "KerrVacuumTime",
@@ -35,6 +36,14 @@ def build():
         "KerrVacuumMixed",
         "NagaFixtureKerr",
         "NagaFixtureKerrSpirv",
+        "NagaFixturePlasma0",
+        "NagaFixturePlasma1",
+        "NagaFixturePlasma2",
+        "NagaFixturePlasma3",
+        "NagaFixturePlasmaSpirv0",
+        "NagaFixturePlasmaSpirv1",
+        "NagaFixturePlasmaSpirv2",
+        "NagaFixturePlasmaSpirv3",
         "NagaFixturePlasma",
     ):
         run("--no-ansi", "build", f"BlackHole.{module}")

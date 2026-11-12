@@ -32,12 +32,18 @@ python check.py
 On Windows, if Elan is not on `PATH`, first run
 `$env:PATH = "$env:USERPROFILE\.elan\bin;$env:PATH"` in PowerShell.
 `check.py` builds the large curvature and naga fixture modules one at a time,
-then builds the complete project, audits all project declarations' axiom dependencies and independently
+including each of the eight plasma checks (four models for each of the WGSL
+and SPIR-V fixtures) in its own module and process. `NagaFixturePlasma` combines
+those checked results into the same two aggregate theorem statements. Use the script for a cold build;
+building the aggregate directly can launch its expensive imports concurrently.
+It then builds the complete project, audits all project declarations' axiom dependencies and independently
 replays the compiled proofs (`--build` and `--replay` run the two phases
 separately; CI runs them as separate jobs). On a 16 GB hosted runner with swap,
 `KerrVacuumTime` alone has taken about 2.7 hours; total build time depends on the
 cache. Concurrent naga fixture checks exhausted RAM and used about 32 GB of swap
-before hitting CI's 330-minute timeout. The script also sets
+before hitting CI's 330-minute timeout. A later serial run also timed out in
+the monolithic plasma fixture after using roughly 16 GB RAM and 32 GB swap;
+this is why its cases now build separately. The script also sets
 `LEAN_NUM_THREADS=1`; an earlier concurrent
 replay failed to resolve a Mathlib import. A parallel curvature build also
 exhausted a 64 GB workstation's free memory.
