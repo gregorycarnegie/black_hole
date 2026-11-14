@@ -60,6 +60,13 @@ for toolchain and Mathlib-cache setup.
 
 ## Correspondence and coverage
 
+The [Einstein–Rosen bridge notes](einstein-rosen.md) map its paper equations to
+the numerical profile, exact-real Lean proofs, and explicit numerical limits.
+The [Ellis ray-tracing notes](ellis.md) cover the traversable metric, shared
+Rust/CUDA solver, Lean-checked RHS fixture, and GPU image tests.
+They also describe the evolving pressureless test-dust pulse, retarded emission,
+and the continuity, timelike-flow, and density-fixture proofs in `EllisDust.lean`.
+
 All lengths below are in gravitational radii, with G = c = M = 1. Theorems state
 their hypotheses explicitly; they do not establish that every runtime input
 satisfies them.

@@ -180,7 +180,10 @@ impl Plugin for SimulationPlugin {
             .init_resource::<DebugBodiesEnabled>()
             .init_resource::<BinaryBlackHoles>()
             .init_resource::<DiskConfig>()
-            .add_systems(FixedUpdate, gravity_system)
+            .add_systems(
+                FixedUpdate,
+                gravity_system.run_if(crate::bridge::black_hole_view),
+            )
             .add_systems(
                 Update,
                 (
@@ -190,7 +193,9 @@ impl Plugin for SimulationPlugin {
                     update_disk_config,
                     animate_binary_black_holes,
                 )
-                    .chain(),
+                    .chain()
+                    .run_if(crate::bridge::black_hole_view)
+                    .after(crate::bridge::BridgeInput),
             );
     }
 }
@@ -676,6 +681,30 @@ mod tests {
     use proptest::prelude::*;
     use rstest::rstest;
     use std::time::Duration;
+
+    #[test]
+    fn inactive_black_holes_pause_without_resetting_wormhole_accumulation() {
+        use crate::bridge::{BridgeView, SimulationView};
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<OrbitalCamera>()
+            .init_resource::<BridgeView>()
+            .add_plugins(SimulationPlugin)
+            .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+                100,
+            )));
+        app.world_mut().resource_mut::<BridgeView>().mode = SimulationView::Ellis;
+        for _ in 0..4 {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<BinaryBlackHoles>().phase, 0.0);
+        assert!(!app.world().resource::<OrbitalCamera>().is_moving);
+        app.world_mut().resource_mut::<BridgeView>().mode = SimulationView::BlackHoles;
+        app.update();
+        assert!(app.world().resource::<BinaryBlackHoles>().phase > 0.0);
+        assert!(app.world().resource::<OrbitalCamera>().is_moving);
+    }
 
     const ALL_MODELS: [DiskModel; 4] = [
         DiskModel::ThinNt,

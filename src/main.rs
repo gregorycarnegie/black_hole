@@ -3,6 +3,7 @@ use bevy::{
     prelude::*,
 };
 
+mod bridge;
 mod camera;
 mod compute;
 mod controller;
@@ -23,6 +24,7 @@ fn main() {
         .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(camera::OrbitalCameraPlugin)
         .add_plugins(simulation::SimulationPlugin)
+        .add_plugins(bridge::BridgePlugin)
         .add_plugins(grid::GridPlugin)
         .add_plugins(compute::GeodesicComputePlugin)
         .add_plugins(ui::UiPlugin)

@@ -8,6 +8,9 @@ use rstest::rstest;
 #[path = "common/gpu.rs"]
 mod gpu;
 
+#[path = "common/wormhole.rs"]
+mod wormhole;
+
 #[path = "common/snapshot.rs"]
 mod snapshot;
 

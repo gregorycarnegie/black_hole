@@ -8,7 +8,15 @@ impl Plugin for GridPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GridCache>()
             .init_resource::<GridVisible>()
-            .add_systems(Update, (toggle_grid, draw_spacetime_grid).chain());
+            .add_systems(
+                Update,
+                (
+                    toggle_grid,
+                    draw_spacetime_grid.run_if(crate::bridge::black_hole_view),
+                )
+                    .chain()
+                    .after(crate::bridge::BridgeInput),
+            );
     }
 }
 

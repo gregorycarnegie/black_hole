@@ -4,6 +4,10 @@ use core::ops::{
     Add, AddAssign, Div, DivAssign, Index, IndexMut, Mul, MulAssign, Neg, Sub, SubAssign,
 };
 
+mod ellis {
+    include!("../../src/ellis.rs");
+}
+
 // -- Thread indexing & scalar math intrinsics --------------------------------
 
 #[inline(always)]
@@ -738,7 +742,7 @@ pub struct Camera {
     pub frequency_ghz: f32,
     pub faraday_depth: f32,
     pub conversion_depth: f32,
-    pub _pad7: f32,
+    pub wormhole_radius: f32,
 }
 
 #[repr(C)]
@@ -2006,6 +2010,82 @@ fn pack_rgba8(c: Vec4) -> u32 {
 }
 
 // -- Production Kernels ------------------------------------------------------
+
+#[cuda_device::kernel]
+pub unsafe fn bh_wormhole(
+    out_image: *mut Vec4, cam: *const Camera,
+    near_sky: *const Vec4, far_sky: *const Vec4,
+    width: u32, height: u32, near_w: u32, near_h: u32, far_w: u32, far_h: u32,
+    matter_time: f32, matter_enabled: u32,
+) {
+    let x = gid_x();
+    let y = gid_y();
+    if x >= width || y >= height { return; }
+    let cam = unsafe { &*cam };
+    let a = cam.wormhole_radius;
+    let l = cam.pos.length();
+    let normal = cam.pos / l;
+    let u = (2.0 * (x as f32 + 0.5 + cam.jitter_x) / width as f32 - 1.0) * cam.aspect * cam.tan_half_fov;
+    let v = (1.0 - 2.0 * (y as f32 + 0.5 + cam.jitter_y) / height as f32) * cam.tan_half_fov;
+    let sight = (u * cam.right - v * cam.up + cam.forward).normalize();
+    let p = sight.dot(normal);
+    let transverse = sight - p * normal;
+    let transverse_norm = transverse.length();
+    let tangent = if transverse_norm > 1e-8 { transverse / transverse_norm } else { cam.right };
+    // Local orthonormal camera components, not coordinate components.
+    let impact = sqrt(l*l + a*a) * transverse_norm;
+    let observer_time = if matter_enabled != 0 { Some(matter_time) } else { None };
+    let output = match ellis::trace(l, p, impact, a, cam.max_iter, observer_time) {
+        Some((state, steps, intensity)) => {
+            let sc = sincos(state[2]);
+            let radial = sc.y * normal + sc.x * tangent;
+            let angular = -sc.x * normal + sc.y * tangent;
+            // Asymptotic Cartesian velocity retains the finite-cutoff angular tail.
+            let direction = (state[0] * state[1] * radial + impact * angular).normalize();
+            let sky = unsafe {
+                if state[0] < 0.0 { sample_skybox(direction, far_sky, far_w as i32, far_h as i32) }
+                else { sample_skybox(direction, near_sky, near_w as i32, near_h as i32) }
+            };
+            if cam.debug_heatmap != 0 { heatmap_color(steps as f32 / cam.max_iter.max(1) as f32) }
+            else { tonemap(sky + 0.2 * intensity * vec3(1.0, 0.45, 0.12)) }
+        }
+        None => vec3(1.0, 0.0, 1.0),
+    };
+    unsafe { *out_image.add((y * width + x) as usize) = vec4_v3_f(output, 1.0); }
+}
+
+#[cuda_device::kernel]
+pub unsafe fn bh_test_wormhole(cases: *const Vec4, results: *mut Vec4, count: u32) {
+    let i = gid_x();
+    if i >= count { return; }
+    let input = unsafe { *cases.add(i as usize) };
+    let rhs = ellis::rhs([input.x, input.y, 0.0], input.z, input.w);
+    let ray = match ellis::trace(input.x, input.y, input.z, input.w, 10_000, None) {
+        Some((s, steps, _)) => vec4(s[0], s[1], s[2], steps as f32),
+        None => vec4(0.0, 0.0, 0.0, -1.0),
+    };
+    unsafe {
+        *results.add(2 * i as usize) = vec4(rhs[0], rhs[1], rhs[2], 0.0);
+        *results.add(2 * i as usize + 1) = ray;
+    }
+}
+
+#[cuda_device::kernel]
+pub unsafe fn bh_test_dust(cases: *const Vec4, results: *mut Vec4, count: u32) {
+    let i = gid_x();
+    if i >= count { return; }
+    let c = unsafe { *cases.add(i as usize) };
+    let density = ellis::dust_density(c.x, c.y, c.w);
+    let energy = ellis::dust_photon_energy(c.z);
+    let ray = match ellis::trace(c.x, c.z, 0.0, c.w, 10_000, Some(c.y)) {
+        Some((s, _, intensity)) => vec4(s[0],s[1],s[2],intensity),
+        None => vec4(0.0,0.0,0.0,-1.0),
+    };
+    unsafe {
+        *results.add(2*i as usize) = vec4(density, (c.x*c.x+c.w*c.w)*density, energy*energy, 0.0);
+        *results.add(2*i as usize+1) = ray;
+    }
+}
 
 #[cuda_device::kernel]
 pub unsafe fn bh_geodesic(

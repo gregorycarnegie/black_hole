@@ -10,7 +10,10 @@ use cudarc::{
 
 pub const PTX: &str = include_str!("kernels.ptx");
 
-pub const KERNEL_NAMES: [&str; 13] = [
+pub const KERNEL_NAMES: [&str; 16] = [
+    "bh_test_dust",
+    "bh_wormhole",
+    "bh_test_wormhole",
     "bh_geodesic",
     "bh_accumulate",
     "bh_check_relativity",
@@ -33,6 +36,9 @@ pub struct CudaKernels {
     pub stream: Arc<CudaStream>,
     pub module: Arc<CudaModule>,
     pub geodesic: CudaFunction,
+    pub wormhole: CudaFunction,
+    pub test_wormhole: CudaFunction,
+    pub test_dust: CudaFunction,
     pub accumulate: CudaFunction,
     pub check_relativity: CudaFunction,
     pub test_atan2: CudaFunction,
@@ -80,6 +86,9 @@ impl CudaKernels {
         };
 
         Ok(Self {
+            test_dust: load("bh_test_dust")?,
+            wormhole: load("bh_wormhole")?,
+            test_wormhole: load("bh_test_wormhole")?,
             geodesic: load("bh_geodesic")?,
             accumulate: load("bh_accumulate")?,
             check_relativity: load("bh_check_relativity")?,
@@ -181,11 +190,12 @@ pub fn ptx_recorded_sha256() -> Option<&'static str> {
 }
 
 pub fn kernels_source_sha256() -> String {
-    const SOURCES: [(&str, &[u8]); 5] = [
+    const SOURCES: [(&str, &[u8]); 6] = [
         (
             "tools/cuda/kernels.rs",
             include_bytes!("../../tools/cuda/kernels.rs"),
         ),
+        ("src/ellis.rs", include_bytes!("../ellis.rs")),
         (
             "tools/cuda/oxide/Cargo.toml",
             include_bytes!("../../tools/cuda/oxide/Cargo.toml"),

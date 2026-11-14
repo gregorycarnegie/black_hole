@@ -4,6 +4,7 @@
 
 ### Added
 
+- Wormhole views, cycled with W: a CUDA ray-traced Ellis wormhole between two skies with an evolving pressureless test-dust pulse, and an Einstein–Rosen bridge embedding diagram stepped in Kruskal time. Lean proofs cover the Ellis ray equations, the dust continuity solution, and the bridge embedding and its nontraversability; `verification/ellis.md` and `verification/einstein-rosen.md` list coverage and limits.
 - Exact-rational property tests for certified arithmetic, table-driven certification cases, and GPU regression cases for redshift clamping in the truncated hot flow and slim disk.
 - The translation-validation test also checks naga's SPIR-V backend for every compared kernel, by reading the written SPIR-V back with naga's SPIR-V front end. A GPU test checks the proved `geodesic_rhs` error bound on the driver, with exact values taken from the Lean fixture.
 - Unconditional WGSL error bounds for `heatmap_color` (every input) and `tonemap` (input error at most 1/10): their safety conditions are now proved instead of assumed. A matching lower bound shows that near a branch threshold no all-input error bound can be smaller than half the branch jump.

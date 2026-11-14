@@ -66,6 +66,11 @@ pub struct SkyboxData {
     pub bytes: std::sync::Arc<[u8]>,
 }
 
+/// Sky on the opposite asymptotic end of the Ellis wormhole.
+#[derive(Resource, Clone, Default, ExtractResource)]
+#[extract_app(RenderApp)]
+pub struct OtherSkyboxData(pub SkyboxData);
+
 /// All loaded skyboxes; main-world-only, drives the cycle-on-B-key UI.
 #[derive(Resource)]
 pub struct SkyboxSet {
@@ -111,7 +116,7 @@ pub struct CameraUniform {
     pub frequency_ghz: f32,
     pub faraday_depth: f32,
     pub conversion_depth: f32,
-    pub _pad7: f32,
+    pub wormhole_radius: f32,
 }
 
 /// Object data packed for the uniform buffer.
@@ -219,6 +224,7 @@ impl Plugin for GeodesicComputePlugin {
             ExtractResourcePlugin::<DiskConfigUniform>::default(),
             ExtractResourcePlugin::<SkyboxImage>::default(),
             ExtractResourcePlugin::<SkyboxData>::default(),
+            ExtractResourcePlugin::<OtherSkyboxData>::default(),
         ));
 
         app.init_resource::<CameraUniform>()
@@ -227,10 +233,15 @@ impl Plugin for GeodesicComputePlugin {
             .init_resource::<FrameParity>()
             .init_resource::<DiskConfigUniform>()
             .init_resource::<SkyboxData>()
+            .init_resource::<OtherSkyboxData>()
             .init_resource::<StillFrameCounter>()
             .init_resource::<RenderScale>();
 
         app.add_systems(Startup, (setup_compute_texture, load_skyboxes));
+        app.add_systems(
+            Update,
+            sync_display_visibility.after(crate::bridge::BridgeInput),
+        );
         app.add_systems(
             Update,
             (
@@ -245,7 +256,9 @@ impl Plugin for GeodesicComputePlugin {
                 sync_camera_uniform,
                 sync_objects_uniform,
                 sync_disk_config_uniform,
-                sync_skybox_data,
+                (sync_skybox_data, sync_other_skybox_data)
+                    .chain()
+                    .before(sync_camera_uniform),
             ),
         );
 
@@ -265,12 +278,29 @@ impl Plugin for GeodesicComputePlugin {
             RenderGraph,
             (dispatch_geodesic, dispatch_accumulate)
                 .chain()
+                .run_if(crate::bridge::ray_traced_view)
                 .before(camera_driver),
         );
     }
 }
 
 // ── Startup: create all textures + display sprite ────────────────────────────
+
+fn sync_display_visibility(
+    view: Option<Res<crate::bridge::BridgeView>>,
+    mut sprites: Query<&mut Visibility, With<DisplaySprite>>,
+) {
+    for mut visibility in &mut sprites {
+        *visibility = if view
+            .as_ref()
+            .is_some_and(|view| view.mode == crate::bridge::SimulationView::EinsteinRosen)
+        {
+            Visibility::Hidden
+        } else {
+            Visibility::Visible
+        };
+    }
+}
 
 fn make_rgba8_tex(w: u32, h: u32, images: &mut Assets<Image>) -> Handle<Image> {
     let mut img = Image::new_target_texture(w, h, TextureFormat::Rgba8Unorm, None);
@@ -350,13 +380,34 @@ fn halton(mut i: u32, base: u32) -> f32 {
 
 fn sync_camera_uniform(
     cam: Res<OrbitalCamera>,
-    objects: Res<SimObjects>,
+    (objects, view): (Res<SimObjects>, Option<Res<crate::bridge::BridgeView>>),
     mut uniform: ResMut<CameraUniform>,
-    mut counter: ResMut<StillFrameCounter>,
+    (mut counter, mut last_matter): (ResMut<StillFrameCounter>, Local<Option<(bool, f64)>>),
     mut render_fc: ResMut<RenderFrameCount>,
     mut parity: ResMut<FrameParity>,
     windows: Query<&Window, With<PrimaryWindow>>,
 ) {
+    let matter = view
+        .as_ref()
+        .filter(|view| view.mode == crate::bridge::SimulationView::Ellis)
+        .map(|view| {
+            (
+                view.matter_enabled,
+                if view.matter_enabled {
+                    view.matter_time
+                } else {
+                    0.0
+                },
+            )
+        });
+    let matter_changed = *last_matter != matter;
+    *last_matter = matter;
+    let wormhole_radius =
+        if view.is_some_and(|view| view.mode == crate::bridge::SimulationView::Ellis) {
+            black_hole::ellis::THROAT_RADIUS
+        } else {
+            0.0
+        };
     let aspect = windows
         .single()
         .ok()
@@ -372,7 +423,9 @@ fn sync_camera_uniform(
     // fc = frame_count sent to the GPU for THIS render frame.
     // 0 means "reset accumulation", ≥1 means "blend".
     let scene_moving = cam.is_moving
+        || matter_changed
         || objects.is_changed()
+        || uniform.wormhole_radius != wormhole_radius
         || uniform.polarization_view != cam.polarization_view
         || uniform.frequency_ghz != cam.frequency_ghz
         || uniform.faraday_depth != cam.faraday_depth
@@ -418,7 +471,7 @@ fn sync_camera_uniform(
         frequency_ghz: cam.frequency_ghz,
         faraday_depth: cam.faraday_depth,
         conversion_depth: cam.conversion_depth,
-        _pad7: 0.0,
+        wormhole_radius,
     };
 }
 
@@ -459,27 +512,57 @@ fn sync_skybox_data(
     skybox: Option<Res<SkyboxImage>>,
     images: Option<Res<Assets<Image>>>,
     mut data: ResMut<SkyboxData>,
+    mut cam: ResMut<OrbitalCamera>,
 ) {
     let (Some(skybox), Some(images)) = (skybox, images) else {
         return;
     };
-    if data.handle.as_ref() == Some(&skybox.0) && !data.bytes.is_empty() {
-        return;
+    if update_skybox_data(&skybox.0, &images, &mut data) {
+        cam.is_moving = true;
     }
-    let Some(img) = images.get(&skybox.0) else {
+}
+
+fn sync_other_skybox_data(
+    set: Option<Res<SkyboxSet>>,
+    images: Res<Assets<Image>>,
+    mut data: ResMut<OtherSkyboxData>,
+    mut cam: ResMut<OrbitalCamera>,
+) {
+    let Some(set) = set else {
         return;
     };
-    let Some(raw) = img.data.as_ref() else {
+    if set.handles.len() < 2 {
         return;
+    }
+    let handle = &set.handles[(set.current + 1) % set.handles.len()];
+    if update_skybox_data(handle, &images, &mut data.0) {
+        cam.is_moving = true;
+    }
+}
+
+fn update_skybox_data(
+    handle: &Handle<Image>,
+    images: &Assets<Image>,
+    data: &mut SkyboxData,
+) -> bool {
+    if data.handle.as_ref() == Some(handle) && !data.bytes.is_empty() {
+        return false;
+    }
+    let Some(img) = images.get(handle) else {
+        return false;
+    };
+    let Some(raw) = img.data.as_ref() else {
+        return false;
     };
     let expected_bytes = (img.width() as usize) * (img.height() as usize) * 16;
     if raw.len() != expected_bytes {
-        return;
+        return false;
     }
-    data.handle = Some(skybox.0.clone());
+    data.handle = Some(handle.clone());
     data.width = img.width();
     data.height = img.height();
     data.bytes = std::sync::Arc::from(raw.as_slice());
+    true
 }
 
 pub(crate) const SCALE_PRESETS: &[f32] = &[0.25, 0.5, 0.75, 1.0];
@@ -741,6 +824,49 @@ mod tests {
         app.world_mut().resource_mut::<OrbitalCamera>().is_moving = false;
         assert_eq!(sync_frame(&mut app).0, 0, "counter restarts from zero");
         assert_eq!(sync_frame(&mut app).0, 1);
+    }
+
+    #[test]
+    fn wormhole_mode_changes_reset_accumulation_and_set_the_camera_metric() {
+        use crate::bridge::{BridgeView, SimulationView};
+        let mut app = camera_sync_app();
+        app.init_resource::<BridgeView>();
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(app.world().resource::<RenderFrameCount>().0 > 0);
+        app.world_mut().resource_mut::<BridgeView>().mode = SimulationView::Ellis;
+        app.update();
+        assert_eq!(app.world().resource::<RenderFrameCount>().0, 0);
+        assert_eq!(
+            app.world().resource::<CameraUniform>().wormhole_radius,
+            black_hole::ellis::THROAT_RADIUS
+        );
+        app.world_mut().resource_mut::<BridgeView>().mode = SimulationView::BlackHoles;
+        app.update();
+        assert_eq!(app.world().resource::<RenderFrameCount>().0, 0);
+        assert_eq!(app.world().resource::<CameraUniform>().wormhole_radius, 0.0);
+    }
+
+    #[test]
+    fn matter_updates_reset_accumulation_without_camera_motion() {
+        use crate::bridge::{BridgeView, SimulationView};
+        let mut app = camera_sync_app();
+        app.init_resource::<BridgeView>();
+        app.world_mut().resource_mut::<BridgeView>().mode = SimulationView::Ellis;
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(app.world().resource::<RenderFrameCount>().0 > 0);
+        app.world_mut().resource_mut::<BridgeView>().matter_time = 28.0;
+        app.update();
+        assert_eq!(app.world().resource::<RenderFrameCount>().0, 0);
+        for _ in 0..3 {
+            app.update();
+        }
+        app.world_mut().resource_mut::<BridgeView>().matter_enabled = false;
+        app.update();
+        assert_eq!(app.world().resource::<RenderFrameCount>().0, 0);
     }
 
     proptest! {

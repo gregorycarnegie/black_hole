@@ -14,6 +14,9 @@ use crate::{
 
 pub struct UiPlugin;
 
+#[derive(Component)]
+pub(crate) struct BlackHoleControls;
+
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, setup_panel).add_systems(
@@ -154,6 +157,7 @@ fn setup_panel(mut commands: Commands) {
                 ..default()
             },
             BackgroundColor(PANEL_BG),
+            BlackHoleControls,
         ))
         .with_children(|root| {
             root.spawn((
@@ -289,6 +293,7 @@ fn setup_panel(mut commands: Commands) {
                 ..default()
             },
             BackgroundColor(PANEL_BG),
+            BlackHoleControls,
         ))
         .with_children(|root| {
             spawn_cycle_row(

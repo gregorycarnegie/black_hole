@@ -7,7 +7,8 @@ use bytemuck::Zeroable;
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 use super::{
-    CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform, SkyboxData, cuda::shared_cuda,
+    CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform, OtherSkyboxData, SkyboxData,
+    cuda::shared_cuda,
 };
 use crate::simulation::{
     BINARY_DISK_INNER_RS, SCHWARZSCHILD_RADIUS, kerr_horizon_radius, kerr_isco_radius,
@@ -38,7 +39,7 @@ struct GpuCameraUniform {
     frequency_ghz: f32,
     faraday_depth: f32,
     conversion_depth: f32,
-    _pad7: f32,
+    wormhole_radius: f32,
 }
 
 /// Matches `GpuDiskUniform` in `tools/cuda/kernels.rs` (64 bytes).
@@ -84,12 +85,16 @@ pub struct GeodesicPipeline {
     objects_buf: CudaSlice<u8>,
     pub(super) geodesic_buf: CudaSlice<f32>,
     skybox_buf: CudaSlice<u8>,
+    other_skybox_buf: CudaSlice<u8>,
     pub(super) width: u32,
     pub(super) height: u32,
     sky_width: u32,
     sky_height: u32,
+    other_sky_width: u32,
+    other_sky_height: u32,
     bound_geo_handle: Option<Handle<Image>>,
     bound_sky_handle: Option<Handle<Image>>,
+    bound_other_sky_handle: Option<Handle<Image>>,
     last_objects: Option<GpuObjectsUniform>,
     last_disk: Option<GpuDiskUniform>,
 }
@@ -108,12 +113,16 @@ pub fn init_geodesic_pipeline(mut commands: Commands) {
         objects_buf,
         geodesic_buf,
         skybox_buf,
+        other_skybox_buf: cuda.alloc_zeros::<u8>(16),
         width: 0,
         height: 0,
         sky_width: 0,
         sky_height: 0,
+        other_sky_width: 0,
+        other_sky_height: 0,
         bound_geo_handle: None,
         bound_sky_handle: None,
+        bound_other_sky_handle: None,
         last_objects: None,
         last_disk: None,
     });
@@ -156,6 +165,7 @@ pub struct GeodesicSources<'w> {
     objects_uniform: Option<Res<'w, ObjectsUniform>>,
     disk_config: Option<Res<'w, DiskConfigUniform>>,
     skybox_data: Option<Res<'w, SkyboxData>>,
+    other_skybox_data: Option<Res<'w, OtherSkyboxData>>,
 }
 
 pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets<GpuImage>>) {
@@ -201,7 +211,7 @@ pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets
         frequency_ghz: camera_uniform.frequency_ghz,
         faraday_depth: camera_uniform.faraday_depth,
         conversion_depth: camera_uniform.conversion_depth,
-        _pad7: 0.0,
+        wormhole_radius: camera_uniform.wormhole_radius,
     };
     cuda.memcpy_htod(bytemuck::bytes_of(&gpu_cam), &mut pipeline.camera_buf);
 
@@ -250,11 +260,104 @@ pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets
         pipeline.sky_height = skybox_data.height;
         pipeline.bound_sky_handle = skybox_data.handle.clone();
     }
+    if let Some(data) = sources.other_skybox_data {
+        let data = &data.0;
+        if pipeline.bound_other_sky_handle != data.handle
+            && data.width > 0
+            && data.height > 0
+            && !data.bytes.is_empty()
+        {
+            pipeline.other_skybox_buf = cuda.clone_htod(&data.bytes);
+            pipeline.other_sky_width = data.width;
+            pipeline.other_sky_height = data.height;
+            pipeline.bound_other_sky_handle = data.handle.clone();
+        }
+    }
 }
 
 // ── Render graph node ────────────────────────────────────────────────────────
 
-pub fn dispatch_geodesic(pipeline: Option<ResMut<GeodesicPipeline>>) {
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; checks transmission in the production image kernel"]
+fn wormhole_image_selects_the_proved_critical_impact_sky() {
+    let cuda = shared_cuda();
+    let orbit = crate::camera::OrbitalCamera {
+        radius: 12.0,
+        ..default()
+    };
+    let camera = GpuCameraUniform {
+        pos: orbit.position().into(),
+        right: orbit.right().into(),
+        up: orbit.up().into(),
+        forward: orbit.forward().into(),
+        aspect: 4.0 / 3.0,
+        tan_half_fov: orbit.tan_half_fov(),
+        wormhole_radius: black_hole::ellis::THROAT_RADIUS,
+        max_iter: 10_000,
+        ..GpuCameraUniform::zeroed()
+    };
+    let cam = cuda.clone_htod(bytemuck::bytes_of(&camera));
+    let near = cuda.clone_htod(&[[4.0_f32, 0.0, 0.0, 1.0]]);
+    let far = cuda.clone_htod(&[[0.0_f32, 0.0, 4.0, 1.0]]);
+    let (width, height) = (128_u32, 96_u32);
+    let mut output = cuda.alloc_zeros::<f32>((width * height * 4) as usize);
+    let mut launch = cuda.stream.launch_builder(&cuda.wormhole);
+    launch.arg(&mut output);
+    launch.arg(&cam);
+    launch.arg(&near);
+    launch.arg(&far);
+    launch.arg(&width);
+    launch.arg(&height);
+    launch.arg(&1_u32);
+    launch.arg(&1_u32);
+    launch.arg(&1_u32);
+    launch.arg(&1_u32);
+    launch.arg(&0.0_f32);
+    launch.arg(&0_u32);
+    unsafe {
+        launch
+            .launch(LaunchConfig {
+                grid_dim: (8, 6, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            })
+            .unwrap();
+    }
+    let pixels = cuda.clone_dtoh(&output);
+    let normal = orbit.position().normalize();
+    for y in 0..height {
+        for x in 0..width {
+            let u =
+                (2.0 * (x as f32 + 0.5) / width as f32 - 1.0) * camera.aspect * camera.tan_half_fov;
+            let v = (1.0 - 2.0 * (y as f32 + 0.5) / height as f32) * camera.tan_half_fov;
+            let sight = (u * orbit.right() - v * orbit.up() + orbit.forward()).normalize();
+            let transverse = sight - sight.dot(normal) * normal;
+            let impact = (12.0_f32 * 12.0 + 16.0).sqrt() * transverse.length();
+            let color = &pixels[((y * width + x) * 4) as usize..][..4];
+            assert!(color.iter().all(|c| c.is_finite()));
+            if (impact - 4.0).abs() > 4e-4 {
+                if impact < 4.0 {
+                    assert!(
+                        color[2] > 0.9 && color[0] == 0.0,
+                        "transmitted pixel ({x},{y})={color:?}"
+                    );
+                } else {
+                    assert!(
+                        color[0] > 0.9 && color[2] == 0.0,
+                        "reflected pixel ({x},{y})={color:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub fn dispatch_geodesic(
+    pipeline: Option<ResMut<GeodesicPipeline>>,
+    camera: Option<Res<CameraUniform>>,
+    view: Option<Res<crate::bridge::BridgeView>>,
+) {
     let Some(mut pipeline) = pipeline else {
         return;
     };
@@ -275,10 +378,13 @@ pub fn dispatch_geodesic(pipeline: Option<ResMut<GeodesicPipeline>>) {
         ref objects_buf,
         ref mut geodesic_buf,
         ref skybox_buf,
+        ref other_skybox_buf,
         width,
         height,
         sky_width,
         sky_height,
+        other_sky_width,
+        other_sky_height,
         ..
     } = *pipeline;
 
@@ -287,6 +393,36 @@ pub fn dispatch_geodesic(pipeline: Option<ResMut<GeodesicPipeline>>) {
         block_dim: (16, 16, 1),
         shared_mem_bytes: 0,
     };
+    if camera.is_some_and(|camera| camera.wormhole_radius > 0.0) {
+        // Reuse the near sky until the second asynchronous asset has loaded.
+        let (far_sky, far_w, far_h) = if other_sky_width > 0 && other_sky_height > 0 {
+            (other_skybox_buf, other_sky_width, other_sky_height)
+        } else {
+            (skybox_buf, sky_width, sky_height)
+        };
+        let mut builder = cuda.stream.launch_builder(&cuda.wormhole);
+        builder.arg(geodesic_buf);
+        builder.arg(camera_buf);
+        builder.arg(skybox_buf);
+        builder.arg(far_sky);
+        builder.arg(&width);
+        builder.arg(&height);
+        builder.arg(&sky_width);
+        builder.arg(&sky_height);
+        builder.arg(&far_w);
+        builder.arg(&far_h);
+        let (matter_time, matter_enabled) = view.map_or((0.0_f32, 0_u32), |view| {
+            (view.matter_time as f32, u32::from(view.matter_enabled))
+        });
+        builder.arg(&matter_time);
+        builder.arg(&matter_enabled);
+        unsafe {
+            builder
+                .launch(cfg)
+                .expect("CUDA bh_wormhole kernel launch failed");
+        }
+        return;
+    }
     let mut builder = cuda.stream.launch_builder(&cuda.geodesic);
     builder.arg(geodesic_buf);
     builder.arg(camera_buf);

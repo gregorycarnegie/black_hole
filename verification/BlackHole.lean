@@ -3,6 +3,9 @@ module
 public import BlackHole.Numerics
 public import BlackHole.Binary
 public import BlackHole.Schwarzschild
+public import BlackHole.EinsteinRosen
+public import BlackHole.Ellis
+public import BlackHole.EllisDust
 public import BlackHole.MetricInverse
 public import BlackHole.BinaryCurvature
 public import BlackHole.Calculus

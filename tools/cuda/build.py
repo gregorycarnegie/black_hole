@@ -14,6 +14,7 @@ OXIDE_DIR = ROOT / "tools" / "cuda" / "oxide"
 OUT_PTX = ROOT / "src" / "compute" / "kernels.ptx"
 SOURCE_FILES = [
     ROOT / "tools" / "cuda" / "kernels.rs",
+    ROOT / "src" / "ellis.rs",
     OXIDE_DIR / "Cargo.toml",
     OXIDE_DIR / "Cargo.lock",
     OXIDE_DIR / "rust-toolchain.toml",

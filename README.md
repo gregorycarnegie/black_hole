@@ -25,6 +25,7 @@ Simulates null geodesics (light paths) in Kerr spacetime in mass-independent gra
 6. **Skyboxes** — a procedural checker grid plus bilinearly filtered equirectangular HDR space backgrounds sampled along each ray's lensed escape direction
 7. **Polarized transfer** ? transported polarization basis, Stokes I/Q/U/V, power-law synchrotron emission, scalar absorption, Faraday rotation and conversion, and selectable diagnostic views
 8. **Filmic lighting** — an ACES curve approximation applied after combining disk and background lighting
+9. **Wormholes** — CUDA ray tracing through an Ellis throat between two skies, plus an evolving Einstein–Rosen spatial embedding. Both have Lean-checked equations; the Einstein–Rosen bridge is nontraversable.
 
 ## Controls
 
@@ -34,6 +35,10 @@ Simulates null geodesics (light paths) in Kerr spacetime in mass-independent gra
 |-----------------|------------------------------------------------|
 | Left mouse drag | Orbit camera                                   |
 | Scroll wheel    | Zoom in/out                                    |
+| W               | Cycle black holes / ray-traced Ellis wormhole / Einstein–Rosen diagram |
+| Left / Right    | In the Einstein–Rosen diagram: step Kruskal time by 0.05; pause |
+| Space / R       | In wormhole modes: play/pause / reset dust time or Einstein–Rosen v to 0 |
+| D               | Toggle the evolving test-dust emission in the Ellis wormhole |
 | `[` / `]`       | Decrease / increase FOV                        |
 | `-` / `=`       | Decrease / increase render scale (25 – 100 %)  |
 | Q / E           | Decrease / increase Kerr spin, or selected binary-hole spin magnitude (±0.05) |
@@ -97,6 +102,14 @@ In binary mode, the on-screen `BH` selector chooses which black hole is being ed
 The spacetime grid is drawn each frame using Bevy's `Gizmos` API, with vertex Y-positions displaced by `2 * sqrt(r_s * (r - r_s))` (the Schwarzschild embedding).
 
 ## Units and timing
+
+The ray-traced Ellis view uses the metric and camera-to-sky construction in [James et al., *Visualizing Interstellar's Wormhole*](https://arxiv.org/abs/1502.03809), Eqs. (1), (2), (13), and (16). `W` enters this mode; drag to orbit, scroll to approach the throat, use `[` / `]` for field of view, and `B` to cycle pairs of skies. The first sky is the current background and the second is the next background in the list. Rays may cross the throat or turn back to their starting side. The CUDA renderer uses the existing temporal accumulation and tone mapping. Magenta identifies unresolved rays, including a narrow band around the critical photon orbit.
+
+The Ellis throat radius is fixed at 4 scene-length units. These are arbitrary length units for this massless metric, rather than a gravitational radius defined by its mass. A pressureless test-dust pulse flows through the throat with coordinate speed -0.5c. Its density is an exact time-dependent solution of the relativistic continuity equation. The renderer samples its optically thin emission at retarded time, including the fluid-frame Doppler factor. Space pauses/resumes the flow, R rewinds it, and D hides/shows the matter. Geometry remains prescribed: supporting exotic matter, gravitational backreaction, pressure, magnetic fields, and stability are not evolved. [Ellis equations, proof coverage, and numerical tests](verification/ellis.md) document the implementation.
+
+The bridge view follows [Collas & Klein, *Embeddings and time evolution of the Schwarzschild wormhole*](https://arxiv.org/abs/1107.4871), Eqs. (3), (5), (21), (22), and (24). Its two colors distinguish the two signed spatial sheets. Embedding height is an auxiliary Euclidean coordinate, not a physical travel direction. The original [Einstein & Rosen paper (1935)](https://doi.org/10.1103/PhysRev.48.73) motivates the two-sheet construction; this view uses the modern Schwarzschild/Kruskal extension. [Fuller & Wheeler (1962)](https://doi.org/10.1103/PhysRev.128.919) analyze its causal obstruction.
+
+Bridge playback advances Kruskal coordinate time by 0.2 per application second and stops at v = 0.95. The finite display domain is |u| <= 32, |v| <= 0.95; the singular pinch at |v| = 1 and separated slices are excluded. The camera remains an external diagram viewer. See [the equations, proofs, and numerical checks](verification/einstein-rosen.md) for coverage and limitations.
 
 Camera, objects, grid, Kerr radii, and GPU ray tracing use `G = c = M = 1`: distances are in gravitational radii `r_g = GM/c²`, and object masses are fractions of the total black-hole mass. The Schwarzschild radius is `2 r_g`; the UI continues to express disk radii in `r_s`. The same scene therefore represents a stellar-mass or supermassive black hole without changing shader constants.
 
