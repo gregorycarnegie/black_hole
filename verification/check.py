@@ -35,6 +35,8 @@ def build():
         "KerrVacuumSpatial23",
         "KerrVacuumSpatial33",
         "KerrVacuumMixed",
+        "NagaFixtureSmall",
+        "NagaFixtureSmallSpirv",
         *(f"NagaFixtureKerr{part}" for part in range(6)),
         "NagaFixtureKerr",
         *(f"NagaFixtureKerrSpirv{part}" for part in range(6)),

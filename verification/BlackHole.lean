@@ -91,6 +91,8 @@ public import BlackHole.KernelFixture
 public import BlackHole.CudaGeodesic
 public import BlackHole.WgslRAChk
 public import BlackHole.NagaFixture
+public import BlackHole.NagaFixtureSmall
+public import BlackHole.NagaFixtureSmallSpirv
 public import BlackHole.NagaFixtureKerr
 public import BlackHole.NagaFixtureKerrSpirv
 public import BlackHole.NagaFixturePlasma

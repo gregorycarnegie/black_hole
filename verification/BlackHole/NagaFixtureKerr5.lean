@@ -2,8 +2,8 @@ module
 
 public import BlackHole.NagaFixture
 
-/-! Check `add_kerr`'s clearance output (80) in a separate process to bound
-kernel-reduction memory. -/
+/-! Check `add_kerr`'s clearance output (80) (`checkPart` with `k = 4`),
+in a separate process to bound kernel-reduction memory. -/
 
 @[expose] public section
 
@@ -12,8 +12,8 @@ open WgslExpr KernelFixture
 
 set_option maxHeartbeats 4000000 in
 set_option maxRecDepth 100000 in
-theorem naga_add_kerr_5 :
-    checkPart nagaFixture "add_kerr" "add_kerr" GExpr.input 16 5 = true := by
+theorem naga_add_kerr_20 :
+    checkPart nagaFixture "add_kerr" "add_kerr" GExpr.input 4 20 = true := by
   decide +kernel
 
 end BlackHole.NagaFixture

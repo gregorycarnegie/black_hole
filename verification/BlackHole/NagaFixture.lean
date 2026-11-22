@@ -18,8 +18,9 @@ and unrolls loops; that evaluator and the fixture writer remain trusted.
 program `n`; `check_sound` turns an accepted check into `RA` between every
 expanded output. The kernel checks every compared kernel, for the trees of
 naga's WGSL front end and for those read back from the SPIR-V naga writes
-(`naga-raw-spirv.sexp`): `naga_small` here, `add_kerr` in `NagaFixtureKerr`
-and `NagaFixtureKerrSpirv`, and `sample_plasma` in `NagaFixturePlasma`.
+(`naga-raw-spirv.sexp`): the `small` kernels in `NagaFixtureSmall` and
+`NagaFixtureSmallSpirv`, `add_kerr` in `NagaFixtureKerr` and
+`NagaFixtureKerrSpirv`, and `sample_plasma` in `NagaFixturePlasma`.
 So each domain theorem stated for every reassociation of a model holds for
 the tree naga builds, read with `std`'s rewrites (`exact_withLets_std`: they
 do not change the exact value). -/
@@ -93,7 +94,10 @@ theorem checkParts_sound {F : List (String × GExpr)} {m n : String} {σ : ℕ �
   generalize k * (i / k) = a at hi hra
   generalize i % k = r at hi hik
   subst hi
-  simpa using hra r (by simp only [List.length_take, List.length_drop]; omega)
+  rw [List.getElem_drop' h1, List.getElem_drop' h2,
+    List.getElem_take' (xs := (modelOuts m σ).drop a) (by simp only [List.length_drop]; omega) hik,
+    List.getElem_take' (xs := (nagaOuts F n).drop a) (by simp only [List.length_drop]; omega) hik]
+  exact hra r (by simp only [List.length_take, List.length_drop]; omega)
     (by simp only [List.length_take, List.length_drop]; omega)
 
 /-! #### `std` keeps the exact value of a slot program -/
@@ -152,21 +156,11 @@ theorem exact_withLets_std (v : ℕ → ℝ) (S : List GExpr) (e : GExpr) :
   rw [withLets, withLets, exact_subst, exact_subst, exact_std]
   exact congrArg (fun w => exact w e) (funext fun i => (he i).symm)
 
-/-! #### The checks -/
-
-/-- Every compared kernel except `add_kerr` and `sample_plasma`. -/
+/-- Every compared kernel except `add_kerr` and `sample_plasma`, checked in
+`NagaFixtureSmall` and `NagaFixtureSmallSpirv`. -/
 def small : List String :=
   ["geodesic_rhs", "atan_poly", "tonemap", "heatmap_color", "polarization_color", "spatial_unit",
     "screen_frame", "atan2_arith", "kerr_radius", "sincos", "transfer_phi", "faraday_rotation",
     "polarized_cell"]
-
-set_option maxHeartbeats 1000000 in
-set_option maxRecDepth 100000 in
-theorem naga_small : small.all (fun n => check nagaFixture n n) = true := by decide +kernel
-
-set_option maxHeartbeats 1000000 in
-set_option maxRecDepth 100000 in
-theorem naga_small_spirv : small.all (fun n => check nagaSpirvFixture n n) = true := by
-  decide +kernel
 
 end BlackHole.NagaFixture
