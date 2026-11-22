@@ -67,6 +67,35 @@ theorem check_sound {F : List (String × GExpr)} {m n : String} {σ : ℕ → GE
         (withLets (nagaSlots F n) (nagaOuts F n)[i]) :=
   chkProg_sound h
 
+/-- Outputs `k*j` to `k*j+k-1` of `check F m n σ`. Separate kernel checks of
+the parts bound the kernel's memory on large programs. -/
+def checkPart (F : List (String × GExpr)) (m n : String) (σ : ℕ → GExpr) (k j : ℕ) : Bool :=
+  chkProg (modelSlots m) (nagaSlots F n) (((modelOuts m σ).drop (k*j)).take k)
+    (((nagaOuts F n).drop (k*j)).take k)
+
+/-- Accepted parts `0, …, c-1` covering every output give `check_sound`'s conclusion. -/
+theorem checkParts_sound {F : List (String × GExpr)} {m n : String} {σ : ℕ → GExpr} {k c : ℕ}
+    (hl : (modelOuts m σ).length = (nagaOuts F n).length) (hc : (modelOuts m σ).length ≤ k*c)
+    (h : ∀ j < c, checkPart F m n σ k j = true) :
+    (modelOuts m σ).length = (nagaOuts F n).length ∧ ∀ i (h1 : i < (modelOuts m σ).length)
+      (h2 : i < (nagaOuts F n).length),
+      WgslReassoc.RA (withLets (modelSlots m) (modelOuts m σ)[i])
+        (withLets (nagaSlots F n) (nagaOuts F n)[i]) := by
+  refine ⟨hl, fun i h1 h2 => ?_⟩
+  have hk : 0 < k := Nat.pos_of_ne_zero (by rintro rfl; rw [Nat.zero_mul] at hc; omega)
+  have hj : i / k < c :=
+    (Nat.div_lt_iff_lt_mul hk).2 (Nat.lt_of_lt_of_le h1 (hc.trans_eq (Nat.mul_comm k c)))
+  have hp := h _ hj
+  unfold checkPart at hp
+  have hra := (chkProg_sound hp).2
+  have hik := Nat.mod_lt i hk
+  have hi := Nat.div_add_mod i k
+  generalize k * (i / k) = a at hi hra
+  generalize i % k = r at hi hik
+  subst hi
+  simpa using hra r (by simp only [List.length_take, List.length_drop]; omega)
+    (by simp only [List.length_take, List.length_drop]; omega)
+
 /-! #### `std` keeps the exact value of a slot program -/
 
 lemma exact_subst (v : ℕ → ℝ) (σ : ℕ → GExpr) :

@@ -34,8 +34,11 @@ On Windows, if Elan is not on `PATH`, first run
 `check.py` builds the large curvature and naga fixture modules one at a time,
 including each of the eight plasma checks (four models for each of the WGSL
 and SPIR-V fixtures) in its own module and process. `NagaFixturePlasma` combines
-those checked results into the same two aggregate theorem statements. Use the script for a cold build;
-building the aggregate directly can launch its expensive imports concurrently.
+those checked results into the same two aggregate theorem statements. Likewise
+`add_kerr`'s 81 outputs are checked in six parts per fixture
+(`NagaFixtureKerr0`–`5`, `NagaFixtureKerrSpirv0`–`5`), which
+`NagaFixture.checkParts_sound` combines into `check_sound`'s conclusion. Use the script for a cold build;
+building an aggregate directly can launch its expensive imports concurrently.
 It then builds the complete project, audits all project declarations' axiom dependencies and independently
 replays the compiled proofs (`--build` and `--replay` run the two phases
 separately; CI runs them as separate jobs). On a 16 GB hosted runner with swap,
@@ -43,7 +46,9 @@ separately; CI runs them as separate jobs). On a 16 GB hosted runner with swap,
 cache. Concurrent naga fixture checks exhausted RAM and used about 32 GB of swap
 before hitting CI's 330-minute timeout. A later serial run also timed out in
 the monolithic plasma fixture after using roughly 16 GB RAM and 32 GB swap;
-this is why its cases now build separately. The script also sets
+this is why its cases now build separately. The monolithic `add_kerr` checks
+then took 70–100 minutes each at roughly 16 GB RAM and 13–16 GB swap, and the
+kernel replay also thrashed past its 6-hour limit, so they were split too. The script also sets
 `LEAN_NUM_THREADS=1`; an earlier concurrent
 replay failed to resolve a Mathlib import. A parallel curvature build also
 exhausted a 64 GB workstation's free memory.

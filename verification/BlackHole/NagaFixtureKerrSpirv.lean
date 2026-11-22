@@ -1,19 +1,38 @@
 module
 
 public import BlackHole.NagaFixtureKerr
+public import BlackHole.NagaFixtureKerrSpirv0
+public import BlackHole.NagaFixtureKerrSpirv1
+public import BlackHole.NagaFixtureKerrSpirv2
+public import BlackHole.NagaFixtureKerrSpirv3
+public import BlackHole.NagaFixtureKerrSpirv4
+public import BlackHole.NagaFixtureKerrSpirv5
 
 /-! The trees read back from the SPIR-V naga writes for `add_kerr` and its
-spin scaling are reassociations of the models (`NagaFixture`). -/
+spin scaling are reassociations of the models (`NagaFixture`), checked in six
+parts like `NagaFixtureKerr`. -/
 
 @[expose] public section
 
 namespace BlackHole.NagaFixture
-open KernelFixture
+open WgslExpr WgslLets KernelFixture
 
-set_option maxHeartbeats 4000000 in
 set_option maxRecDepth 100000 in
-theorem naga_add_kerr_spirv : check nagaSpirvFixture "add_kerr" "add_kerr" = true := by
-  decide +kernel
+theorem naga_add_kerr_spirv :
+    (modelOuts "add_kerr" GExpr.input).length = (nagaOuts nagaSpirvFixture "add_kerr").length ∧
+      ∀ i (h1 : i < (modelOuts "add_kerr" GExpr.input).length)
+        (h2 : i < (nagaOuts nagaSpirvFixture "add_kerr").length),
+        WgslReassoc.RA (withLets (modelSlots "add_kerr") (modelOuts "add_kerr" GExpr.input)[i])
+          (withLets (nagaSlots nagaSpirvFixture "add_kerr") (nagaOuts nagaSpirvFixture "add_kerr")[i]) :=
+  checkParts_sound (k := 16) (c := 6) (by decide +kernel) (by decide +kernel) fun j hj =>
+    match j, hj with
+    | 0, _ => naga_add_kerr_spirv_0
+    | 1, _ => naga_add_kerr_spirv_1
+    | 2, _ => naga_add_kerr_spirv_2
+    | 3, _ => naga_add_kerr_spirv_3
+    | 4, _ => naga_add_kerr_spirv_4
+    | 5, _ => naga_add_kerr_spirv_5
+    | _+6, h => absurd h (by omega)
 
 set_option maxRecDepth 100000 in
 theorem naga_add_kerr_spin_spirv :

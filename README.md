@@ -1,7 +1,6 @@
 [![Rust](https://img.shields.io/badge/Rust-2024-f74c00?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Bevy](https://img.shields.io/badge/Bevy-0.20.1-232326?logo=bevy&logoColor=white)](https://bevyengine.org/)
 ![WESL](https://img.shields.io/badge/WESL-compute%20shader-005a9c)
-[![Lean 4](https://img.shields.io/badge/Lean-4-375f99)](verification/README.md)
 [![CI](https://github.com/gregorycarnegie/black_hole/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/gregorycarnegie/black_hole/actions/workflows/ci.yml)
 [![Lean verification](https://github.com/gregorycarnegie/black_hole/actions/workflows/verification.yml/badge.svg?branch=main&event=push)](https://github.com/gregorycarnegie/black_hole/actions/workflows/verification.yml)
 [![Version tag](https://img.shields.io/github/v/tag/gregorycarnegie/black_hole?sort=semver&label=version)](https://github.com/gregorycarnegie/black_hole/tags)

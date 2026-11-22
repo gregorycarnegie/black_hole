@@ -23,7 +23,8 @@ def run(*arguments):
 
 
 def build():
-    # Prebuild each plasma case before Lake sees the aggregate's parallel imports.
+    # Prebuild each add_kerr part and plasma case before Lake sees the
+    # aggregates' parallel imports.
     # Concurrent curvature and fixture checks exhaust RAM and thrash swap.
     for module in (
         "KerrVacuumTime",
@@ -34,7 +35,9 @@ def build():
         "KerrVacuumSpatial23",
         "KerrVacuumSpatial33",
         "KerrVacuumMixed",
+        *(f"NagaFixtureKerr{part}" for part in range(6)),
         "NagaFixtureKerr",
+        *(f"NagaFixtureKerrSpirv{part}" for part in range(6)),
         "NagaFixtureKerrSpirv",
         "NagaFixturePlasma0",
         "NagaFixturePlasma1",
