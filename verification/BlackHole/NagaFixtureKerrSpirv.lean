@@ -20,8 +20,8 @@ open WgslExpr WgslLets KernelFixture
 set_option maxRecDepth 100000 in
 theorem naga_add_kerr_spirv :
     (modelOuts "add_kerr" GExpr.input).length = (nagaOuts nagaSpirvFixture "add_kerr").length ∧
-      ∀ i (h1 : i < (modelOuts "add_kerr" GExpr.input).length)
-        (h2 : i < (nagaOuts nagaSpirvFixture "add_kerr").length),
+      ∀ i (_h1 : i < (modelOuts "add_kerr" GExpr.input).length)
+        (_h2 : i < (nagaOuts nagaSpirvFixture "add_kerr").length),
         WgslReassoc.RA (withLets (modelSlots "add_kerr") (modelOuts "add_kerr" GExpr.input)[i])
           (withLets (nagaSlots nagaSpirvFixture "add_kerr")
             (nagaOuts nagaSpirvFixture "add_kerr")[i]) :=

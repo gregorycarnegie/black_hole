@@ -28,12 +28,7 @@ def build():
     # Concurrent curvature and fixture checks exhaust RAM and thrash swap.
     for module in (
         "KerrVacuumTime",
-        "KerrVacuumSpatial11",
-        "KerrVacuumSpatial12",
-        "KerrVacuumSpatial13",
-        "KerrVacuumSpatial22",
-        "KerrVacuumSpatial23",
-        "KerrVacuumSpatial33",
+        *(f"KerrVacuumSpatial{i}{j}" for i in range(1, 4) for j in range(i, 4)),
         "KerrVacuumMixed",
         "NagaFixtureSmall",
         "NagaFixtureSmallSpirv",
@@ -41,14 +36,8 @@ def build():
         "NagaFixtureKerr",
         *(f"NagaFixtureKerrSpirv{part}" for part in range(6)),
         "NagaFixtureKerrSpirv",
-        "NagaFixturePlasma0",
-        "NagaFixturePlasma1",
-        "NagaFixturePlasma2",
-        "NagaFixturePlasma3",
-        "NagaFixturePlasmaSpirv0",
-        "NagaFixturePlasmaSpirv1",
-        "NagaFixturePlasmaSpirv2",
-        "NagaFixturePlasmaSpirv3",
+        *(f"NagaFixturePlasma{part}" for part in range(4)),
+        *(f"NagaFixturePlasmaSpirv{part}" for part in range(4)),
         "NagaFixturePlasma",
     ):
         run("--no-ansi", "build", f"BlackHole.{module}")

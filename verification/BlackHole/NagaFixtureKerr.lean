@@ -25,8 +25,8 @@ set_option maxRecDepth 100000 in
 /-- `check_sound`'s conclusion for `add_kerr`, from the 21 checked parts. -/
 theorem naga_add_kerr :
     (modelOuts "add_kerr" GExpr.input).length = (nagaOuts nagaFixture "add_kerr").length ∧
-      ∀ i (h1 : i < (modelOuts "add_kerr" GExpr.input).length)
-        (h2 : i < (nagaOuts nagaFixture "add_kerr").length),
+      ∀ i (_h1 : i < (modelOuts "add_kerr" GExpr.input).length)
+        (_h2 : i < (nagaOuts nagaFixture "add_kerr").length),
         WgslReassoc.RA (withLets (modelSlots "add_kerr") (modelOuts "add_kerr" GExpr.input)[i])
           (withLets (nagaSlots nagaFixture "add_kerr") (nagaOuts nagaFixture "add_kerr")[i]) :=
   checkParts_sound (k := 4) (c := 21) (by decide +kernel) (by decide +kernel) fun j hj =>
