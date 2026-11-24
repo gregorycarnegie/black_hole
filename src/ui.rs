@@ -73,6 +73,7 @@ enum UiAction {
     ToggleHeatmap,
     ToggleBinary,
     ToggleDebugBodies,
+    ToggleRtx,
 }
 
 /// Marks a Text node whose content mirrors a live value.
@@ -104,6 +105,7 @@ enum ToggleLabel {
     Heatmap,
     Binary,
     DebugBodies,
+    Rtx,
 }
 
 // ── Palette ──────────────────────────────────────────────────────────────────
@@ -283,14 +285,13 @@ fn setup_panel(mut commands: Commands) {
                     ("Heatmap", UiAction::ToggleHeatmap, ToggleLabel::Heatmap),
                 ],
             );
-            spawn_toggle_row(
-                root,
-                &[(
-                    "Debug",
-                    UiAction::ToggleDebugBodies,
-                    ToggleLabel::DebugBodies,
-                )],
-            );
+            let debug = ("Debug", UiAction::ToggleDebugBodies, ToggleLabel::DebugBodies);
+            // RT-core swarm tracing exists only in builds with the OptiX SDK.
+            if cfg!(feature = "optix") {
+                spawn_toggle_row(root, &[debug, ("RTX", UiAction::ToggleRtx, ToggleLabel::Rtx)]);
+            } else {
+                spawn_toggle_row(root, &[debug]);
+            }
         });
     commands
         .spawn((
@@ -763,6 +764,10 @@ fn handle_button_press(query: UiButtonInteractionQuery<'_, '_>, mut params: Butt
                 );
                 params.cam.is_moving = true;
             }
+            UiAction::ToggleRtx => {
+                params.swarm.rtx = !params.swarm.rtx;
+                params.cam.is_moving = true;
+            }
             UiAction::ToggleDebugBodies => {
                 params.debug.0 = !params.debug.0;
                 rebuild_scene_objects(
@@ -858,6 +863,7 @@ fn update_toggle_buttons(
     gravity: Res<GravityEnabled>,
     binary: Res<BinaryBlackHoles>,
     debug: Res<DebugBodiesEnabled>,
+    swarm: Res<Swarm>,
     mut query: Query<(&Hovered, &mut BackgroundColor, &ToggleLabel)>,
 ) {
     for (hovered, mut bg, label) in &mut query {
@@ -867,6 +873,7 @@ fn update_toggle_buttons(
             ToggleLabel::Heatmap => cam.debug_heatmap,
             ToggleLabel::Binary => binary.enabled,
             ToggleLabel::DebugBodies => debug.0,
+            ToggleLabel::Rtx => swarm.rtx,
         };
         *bg = BackgroundColor(if hovered.get() {
             if active {
@@ -1288,6 +1295,7 @@ mod tests {
         3
     )]
     #[case::binary(UiAction::ToggleBinary, |app: &App| binary(app).enabled, 2)]
+    #[case::rtx(UiAction::ToggleRtx, |app: &App| app.world().resource::<Swarm>().rtx, 2)]
     fn toggle_buttons_flip_their_flags(
         #[case] action: UiAction,
         #[case] flipped: fn(&App) -> bool,
@@ -1359,7 +1367,8 @@ mod tests {
             ToggleLabel::Gravity,
             ToggleLabel::Heatmap,
             ToggleLabel::Binary,
-            ToggleLabel::DebugBodies
+            ToggleLabel::DebugBodies,
+            ToggleLabel::Rtx
         )]
         label: ToggleLabel,
         #[values(false, true)] active: bool,
@@ -1373,6 +1382,7 @@ mod tests {
             ToggleLabel::Heatmap => world.resource_mut::<OrbitalCamera>().debug_heatmap = active,
             ToggleLabel::Binary => world.resource_mut::<BinaryBlackHoles>().enabled = active,
             ToggleLabel::DebugBodies => world.resource_mut::<DebugBodiesEnabled>().0 = active,
+            ToggleLabel::Rtx => world.resource_mut::<Swarm>().rtx = active,
         }
         let toggle = world
             .spawn((Hovered(hovered), BackgroundColor::default(), label))

@@ -26,6 +26,9 @@ pub(crate) struct Swarm {
     pub count: u32,
     /// Coordinate time at the camera, in r_g/c.
     pub time: f64,
+    /// Trace the swarm with RT cores (OptiX) instead of the software BVH. Only
+    /// builds with `--features optix` act on it.
+    pub rtx: bool,
 }
 
 impl Swarm {
@@ -171,8 +174,11 @@ pub struct SwarmPlugin;
 
 impl Plugin for SwarmPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Swarm>()
-            .add_systems(Update, (cycle_swarm, advance_swarm).chain());
+        app.insert_resource(Swarm {
+            rtx: std::env::args_os().any(|arg| arg == "--optix"),
+            ..default()
+        })
+        .add_systems(Update, (cycle_swarm, advance_swarm).chain());
     }
 }
 
@@ -249,7 +255,7 @@ mod tests {
     ) {
         let mut swarm = Swarm {
             count: start,
-            time: 0.0,
+            ..Swarm::default()
         };
         swarm.step(forward);
         assert_eq!(swarm.count, expected);

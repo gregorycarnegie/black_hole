@@ -103,19 +103,33 @@ pub struct GeodesicPipeline {
     last_objects: Option<GpuObjectsUniform>,
     last_disk: Option<GpuDiskUniform>,
     swarm: SwarmDevice,
-    /// RT-core swarm queries, when built with `--features optix` and a driver supports them.
+    /// RT-core swarm queries: None until RTX is first switched on, then the started
+    /// renderer, or None inside if OptiX could not start.
     #[cfg(feature = "optix")]
-    optix: Option<super::optix::OptixRender>,
+    optix: Option<Option<super::optix::OptixRender>>,
+    /// This frame's bodies when the swarm renders through OptiX; empty otherwise.
     #[cfg(feature = "optix")]
     optix_bodies: Vec<GpuSwarmBody>,
 }
 
 impl GeodesicPipeline {
-    fn optix_ready(&self) -> bool {
+    /// Whether the swarm renders through OptiX this frame, starting it on first use.
+    fn use_optix(&mut self, rtx: bool) -> bool {
         #[cfg(feature = "optix")]
-        return self.optix.is_some();
+        return rtx
+            && self
+                .optix
+                .get_or_insert_with(|| {
+                    super::optix::OptixRender::new()
+                        .inspect_err(|e| warn!("OptiX unavailable, using the software BVH: {e}"))
+                        .ok()
+                })
+                .is_some();
         #[cfg(not(feature = "optix"))]
-        false
+        {
+            let _ = rtx;
+            false
+        }
     }
 }
 
@@ -238,16 +252,9 @@ pub fn init_geodesic_pipeline(mut commands: Commands) {
         last_objects: None,
         last_disk: None,
         swarm: SwarmDevice::new(),
-        // Opt-in: with its belt check the BVH is as fast, and OptiX reserves a 512 MB queue.
+        // Started on demand: OptiX reserves a 512 MB queue.
         #[cfg(feature = "optix")]
-        optix: std::env::args_os()
-            .any(|arg| arg == "--optix")
-            .then(|| {
-                super::optix::OptixRender::new()
-                    .inspect_err(|e| warn!("OptiX unavailable, using the software BVH: {e}"))
-                    .ok()
-            })
-            .flatten(),
+        optix: None,
         #[cfg(feature = "optix")]
         optix_bodies: Vec::new(),
     });
@@ -362,10 +369,12 @@ pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets
 
     // Swarm phases move every frame, so upload them whenever bodies are shown.
     pipeline.swarm.count = 0;
+    #[cfg(feature = "optix")]
+    pipeline.optix_bodies.clear();
     if let Some(swarm) = sources.swarm.filter(|swarm| swarm.count > 0) {
         let bodies = swarm_bodies(swarm.count, disk_config.spin, swarm.time);
         // OptiX builds its own motion GAS, so skip the software BVH then.
-        let optix = pipeline.optix_ready();
+        let optix = pipeline.use_optix(swarm.rtx);
         pipeline.swarm.upload(&bodies, optix);
         #[cfg(feature = "optix")]
         if optix {
@@ -518,7 +527,7 @@ pub fn dispatch_geodesic(
         .as_ref()
         .is_some_and(|objects| objects.num_objects == 1);
     #[cfg(feature = "optix")]
-    if !wormhole && pipeline.swarm.count > 0 && pipeline.optix_ready() {
+    if !wormhole && !pipeline.optix_bodies.is_empty() {
         let experiments = active_experiments(single_source, experiments.as_deref());
         let cfg = ray_launch_config(pipeline.width, pipeline.height, single_source);
         render_swarm_with_optix(&mut pipeline, experiments, cfg);
@@ -629,7 +638,7 @@ fn render_swarm_with_optix(pipeline: &mut GeodesicPipeline, experiments: u32, cf
         experiments,
         cfg,
     };
-    if let Some(optix) = p.optix.as_mut() {
+    if let Some(Some(optix)) = p.optix.as_mut() {
         optix.render(&inputs, &p.optix_bodies);
     }
 }
