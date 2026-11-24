@@ -145,7 +145,11 @@ The driver reports 255 registers for both kernels. Local memory is 704 bytes per
 
 The EHT snapshot test traces its gauged path with both controllers and writes `image-gpu.f32` and `image-gpu-dp45.f32`. Compare each with `check_image.py compare --image <file>`. Both resolve every ray (990 captured, 24,610 escaped). Against the refined Zig reference, Stokes I L2 error is 0.719% for RK4 and 0.704% for DP45. The worst I error is 2.75% and 2.87% of the reference peak. The worst relative I error above the floor is 24.27% for both. The maximum null residual is 4.06e-5 and 2.37e-5. The Q, U and V L2 errors are within 0.0001 of each other. Path error does not dominate this image's error. A single launch of each took 711 ms (RK4, run first) and 431 ms (DP45). That is not a controlled timing. The recorded RK4 median is 546 ms.
 
-Not yet measured: the swarm scenes, and the two close-up outlier pixels against an independent reference.
+`dp45_disagreements_against_a_binary64_reference` traces the 16 close-up pixels where the controllers' escape directions differ most. It uses binary64 RK4 on the CPU Kerr field (`certified::Kerr`), starting from the GPU's own initial state. Halving the reference step changed directions by at most 9e-8 rad. The two image outliers top that list. At (196, 103) the error against the reference is 9.1e-2 rad for RK4 and 1.6e-2 for DP45; at (183, 112) it is 2.1e-2 and 4.1e-3. DP45 is closer at 13 of the 16 pixels. Four ordinary pixels agree with the reference to 3e-7 rad under both controllers.
+
+The near-critical classification regression (256 consecutive binary32 impacts around the Schwarzschild critical value, run twice) blocks a default switch as written. RK4 gives zero wrong resolved answers, and DP45 gives 2 per run, all within 1.2e-7 of the critical margin. RK4's zero is not robust, though. Changing the geometric step factor from 0.12 to 0.11 or 0.13 gave RK4 5 and 9 wrong answers per run, against 1 and 2 for DP45. Tightening the DP45 tolerance to 1e-8 or 2e-9 did not help: more steps meant more binary32 rounding, and impact 5.25 rose to 2.9e-3 position error at 2e-9. Neither controller reliably ends near-critical rays as unresolved.
+
+Not yet measured: the swarm scenes.
 
 ## Experiment order
 

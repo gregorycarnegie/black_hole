@@ -1330,3 +1330,196 @@ fn dp45_controller_benchmark() {
         }
     }
 }
+
+/// Escape directions of the pixels where the RK4 and Dormand–Prince controllers
+/// disagree most in the `--profile-renderer` close-up, against a binary64 RK4
+/// reference of the CPU Kerr field (`certified::Kerr`) started from the GPU's own
+/// initial state. Diagnostic: prints which controller is closer.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn dp45_disagreements_against_a_binary64_reference() {
+    use crate::simulation::{
+        DiskConfig, DiskModel, KERR_SPIN, default_binary_spins, scene_objects,
+    };
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+    let (width, height) = (400u32, 300u32);
+    // The profile runner's close-up pose, without jitter.
+    let cam = crate::camera::OrbitalCamera {
+        radius: 24.0,
+        elevation: std::f64::consts::FRAC_PI_2 - 0.1,
+        azimuth: 0.0,
+        ..Default::default()
+    };
+    let camera = GpuCameraUniform {
+        pos: cam.position().into(),
+        right: cam.right().into(),
+        up: cam.up().into(),
+        forward: cam.forward().into(),
+        tan_half_fov: cam.tan_half_fov(),
+        aspect: width as f32 / height as f32,
+        max_iter: cam.max_iter,
+        polarization_view: 2,
+        frequency_ghz: cam.frequency_ghz,
+        faraday_depth: cam.faraday_depth,
+        conversion_depth: cam.conversion_depth,
+        ..GpuCameraUniform::zeroed()
+    };
+    let config = DiskConfig::for_model(DiskModel::TruncatedHotFlow, KERR_SPIN);
+    let disk = build_disk_uniform(&DiskConfigUniform {
+        spin: config.spin,
+        r_outer_rs: config.r_outer_rs,
+        model: config.model.as_u32(),
+        h_thin: config.h_thin,
+        h_hot: config.h_hot,
+        r_trunc_rs: config.r_trunc_rs,
+        tilt_deg: config.tilt_deg,
+        r_bp_rs: config.r_bp_rs,
+        twist_deg: config.twist_deg,
+        binary_enabled: false,
+    });
+    let scene = scene_objects(KERR_SPIN, false, false, 0.0, default_binary_spins());
+    assert_eq!(scene.len(), 1);
+    let mut objects = GpuObjectsUniform::zeroed();
+    objects.num_objects = 1;
+    objects.pos_radius[0] = scene[0].position.extend(scene[0].radius).into();
+    objects.color[0] = scene[0].color.into();
+    objects.mass[0][0] = scene[0].mass;
+    objects.spin[0] = scene[0].spin.extend(0.0).into();
+    let d_camera = cuda.clone_htod(bytemuck::bytes_of(&camera));
+    let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
+    let d_objects = cuda.clone_htod(bytemuck::bytes_of(&objects));
+    let sky: CudaSlice<u8> =
+        cuda.clone_htod(bytemuck::cast_slice(&[0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0]));
+
+    // Escape direction per pixel, or None, for the default (0) and DP45 (4) controllers.
+    let diagnostics_kernel = cuda.module.load_function("bh_geodesic_diagnostics").unwrap();
+    let directions = [0u32, 4].map(|experiments| {
+        let pixels = (width * height) as usize;
+        let mut image = cuda.alloc_zeros::<f32>(pixels * 4);
+        let mut diagnostics = cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);
+        let mut launch = cuda.stream.launch_builder(&diagnostics_kernel);
+        launch.arg(&mut image);
+        launch.arg(&d_camera);
+        launch.arg(&d_disk);
+        launch.arg(&d_objects);
+        launch.arg(&sky);
+        launch.arg(&width);
+        launch.arg(&height);
+        launch.arg(&2u32);
+        launch.arg(&1u32);
+        launch.arg(&mut diagnostics);
+        launch.arg(&experiments);
+        unsafe { launch.launch(ray_launch_config(width, height, true)).unwrap() };
+        drop(launch);
+        let data = cuda.clone_dtoh(&diagnostics);
+        // RayDiagnostics: exit at field 7 (7 = escaped), sky direction at 9..12.
+        data.as_chunks::<RAY_FIELDS>()
+            .0
+            .iter()
+            .map(|d| (d[7] == 7).then(|| [9, 10, 11].map(|i| f64::from(f32::from_bits(d[i])))))
+            .collect::<Vec<_>>()
+    });
+    let angle = |a: [f64; 3], b: [f64; 3]| {
+        let dot: f64 = (0..3).map(|i| a[i] * b[i]).sum();
+        let norm = |v: [f64; 3]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        (dot / (norm(a) * norm(b))).clamp(-1.0, 1.0).acos()
+    };
+    let mut disagreements: Vec<(f64, u32)> = (0..width * height)
+        .filter_map(|i| match (directions[0][i as usize], directions[1][i as usize]) {
+            (Some(a), Some(b)) => Some((angle(a, b), i)),
+            _ => None,
+        })
+        .collect();
+    disagreements.sort_by(|a, b| b.0.total_cmp(&a.0));
+    // The 16 largest disagreements, then four ordinary pixels as a set-up check.
+    let mut chosen: Vec<u32> = disagreements.iter().take(16).map(|d| d.1).collect();
+    let n = disagreements.len();
+    chosen.extend([n / 5, 2 * n / 5, 3 * n / 5, 4 * n / 5].map(|k| disagreements[k].1));
+
+    let pixel_input: Vec<f32> = chosen
+        .iter()
+        .flat_map(|&i| [(i % width) as f32, (i / width) as f32, width as f32, height as f32])
+        .collect();
+    let d_pixels = cuda.clone_htod(&pixel_input);
+    let mut d_states = cuda.alloc_zeros::<f32>(chosen.len() * 12);
+    let pixel_kernel = cuda.module.load_function("bh_test_pixel_ray").unwrap();
+    let mut launch = cuda.stream.launch_builder(&pixel_kernel);
+    launch.arg(&d_camera);
+    launch.arg(&d_objects);
+    launch.arg(&d_pixels);
+    launch.arg(&mut d_states);
+    let count = chosen.len() as u32;
+    launch.arg(&count);
+    unsafe {
+        launch
+            .launch(LaunchConfig {
+                grid_dim: (count, 1, 1),
+                block_dim: (1, 1, 1),
+                shared_mem_bytes: 0,
+            })
+            .unwrap()
+    };
+    drop(launch);
+    let states = cuda.clone_dtoh(&d_states);
+
+    let spin = scene[0].spin.as_dvec3().to_array();
+    let kerr = black_hole::certified::Kerr::new(spin).unwrap();
+    let horizon = 1.0 + (1.0 - spin.iter().map(|a| a * a).sum::<f64>()).sqrt();
+    // Binary64 RK4 with steps of `factor` times horizon clearance over speed, until the
+    // coordinate radius passes 1600 as in the renderer. None if it nears the horizon.
+    let reference = |start: [f64; 11], factor: f64| -> Option<[f64; 3]> {
+        let mut s = start;
+        let add = |s: [f64; 11], d: [f64; 11], h: f64| std::array::from_fn(|i| s[i] + h * d[i]);
+        for _ in 0..50_000_000 {
+            let k1 = kerr.phase_rhs(s);
+            if s[..3].iter().map(|x| x * x).sum::<f64>().sqrt() > 1600.0 {
+                return Some([k1[0], k1[1], k1[2]]);
+            }
+            let clearance = kerr.radius([s[0], s[1], s[2]]) - horizon;
+            if clearance < 1.0e-3 {
+                return None;
+            }
+            let speed = k1[..3].iter().map(|x| x * x).sum::<f64>().sqrt();
+            let h = factor * clearance / speed;
+            let k2 = kerr.phase_rhs(add(s, k1, 0.5 * h));
+            let k3 = kerr.phase_rhs(add(s, k2, 0.5 * h));
+            let k4 = kerr.phase_rhs(add(s, k3, h));
+            s = std::array::from_fn(|i| {
+                s[i] + h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
+            });
+        }
+        None
+    };
+    let (mut rk4_closer, mut dp45_closer) = (0, 0);
+    for (n, &i) in chosen.iter().enumerate() {
+        let v: Vec<f64> = states[12 * n..12 * n + 12].iter().map(|&x| f64::from(x)).collect();
+        let start = [v[0], v[1], v[2], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]];
+        let (rk4, dp45) = (directions[0][i as usize].unwrap(), directions[1][i as usize].unwrap());
+        let (x, y) = (i % width, i / width);
+        let (Some(coarse), Some(fine)) = (reference(start, 0.004), reference(start, 0.002)) else {
+            println!("({x}, {y}): reference reached the horizon");
+            continue;
+        };
+        let converged = angle(coarse, fine);
+        let (e_rk4, e_dp45) = (angle(rk4, fine), angle(dp45, fine));
+        println!(
+            "({x:3}, {y:3}): controllers differ {:.2e} rad; error rk4 {e_rk4:.2e}, \
+             dp45 {e_dp45:.2e}; reference step-halving change {converged:.1e}",
+            angle(rk4, dp45)
+        );
+        assert!(converged < 1.0e-6, "reference not converged at ({x}, {y})");
+        if n < 16 {
+            if e_dp45 < e_rk4 {
+                dp45_closer += 1;
+            } else {
+                rk4_closer += 1;
+            }
+        } else {
+            // Ordinary pixels: both controllers agree with the reference.
+            assert!(e_rk4.max(e_dp45) < 1.0e-3, "set-up mismatch at ({x}, {y})");
+        }
+    }
+    println!("largest disagreements: dp45 closer at {dp45_closer}, rk4 closer at {rk4_closer}");
+}

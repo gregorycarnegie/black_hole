@@ -158,10 +158,10 @@ fn adaptive_controller_misses_trajectory_targets() {
 #[ignore = "requires a GPU; run with --release -- --ignored"]
 fn classification_against_the_critical_impact_parameter() {
     let critical = 27.0_f64.sqrt() * MASS;
-    let run = |impacts: &[f32], disk_inner: f32| {
+    let run = |impacts: &[f32], disk_inner: f32, dormand_prince: f32| {
         let mut input = Vec::new();
         for &impact in impacts {
-            for value in [impact, disk_inner, 0.0, 0.0] {
+            for value in [impact, disk_inner, dormand_prince, 0.0] {
                 input.extend_from_slice(&value.to_le_bytes());
             }
         }
@@ -204,7 +204,7 @@ fn classification_against_the_critical_impact_parameter() {
     // Coarse pass to locate the critical impact, then every binary32 impact in
     // a window around it.
     let coarse: Vec<f32> = (0..64).map(|i| 5.0 + 0.4 * i as f32 / 63.0).collect();
-    let rays = run(&coarse, 0.0);
+    let rays = run(&coarse, 0.0, 0.0);
     let index = rays.iter().position(|r| r.3 < 0.0).unwrap();
     let centre = coarse[index - 1] + (coarse[index] - coarse[index - 1])
         * (rays[index - 1].3 / (rays[index - 1].3 - rays[index].3)) as f32;
@@ -214,32 +214,42 @@ fn classification_against_the_critical_impact_parameter() {
         fine.push(impact);
         impact = f32::from_bits(impact.to_bits() + 1);
     }
-    let mut wrong = Vec::new();
-    for disk_inner in [0.0, 4.0] {
+    // Wrong resolved answers for the production RK4 controller and the Dormand–Prince
+    // experiment. Only RK4 is held to zero: perturbing the 0.12 geometric step factor to
+    // 0.11 or 0.13 gave RK4 5 and 9 wrong answers per run (DP45: 1 and 2), so neither
+    // controller leaves every near-critical ray unresolved (checklist P1.1b).
+    let mut wrong = [Vec::new(), Vec::new()];
+    for (disk_inner, dormand_prince) in [(0.0, 0.0), (4.0, 0.0), (0.0, 1.0), (4.0, 1.0)] {
         let mut counts = [0; 5];
-        for (impact, (b, status, steps, margin)) in fine.iter().zip(run(&fine, disk_inner)) {
+        let rays = run(&fine, disk_inner, dormand_prince);
+        for (impact, (b, status, steps, margin)) in fine.iter().zip(rays) {
             counts[status as usize] += 1;
             // Positive margin: E² exceeds the potential barrier, so the ray is captured.
             let exact = if margin > 0.0 { 1 } else { 2 };
             let result = if status == 4 { 1 } else { status };
             if (result == 1 || result == 2) && result != exact {
-                wrong.push((*impact, b - critical, margin, status, steps));
+                wrong[dormand_prince as usize].push((*impact, b - critical, margin, status, steps));
             }
         }
         println!(
-            "critical b = {critical}; window {:?}..{:?}; statuses captured/escaped/unresolved/early: {}/{}/{}/{}",
+            "{} disk inner {disk_inner}: critical b = {critical}; window {:?}..{:?}; statuses captured/escaped/unresolved/early: {}/{}/{}/{}",
+            if dormand_prince != 0.0 { "dp45" } else { "rk4" },
             fine[0], fine[255], counts[1], counts[2], counts[0] + counts[3], counts[4]
         );
     }
-    for (impact, offset, margin, status, steps) in wrong.iter().take(8) {
+    for (impact, offset, margin, status, steps) in wrong.iter().flatten().take(8) {
         println!(
             "misclassified impact {impact}: b - b_c = {offset:.3e}, (E² - V_max)/E² = {margin:.3e}, \
              status {status}, {steps} steps"
         );
     }
-    println!("{} disagreements across the two 256-ray runs", wrong.len());
+    println!(
+        "wrong resolved answers: rk4 {}, dp45 {} across two 256-ray runs each",
+        wrong[0].len(),
+        wrong[1].len()
+    );
     assert!(
-        wrong.is_empty(),
+        wrong[0].is_empty(),
         "resolved near-critical rays must match the reference"
     );
 }

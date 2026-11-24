@@ -2968,6 +2968,43 @@ fn pixel_output(rgb: Vec3, stokes: Vec4, iterations: u32, cam: &Camera) -> Vec3 
     output
 }
 
+/// The coordinate direction of pixel (`pix_x`, `pix_y`) before the camera tetrad.
+#[inline(always)]
+fn pixel_direction(cam: &Camera, pix_x: u32, pix_y: u32, width: u32, height: u32) -> Vec3 {
+    let u = (2.0 * (pix_x as f32 + 0.5 + cam.jitter_x) / width as f32 - 1.0)
+        * cam.aspect
+        * cam.tan_half_fov;
+    let v = (1.0 - 2.0 * (pix_y as f32 + 0.5 + cam.jitter_y) / height as f32) * cam.tan_half_fov;
+    (u * cam.right - v * cam.up + cam.forward).normalize()
+}
+
+/// The initial ray `render_geodesic` traces for pixel (`x`, `y`) of a `z`×`w` image:
+/// position, momentum and screen vector, so host references can start from it.
+#[cuda_device::kernel]
+pub unsafe fn bh_test_pixel_ray(
+    cam: *const Camera,
+    objects: *const Objects,
+    pixels: *const Vec4,
+    results: *mut Vec4,
+    count: u32,
+) {
+    let id = gid_x();
+    if id >= count {
+        return;
+    }
+    let cam = unsafe { &*cam };
+    let objects = unsafe { &*objects };
+    let c = unsafe { *pixels.add(id as usize) };
+    let dir = pixel_direction(cam, c.x as u32, c.y as u32, c.z as u32, c.w as u32);
+    let ray = init_ray(cam.pos, dir, scene_metric(cam.pos, objects), cam);
+    let base = (3 * id) as usize;
+    unsafe {
+        *results.add(base) = vec4_v3_f(ray.pos, 0.0);
+        *results.add(base + 1) = ray.p;
+        *results.add(base + 2) = ray.screen;
+    }
+}
+
 /// Renders pixel (`pix_x`, `pix_y`). With SWARM, `swarm_hit(start, end, t0, t1, state)`
 /// tests each accepted step against the swarm, as `swarm_segment_hit` does.
 #[inline(always)]
@@ -3001,11 +3038,7 @@ unsafe fn render_geodesic<
     let objects = unsafe { &*objects };
     let idx = (pix_y * width + pix_x) as usize;
 
-    let u = (2.0 * (pix_x as f32 + 0.5 + cam.jitter_x) / width as f32 - 1.0)
-        * cam.aspect
-        * cam.tan_half_fov;
-    let v = (1.0 - 2.0 * (pix_y as f32 + 0.5 + cam.jitter_y) / height as f32) * cam.tan_half_fov;
-    let dir = (u * cam.right - v * cam.up + cam.forward).normalize();
+    let dir = pixel_direction(cam, pix_x, pix_y, width, height);
     let mut metric = scene_metric(cam.pos, objects);
     let mut stats = RayDiagnostics::default();
     let mut exit = RayExit::IterationLimit;
@@ -3934,12 +3967,14 @@ pub unsafe fn bh_test_controller_classify(
             }
         }
         let distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
-        let step = advance_ray(
-            ray,
-            (distance / velocity.length().max(1.0e-6)).min(next_h),
-            metric,
-            objects,
-        );
+        let wanted = (distance / velocity.length().max(1.0e-6)).min(next_h);
+        // cases.z != 0 selects the Dormand–Prince controller.
+        let step = if c.z != 0.0 {
+            let mut m = metric;
+            advance_ray_dp45::<false>(ray, wanted, &mut m, false, objects, &mut 0)
+        } else {
+            advance_ray(ray, wanted, metric, objects)
+        };
         if !step.accepted {
             status = 3.0;
             break;

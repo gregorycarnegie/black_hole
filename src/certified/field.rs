@@ -95,6 +95,16 @@ impl Kerr {
         }
     }
 
+    /// Kerr–Schild radius `r` at a binary64 position, for uncertified references.
+    pub fn radius(&self, x: [f64; 3]) -> f64 {
+        self.geometry(x).radius
+    }
+
+    /// The phase-space right-hand side in plain binary64, for uncertified references.
+    pub fn phase_rhs(&self, state: Phase) -> Phase {
+        self.rhs(state)
+    }
+
     pub(crate) fn rhs<S: Scalar>(&self, state: [S; 11]) -> [S; 11] {
         let c = S::constant;
         let zero = c(0.0);
