@@ -44,6 +44,9 @@ interactive prescribed-plasma renderer uses a separate transfer routine.
 All 21 rendering tests (including GPU cases) and 42 compute tests pass.
 The near-critical classification regression now requires zero wrong resolved
 answers, replacing its stale requirement that a counterexample must occur.
+Since the unresolved band (checklist P1.6, `UNRESOLVED_WINDING`), it holds for
+both controllers at step factors 0.11, 0.12 and 0.13. Before the band, RK4
+gave 5/0/9 wrong answers and DP45 1/2/2.
 The trajectory diagnostic still demonstrates failures; passing that diagnostic
 does not mean that its trajectories meet the accuracy targets.
 

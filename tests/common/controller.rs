@@ -153,15 +153,20 @@ fn adaptive_controller_misses_trajectory_targets() {
 /// in binary64 from the GPU's own binary32 initial state, so the binary32
 /// null residual is accounted for exactly (for a null ray this reduces to
 /// `b = |L|/E` versus `3√3 M`). The renderer's rules must never return the
-/// opposite class; critical rays may only end unresolved.
+/// opposite class; critical rays may only end unresolved, which the unresolved
+/// band (`UNRESOLVED_WINDING`, checklist P1.6) does for rays that wound around the
+/// photon sphere. Both controllers run at geometric step factors 0.11, 0.12 and
+/// 0.13, so a pass cannot hinge on one factor's rounding.
 #[test]
-#[ignore = "requires a GPU; run with --release -- --ignored"]
+#[ignore = "requires a GPU; run with --release -- --ignored --nocapture"]
 fn classification_against_the_critical_impact_parameter() {
     let critical = 27.0_f64.sqrt() * MASS;
-    let run = |impacts: &[f32], disk_inner: f32, dormand_prince: f32| {
+    // (b, status, steps, margin, winding) per ray. Status: 1 captured, 2 escaped,
+    // 4 early capture, 5 unresolved band, 0 or 3 unresolved otherwise.
+    let run = |impacts: &[f32], disk_inner: f32, dormand_prince: f32, step_factor: f32| {
         let mut input = Vec::new();
         for &impact in impacts {
-            for value in [impact, disk_inner, dormand_prince, 0.0] {
+            for value in [impact, disk_inner, dormand_prince, step_factor] {
                 input.extend_from_slice(&value.to_le_bytes());
             }
         }
@@ -197,61 +202,66 @@ fn classification_against_the_critical_impact_parameter() {
                     if potential(a) < potential(c) { lo = a } else { hi = c }
                 }
                 let margin = (energy * energy - potential(0.5 * (lo + hi))) / (energy * energy);
-                (b, v[3] as u32, v[11] as u32, margin)
+                (b, v[3] as u32, v[11] as u32, margin, v[15])
             })
             .collect::<Vec<_>>()
     };
-    // Coarse pass to locate the critical impact, then every binary32 impact in
-    // a window around it.
+    // Coarse pass to locate the critical impact, then every binary32 impact in a
+    // window around it, and a wide sweep for rays safely away from it.
     let coarse: Vec<f32> = (0..64).map(|i| 5.0 + 0.4 * i as f32 / 63.0).collect();
-    let rays = run(&coarse, 0.0, 0.0);
+    let rays = run(&coarse, 0.0, 0.0, 0.0);
     let index = rays.iter().position(|r| r.3 < 0.0).unwrap();
     let centre = coarse[index - 1] + (coarse[index] - coarse[index - 1])
         * (rays[index - 1].3 / (rays[index - 1].3 - rays[index].3)) as f32;
-    let mut fine = Vec::new();
+    let mut impacts = Vec::new();
     let mut impact = f32::from_bits(centre.to_bits() - 128);
     for _ in 0..256 {
-        fine.push(impact);
+        impacts.push(impact);
         impact = f32::from_bits(impact.to_bits() + 1);
     }
-    // Wrong resolved answers for the production RK4 controller and the Dormand–Prince
-    // experiment. Only RK4 is held to zero: perturbing the 0.12 geometric step factor to
-    // 0.11 or 0.13 gave RK4 5 and 9 wrong answers per run (DP45: 1 and 2), so neither
-    // controller leaves every near-critical ray unresolved (checklist P1.1b).
-    let mut wrong = [Vec::new(), Vec::new()];
-    for (disk_inner, dormand_prince) in [(0.0, 0.0), (4.0, 0.0), (0.0, 1.0), (4.0, 1.0)] {
-        let mut counts = [0; 5];
-        let rays = run(&fine, disk_inner, dormand_prince);
-        for (impact, (b, status, steps, margin)) in fine.iter().zip(rays) {
-            counts[status as usize] += 1;
-            // Positive margin: E² exceeds the potential barrier, so the ray is captured.
-            let exact = if margin > 0.0 { 1 } else { 2 };
-            let result = if status == 4 { 1 } else { status };
-            if (result == 1 || result == 2) && result != exact {
-                wrong[dormand_prince as usize].push((*impact, b - critical, margin, status, steps));
+    impacts.extend((0..256).map(|i| 4.0 + 2.5 * i as f32 / 255.0));
+    // Rays at least this far from the critical margin must resolve.
+    const SAFE_MARGIN: f64 = 1.0e-4;
+
+    let mut wrong = Vec::new();
+    let mut unresolved_safe = Vec::new();
+    for dormand_prince in [0.0, 1.0] {
+        let name = if dormand_prince != 0.0 { "dp45" } else { "rk4" };
+        for step_factor in [0.11, 0.12, 0.13] {
+            for disk_inner in [0.0, 4.0] {
+                let mut counts = [0; 6];
+                // Smallest |margin| among definitive answers.
+                let mut closest = f64::INFINITY;
+                for (impact, (b, status, steps, margin, winding)) in
+                    impacts.iter().zip(run(&impacts, disk_inner, dormand_prince, step_factor))
+                {
+                    counts[status as usize] += 1;
+                    // Positive margin: E² exceeds the potential barrier, so the ray is captured.
+                    let exact = if margin > 0.0 { 1 } else { 2 };
+                    let result = if status == 4 { 1 } else { status };
+                    if result == 1 || result == 2 {
+                        closest = closest.min(margin.abs());
+                        if result != exact {
+                            wrong.push((name, step_factor, *impact, b - critical, margin, status, steps, winding));
+                        }
+                    } else if margin.abs() > SAFE_MARGIN {
+                        unresolved_safe.push((name, step_factor, *impact, margin, status, winding));
+                    }
+                }
+                println!(
+                    "{name} step factor {step_factor} disk inner {disk_inner}: captured/escaped/early/band/other unresolved {}/{}/{}/{}/{}; closest definitive |margin| {closest:.2e}",
+                    counts[1], counts[2], counts[4], counts[5], counts[0] + counts[3]
+                );
             }
         }
+    }
+    for (name, factor, impact, offset, margin, status, steps, winding) in wrong.iter().take(8) {
         println!(
-            "{} disk inner {disk_inner}: critical b = {critical}; window {:?}..{:?}; statuses captured/escaped/unresolved/early: {}/{}/{}/{}",
-            if dormand_prince != 0.0 { "dp45" } else { "rk4" },
-            fine[0], fine[255], counts[1], counts[2], counts[0] + counts[3], counts[4]
+            "{name} {factor}: misclassified impact {impact}: b - b_c = {offset:.3e}, (E² - V_max)/E² = {margin:.3e}, status {status}, {steps} steps, winding {winding:.2} rad"
         );
     }
-    for (impact, offset, margin, status, steps) in wrong.iter().flatten().take(8) {
-        println!(
-            "misclassified impact {impact}: b - b_c = {offset:.3e}, (E² - V_max)/E² = {margin:.3e}, \
-             status {status}, {steps} steps"
-        );
-    }
-    println!(
-        "wrong resolved answers: rk4 {}, dp45 {} across two 256-ray runs each",
-        wrong[0].len(),
-        wrong[1].len()
-    );
-    assert!(
-        wrong[0].is_empty(),
-        "resolved near-critical rays must match the reference"
-    );
+    assert!(wrong.is_empty(), "{} definitive answers contradict the reference", wrong.len());
+    assert!(unresolved_safe.is_empty(), "rays away from the critical margin left unresolved: {unresolved_safe:?}");
 }
 
 #[test]
@@ -307,3 +317,4 @@ fn kerr_early_capture_matches_the_equatorial_radial_potential() {
         assert!(early > 0 && saved_steps > 0);
     }
 }
+

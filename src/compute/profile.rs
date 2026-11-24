@@ -146,6 +146,7 @@ pub(super) fn write_ray_profile(
         "escaped",
         "opaque",
         "early_capture",
+        "near_critical",
     ];
     create_dir_all("target")?;
     let mut path = String::from("target/renderer-rays");

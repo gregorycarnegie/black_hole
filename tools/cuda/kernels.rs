@@ -1788,6 +1788,22 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
     }
 }
 
+/// Angle between two positions as seen from the origin.
+#[inline(always)]
+fn swept_angle(a: Vec3, b: Vec3) -> f32 {
+    atan2_arith(a.cross(b).length(), a.dot(b))
+}
+
+/// Unresolved band (checklist P1.6): a ray that has swept more than this angle around
+/// the origin ends unresolved rather than captured or escaped. Near the photon sphere
+/// the winding grows like -ln|margin|, where margin = (E² - V_max)/E², so the band is
+/// about |margin| < 6e-5 for escapes and 1.5e-5 for captures, whatever the controller.
+/// In the Schwarzschild classification test, every wrong answer from either controller
+/// at step factors 0.11-0.13 had swept at least 16.1 rad: e^2.1 ≈ 8 times inside the band.
+/// shortcut: winding is measured about the origin, the hole in the single-source scenes
+/// it was validated on; binaries get no calibrated band.
+const UNRESOLVED_WINDING: f32 = 14.0;
+
 #[inline(always)]
 fn advance_ray(ray: Ray, requested_h: f32, mut m: Metric, objects: &Objects) -> AdaptiveStep {
     advance_ray_gauge(ray, requested_h, &mut m, false, objects)
@@ -2917,6 +2933,8 @@ enum RayExit {
     Escaped,
     Opaque,
     EarlyCapture,
+    /// Captured or escaped inside the unresolved band.
+    NearCritical,
 }
 
 #[cuda_device::kernel]
@@ -3082,12 +3100,19 @@ unsafe fn render_geodesic<
     let vacuum_sq = if far_field { vacuum_radius_sq(objects, disk) } else { f32::INFINITY };
     // Coordinate time relative to the camera; it decreases along the backward ray.
     let mut ray_time = 0.0_f32;
+    let mut winding = 0.0_f32;
     let mut i = 0u32;
     while i < cam.max_iter {
         iterations = i + 1;
         if metric.clearance < 0.002 || !metric.valid {
             if DIAGNOSTICS {
-                exit = if metric.valid { RayExit::Horizon } else { RayExit::InvalidMetric };
+                exit = if !metric.valid {
+                    RayExit::InvalidMetric
+                } else if winding > UNRESOLVED_WINDING {
+                    RayExit::NearCritical
+                } else {
+                    RayExit::Horizon
+                };
             }
             break;
         }
@@ -3098,7 +3123,11 @@ unsafe fn render_geodesic<
             capture_clearance = 0.5 * metric.clearance;
             if inward_kerr_capture(ray, velocity, disk.spin, disk.r1) {
                 if DIAGNOSTICS {
-                    exit = RayExit::EarlyCapture;
+                    exit = if winding > UNRESOLVED_WINDING {
+                        RayExit::NearCritical
+                    } else {
+                        RayExit::EarlyCapture
+                    };
                 }
                 break;
             }
@@ -3199,9 +3228,17 @@ unsafe fn render_geodesic<
             rgb += transmission * plasma.rgb * absorption_integral(plasma.alpha, ds);
             transmission *= exp(-plasma.alpha * ds);
         }
+        winding += swept_angle(ray.pos, next.pos);
         ray = next;
         let frame = screen_frame(ray, metric);
         ray.screen = vec4_f_v3(0.0, frame[0]);
+        if ray.pos.length() > ESCAPE_R && winding > UNRESOLVED_WINDING {
+            // Unresolved: no sky, as for the iteration limit; captures already add none.
+            if DIAGNOSTICS {
+                exit = RayExit::NearCritical;
+            }
+            break;
+        }
         if ray.pos.length() > ESCAPE_R {
             let direction = (metric.inv * ray.p).yzw().normalize();
             let sky = unsafe {
@@ -3968,6 +4005,9 @@ pub unsafe fn bh_test_controller_classify(
     let mut next_h = 1.0e8_f32;
     let mut status = 0.0_f32;
     let mut steps = 0u32;
+    let mut winding = 0.0_f32;
+    // cases.w overrides the geometric step factor, for robustness sweeps.
+    let step_factor = if c.w != 0.0 { c.w } else { 0.12 };
     let mut i = 0u32;
     while i < 10000 {
         if metric.clearance < 0.002 || !metric.valid {
@@ -3982,7 +4022,7 @@ pub unsafe fn bh_test_controller_classify(
                 break;
             }
         }
-        let distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
+        let distance = clamp_f32(step_factor * metric.clearance, 0.0002, 32.0);
         let wanted = (distance / velocity.length().max(1.0e-6)).min(next_h);
         // cases.z != 0 selects the Dormand–Prince controller.
         let step = if c.z != 0.0 {
@@ -4001,6 +4041,7 @@ pub unsafe fn bh_test_controller_classify(
                 0.5,
                 2.0,
             );
+        winding += swept_angle(ray.pos, step.ray.pos);
         ray = step.ray;
         metric = scene_metric(ray.pos, objects);
         ray.screen = vec4_f_v3(0.0, screen_frame(ray, metric)[0]);
@@ -4011,12 +4052,16 @@ pub unsafe fn bh_test_controller_classify(
         }
         i += 1;
     }
+    // Captured (1), escaped (2) or early capture (4) inside the band: unresolved (5).
+    if (status == 1.0 || status == 2.0 || status == 4.0) && winding > UNRESOLVED_WINDING {
+        status = 5.0;
+    }
     let base = (4 * id) as usize;
     unsafe {
         *results.add(base) = vec4_v3_f(start.pos, status);
         *results.add(base + 1) = start.p;
         *results.add(base + 2) = vec4_v3_f(ray.pos, steps as f32);
-        *results.add(base + 3) = vec4_v3_f(ray.p.yzw(), 0.0);
+        *results.add(base + 3) = vec4_v3_f(ray.p.yzw(), winding);
     }
 }
 
