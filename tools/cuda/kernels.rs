@@ -4182,6 +4182,7 @@ pub unsafe fn bh_test_image(
     seeds: *const ImageSeed,
     settings: *const Vec4,
     pixels: *mut Vec4,
+    dormand_prince: u32,
 ) {
     let id = gid_x();
     let settings = unsafe { *settings };
@@ -4236,7 +4237,11 @@ pub unsafe fn bh_test_image(
             h = h.min(0.5_f32.max((r - 100.0) / dr.abs().max(1.0e-8)));
         }
         last_h = h;
-        let step = advance_ray_gauge(ray, h, &mut m, true, objects);
+        let step = if dormand_prince != 0 {
+            advance_ray_dp45::<false>(ray, h, &mut m, true, objects, &mut 0)
+        } else {
+            advance_ray_gauge(ray, h, &mut m, true, objects)
+        };
         last_actual = step.h;
         last_error = step.error;
         if !step.accepted {

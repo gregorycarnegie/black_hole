@@ -31,35 +31,40 @@ fn headless_snapshot_image() {
     objects[..4].copy_from_slice(&1i32.to_le_bytes());
     objects[528..532].copy_from_slice(&1f32.to_le_bytes());
     objects[788..792].copy_from_slice(&0.9375f32.to_le_bytes());
-    let data = crate::gpu::image(
-        &objects,
-        &header,
-        &grids[0],
-        &grids[1],
-        &grids[2],
-        &table,
-        &seeds,
-        &settings,
-        count as u32,
-    );
-    std::fs::write(root.join("image-gpu.f32"), &data).unwrap();
-    let values: &[f32] = bytemuck::cast_slice(&data);
-    assert!(
-        values.iter().all(|v| v.is_finite()),
-        "Nonfinite snapshot image"
-    );
-    let mut statuses = [0usize; 7];
-    for row in values.as_chunks::<16>().0 {
-        let status = row[5] as usize;
-        assert!(status < 7);
-        statuses[status] += 1;
+    // The production RK4 controller, then the Dormand–Prince experiment (checklist P1.1).
+    // Compare each with `python verification/check_image.py compare --image <file>`.
+    for (dormand_prince, file) in [(false, "image-gpu.f32"), (true, "image-gpu-dp45.f32")] {
+        let data = crate::gpu::image(
+            &objects,
+            &header,
+            &grids[0],
+            &grids[1],
+            &grids[2],
+            &table,
+            &seeds,
+            &settings,
+            count as u32,
+            dormand_prince,
+        );
+        std::fs::write(root.join(file), &data).unwrap();
+        let values: &[f32] = bytemuck::cast_slice(&data);
+        assert!(
+            values.iter().all(|v| v.is_finite()),
+            "Nonfinite snapshot image"
+        );
+        let mut statuses = [0usize; 7];
+        for row in values.as_chunks::<16>().0 {
+            let status = row[5] as usize;
+            assert!(status < 7);
+            statuses[status] += 1;
+        }
+        eprintln!(
+            "{file}: {count} snapshot image rays; statuses [unused,captured,escaped,exhausted,step failure,sampling failure,thermal failure] = {statuses:?}"
+        );
+        assert_eq!(
+            statuses[1] + statuses[2],
+            count,
+            "Unresolved rays; inspect saved image output"
+        );
     }
-    eprintln!(
-        "{count} snapshot image rays; statuses [unused,captured,escaped,exhausted,step failure,sampling failure,thermal failure] = {statuses:?}"
-    );
-    assert_eq!(
-        statuses[1] + statuses[2],
-        count,
-        "Unresolved rays; inspect saved image output"
-    );
 }

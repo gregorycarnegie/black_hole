@@ -208,6 +208,7 @@ pub fn image(
     seeds: &[u8],
     settings: &[u8],
     count: u32,
+    dormand_prince: bool,
 ) -> Vec<u8> {
     let cuda = shared_cuda();
     cuda.bind_to_thread();
@@ -238,6 +239,8 @@ pub fn image(
     builder.arg(&d_seeds);
     builder.arg(&d_settings);
     builder.arg(&mut d_out);
+    let dormand_prince = u32::from(dormand_prince);
+    builder.arg(&dormand_prince);
     unsafe {
         builder
             .launch(cfg)

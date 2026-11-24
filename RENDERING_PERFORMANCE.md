@@ -132,7 +132,20 @@ Accepted steps fell by only 0.2% (42.90M to 42.80M), and rejected attempts by 6%
 
 In the binary64 Schwarzschild trajectory test, DP45 cut the near-critical errors about threefold. At impact 5.3 the position error went from 1.646e-3 to 5.70e-4 and the momentum error from 1.500e-5 to 5.12e-6. At 5.25 the position error went from 1.584e-3 to 5.62e-4. Both still miss the target. Impact 10 rose from 1.87e-5 to 4.16e-5 and stays within its 9.88e-5 target. Impact 30 was unchanged. [Trajectory test](tests/common/controller.rs#L85)
 
-Not yet measured: the binary and swarm scenes, register and local-memory counts, and the two outlier pixels against the reference.
+`dp45_controller_benchmark` times `bh_geodesic` against `bh_geodesic_experiments` with only DP45 enabled. It uses CUDA events, alternates launches, and takes 20 samples after three warm-ups. It uses the default camera, a 2×1 sky and thermal intensity. Run it with `cargo test --release --bin black_hole -- --ignored dp45_controller_benchmark --nocapture`. [Benchmark](src/compute/pipeline.rs#L1221)
+
+| Scene | RK4 median / p95 (ms) | DP45 median / p95 (ms) | Pixels differing by more than 1/255 | Largest channel difference |
+|---|---:|---:|---:|---:|
+| Single hole 400×300 | 124.6 / 152.4 | 83.6 / 90.8 | 0 | 0.002 |
+| Single hole 960×540 | 154.2 / 172.8 | 102.3 / 111.3 | 0 | 0.004 |
+| Binary 400×300 | 33.3 / 33.5 | 23.4 / 23.7 | 1 | 0.008 |
+| Binary 960×540 | 80.3 / 81.2 | 53.0 / 53.8 | 3 | 0.019 |
+
+The driver reports 255 registers for both kernels. Local memory is 704 bytes per thread for `bh_geodesic` and 1,128 bytes for `bh_geodesic_experiments`. That kernel also carries the early-capture and far-field code, so the figure is an upper bound for DP45 alone.
+
+The EHT snapshot test traces its gauged path with both controllers and writes `image-gpu.f32` and `image-gpu-dp45.f32`. Compare each with `check_image.py compare --image <file>`. Both resolve every ray (990 captured, 24,610 escaped). Against the refined Zig reference, Stokes I L2 error is 0.719% for RK4 and 0.704% for DP45. The worst I error is 2.75% and 2.87% of the reference peak. The worst relative I error above the floor is 24.27% for both. The maximum null residual is 4.06e-5 and 2.37e-5. The Q, U and V L2 errors are within 0.0001 of each other. Path error does not dominate this image's error. A single launch of each took 711 ms (RK4, run first) and 431 ms (DP45). That is not a controlled timing. The recorded RK4 median is 546 ms.
+
+Not yet measured: the swarm scenes, and the two close-up outlier pixels against an independent reference.
 
 ## Experiment order
 

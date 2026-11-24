@@ -1212,3 +1212,121 @@ mod swarm_gpu {
         }
     }
 }
+
+/// Times `bh_geodesic` against `bh_geodesic_experiments` with Dormand–Prince
+/// (bit 2), alternating launches, and compares their images.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn dp45_controller_benchmark() {
+    use crate::simulation::{KERR_SPIN, default_binary_spins, scene_objects};
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+    for (name, f) in [
+        ("bh_geodesic", &cuda.geodesic),
+        ("bh_geodesic_experiments", &cuda.geodesic_experiments),
+    ] {
+        println!(
+            "{name}: {} registers, {} local bytes per thread",
+            f.num_regs().unwrap(),
+            f.local_size_bytes().unwrap()
+        );
+    }
+    let cam = crate::camera::OrbitalCamera::default();
+    let sky: CudaSlice<u8> = cuda.clone_htod(bytemuck::cast_slice(&[
+        0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0,
+    ]));
+    for binary in [false, true] {
+        let scene = scene_objects(KERR_SPIN, false, binary, 0.0, default_binary_spins());
+        let mut objects = GpuObjectsUniform::zeroed();
+        objects.num_objects = scene.len() as i32;
+        for (i, object) in scene.iter().enumerate() {
+            objects.pos_radius[i] = object.position.extend(object.radius).into();
+            objects.color[i] = object.color.into();
+            objects.mass[i][0] = object.mass;
+            objects.spin[i] = object.spin.extend(0.0).into();
+        }
+        let disk = build_disk_uniform(&DiskConfigUniform {
+            spin: KERR_SPIN,
+            binary_enabled: binary,
+            ..DiskConfigUniform::default()
+        });
+        let d_objects = cuda.clone_htod(bytemuck::bytes_of(&objects));
+        let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
+        for (width, height) in [(400u32, 300u32), (960, 540)] {
+            let camera = GpuCameraUniform {
+                pos: cam.position().into(),
+                right: cam.right().into(),
+                up: cam.up().into(),
+                forward: cam.forward().into(),
+                tan_half_fov: cam.tan_half_fov(),
+                aspect: width as f32 / height as f32,
+                max_iter: cam.max_iter,
+                frequency_ghz: cam.frequency_ghz,
+                faraday_depth: cam.faraday_depth,
+                conversion_depth: cam.conversion_depth,
+                ..GpuCameraUniform::zeroed()
+            };
+            let d_camera = cuda.clone_htod(bytemuck::bytes_of(&camera));
+            let cfg = ray_launch_config(width, height, !binary);
+            let mut outputs =
+                [0, 1].map(|_| cuda.alloc_zeros::<f32>((width * height * 4) as usize));
+            let mut times = [Vec::new(), Vec::new()];
+            let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+            for sample in 0..23 {
+                for (variant, output) in outputs.iter_mut().enumerate() {
+                    let kernel = [&cuda.geodesic, &cuda.geodesic_experiments][variant];
+                    let start = cuda.stream.record_event(timing).unwrap();
+                    let mut builder = cuda.stream.launch_builder(kernel);
+                    builder.arg(output);
+                    builder.arg(&d_camera);
+                    builder.arg(&d_disk);
+                    builder.arg(&d_objects);
+                    builder.arg(&sky);
+                    builder.arg(&width);
+                    builder.arg(&height);
+                    builder.arg(&2u32);
+                    builder.arg(&1u32);
+                    if variant == 1 {
+                        builder.arg(&4u32);
+                    }
+                    unsafe { builder.launch(cfg).unwrap() };
+                    drop(builder);
+                    let end = cuda.stream.record_event(timing).unwrap();
+                    end.synchronize().unwrap();
+                    // Three warm-up launches per variant.
+                    if sample >= 3 {
+                        times[variant].push(start.elapsed_ms(&end).unwrap());
+                    }
+                }
+            }
+            let [rk4, dp45] = outputs.map(|output| cuda.clone_dtoh(&output));
+            assert!(dp45.iter().all(|v| v.is_finite()));
+            let differing = rk4
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dp45.as_chunks::<4>().0)
+                .filter(|(a, b)| a.iter().zip(*b).any(|(x, y)| (x - y).abs() > 1.0 / 255.0))
+                .count();
+            let largest = rk4
+                .iter()
+                .zip(&dp45)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            let [rk4_t, dp45_t] = times.map(|mut t| {
+                t.sort_unstable_by(f32::total_cmp);
+                (t[t.len() / 2], t[(t.len() * 95).div_ceil(100) - 1])
+            });
+            println!(
+                "{} {width}×{height}: rk4 median {:.1} / p95 {:.1} ms, dp45 median {:.1} / p95 {:.1} ms; \
+                 {differing} pixels differ by more than 1/255, largest channel difference {largest:.3}",
+                if binary { "binary" } else { "single" },
+                rk4_t.0,
+                rk4_t.1,
+                dp45_t.0,
+                dp45_t.1,
+            );
+        }
+    }
+}
