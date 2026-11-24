@@ -131,23 +131,25 @@ Press K (or use the Swarm panel row) to add 256–4096 small bodies on circular 
 
 ### Space-time BVH
 
-Camera-relative time is cut into 40 slices, each 8 r_g/c wide. For each slice, the host builds a binary BVH over every body's swept box, with median splits and up to four bodies per leaf. Each box holds the body throughout the slice plus 6 r_g/c on either side, padded by the arc's sagitta and by the kernel's own per-step padding. A ray step therefore traverses only the slice its midpoint time falls in, provided the step spans at most 12 r_g/c. Longer steps, and steps more than 320 r_g/c before the camera time, fall back to brute force. The leaves run the same per-body test as brute force, so the hits are the same. Bodies move every frame, so the trees are rebuilt and uploaded every frame. [Traversal](tools/cuda/kernels.rs) · [Builder](src/swarm.rs)
+Camera-relative time is cut into 40 slices, each 8 r_g/c wide. For each slice, the host builds a binary BVH over every body's swept box, with median splits and up to four bodies per leaf. Each box holds the body throughout the slice plus 6 r_g/c on either side, padded by the arc's sagitta and by the kernel's own per-step padding. A ray step therefore traverses only the slice its midpoint time falls in, provided the step spans at most 12 r_g/c. A step first has to pass a check against the radial shell that holds every orbit: `beyond_belt`, from `swarm_belt` in `src/swarm.rs`. The check widens the shell by the largest arc sagitta for the step's duration, so it holds for steps of any length. Steps that pass but span more than 12 r_g/c, or start more than 320 r_g/c before the camera time, fall back to brute force. Brute force itself skips the shell check, so it remains an unfiltered reference. The leaves run the same per-body test as brute force, so the hits are the same. Bodies move every frame, so the trees are rebuilt and uploaded every frame. [Traversal](tools/cuda/kernels.rs) · [Builder](src/swarm.rs)
 
 `cargo test --release --bin black_hole -- --ignored swarm_bvh_against_brute_force --nocapture` times the default single-hole view at 400×300 on the RTX 4090. Each kernel time is the median of five launches. The build column is the host build plus upload.
 
 | Bodies | Brute force | BVH | BVH build and upload |
 |---:|---:|---:|---:|
-| 0 | 117 ms | 130 ms | — |
-| 256 | 251 ms | 159 ms | 1 ms |
-| 1,024 | 947 ms | 213 ms | 4 ms |
-| 4,096 | 4,357 ms | 384 ms | 18 ms |
-| 16,384 | about 16 s | 890 ms | 78 ms |
+| 0 | 127 ms | 130 ms | — |
+| 256 | 259 ms | 120 ms | 1 ms |
+| 1,024 | 836 ms | 129 ms | 4 ms |
+| 4,096 | 4,339 ms | 125 ms | 17 ms |
+| 16,384 | about 16 s | 126 ms | 75 ms |
+
+Before the shell check, the BVH took 159, 213, 384 and 890 ms at these body counts. Most of that time went to long far-field steps, which were sent to brute force even though they never came near the belt. Now the swarm costs the kernel almost nothing, and at 16,384 bodies the host rebuild is the larger cost.
 
 At 1,024 bodies the BVH image matches brute force bit for bit (`the_bvh_renders_the_brute_force_image`). `swarm_hits_match_exact_circular_orbits` checks the shared per-body test against exact orbits. Possible next steps include refitting instead of rebuilding, building on the GPU, and choosing slice widths from the measured step spans.
 
 ### OptiX RT-core queries (`--features optix`)
 
-With the `optix` cargo feature, the OptiX 9.1 headers (`OPTIX_ROOT`) and libclang (`LIBCLANG_PATH`), the swarm renders through OptiX whenever the driver supports it. It falls back to the BVH otherwise. The OptiX programs are Rust built by cuda-oxide (`tools/optix/programs.rs`, `cargo oxide build --arch sm_80`). The host builds a motion GAS each frame: built-in spheres over 53 keys spanning 412 r_g/c, each padded for half a step's motion, the step's own sagitta padding and the gap between the orbit and OptiX's linear interpolation between keys. One ray per step, at the step's mid time, finds candidates. An any-hit program runs the exact per-body test on each candidate and keeps the earliest hit.
+With the `optix` cargo feature, the OptiX 9.1 headers (`OPTIX_ROOT`) and libclang (`LIBCLANG_PATH`), `--optix` renders the swarm through OptiX, falling back to the BVH if OptiX cannot start. The OptiX programs are Rust built by cuda-oxide (`tools/optix/programs.rs`, `cargo oxide build --arch sm_80`). The host builds a motion GAS each frame: built-in spheres over 53 keys spanning 412 r_g/c, each padded for half a step's motion, the step's own sagitta padding and the gap between the orbit and OptiX's linear interpolation between keys. One ray per step, at the step's mid time, finds candidates. An any-hit program runs the exact per-body test on each candidate and keeps the earliest hit.
 
 The first attempt traced from inside the render loop, with one `optixTrace` per step near the belt. The image matched brute force, but frames took 0.9–11 s, 5–20 times slower than the BVH. OptiX saves and restores the integrator's whole live state around every trace, and this kernel already needs 255 registers.
 
@@ -159,15 +161,14 @@ The renderer now works in batches, one band of rows at a time:
 
 Each band's queue is limited to 512 MB (5.6 million entries of 96 bytes). Band heights come from the previous frame's densest band. `optix_renders_the_brute_force_image` times the same 400×300 view; the frame is the median of five and includes the host GAS build.
 
-| Bodies | BVH | OptiX | of which host GAS build | Steps queued |
+| Bodies | BVH kernel + host build | OptiX frame | of which host GAS build | Steps queued |
 |---:|---:|---:|---:|---:|
-| 0 | 121 ms | — | — | — |
-| 256 | 161 ms | 145 ms | 2 ms | 8.55 M |
-| 1,024 | 213 ms | 144 ms | 4 ms | 8.56 M |
-| 4,096 | 382 ms | 158 ms | 8 ms | 8.57 M |
-| 16,384 | 874 ms | 198 ms | 26 ms | 8.58 M |
+| 256 | 121 + 1 ms | 145 ms | 2 ms | 8.55 M |
+| 1,024 | 125 + 4 ms | 144 ms | 4 ms | 8.56 M |
+| 4,096 | 124 + 17 ms | 159 ms | 8 ms | 8.57 M |
+| 16,384 | 128 + 75 ms | 199 ms | 24 ms | 8.58 M |
 
-The OptiX launch answers the 8.6 M queries in 0.2 ms at 256 bodies and 31 ms at 16,384. Most of the frame is the first pass, which costs about the same as a render without the swarm. Before the belt check was moved ahead of the brute-force fallback, the first pass took 1.15 s at 16,384 bodies. The BVH kernel still sends long steps to brute force without that check, which accounts for most of its growth with body count. At up to 1,024 bodies the OptiX image matches brute force bit for bit.
+The OptiX launch answers the 8.6 M queries in 0.2 ms at 256 bodies and 31 ms at 16,384, and the first pass costs about as much as a render without the swarm. The BVH uses the same shell check, though, and its traversal is just as cheap. OptiX pays for its queue writes, the band launches and the fix-up passes. It ties the BVH only at 16,384 bodies, where the BVH's single-threaded host rebuild dominates. In this scene RT cores give no gain over the BVH, so OptiX stays opt-in. At up to 1,024 bodies the OptiX image matches brute force bit for bit.
 
 The current binary renderer freezes positions and spins for each trace, so 3D bounds suffice for those geometry queries. RT cores accelerate conventional straight-ray traversal and triangle intersections. A mesh-heavy scene could use a 3D BVH to find candidates along short geodesic segments, with the integrator still computing the trajectory. If accuracy is defined against the curved trajectory, the broad phase needs a conservative bound on the curve's departure from each segment, followed by a refined test for candidate hits. Measure the traversal overhead against the direct loop before adopting it. [Frozen metric](README.md#L91) · [NVIDIA RT cores](https://developer.nvidia.com/blog/?p=11872) · [OptiX ray API](https://raytracing-docs.nvidia.com/optix8/api/group__optix__device__api.html)
 

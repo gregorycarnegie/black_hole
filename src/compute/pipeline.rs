@@ -16,7 +16,7 @@ use crate::{
     simulation::{
         BINARY_DISK_INNER_RS, SCHWARZSCHILD_RADIUS, kerr_horizon_radius, kerr_isco_radius,
     },
-    swarm::{GpuSwarmBody, SLICES, Swarm, swarm_bodies, swarm_bvh},
+    swarm::{GpuSwarmBody, SLICES, Swarm, swarm_belt, swarm_bodies, swarm_bvh},
 };
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
@@ -128,6 +128,8 @@ pub(super) struct SwarmDevice {
     count: u32,
     /// 0 selects the brute-force path.
     slices: u32,
+    /// From `swarm_belt`.
+    belt: (f32, f32, f32),
 }
 
 impl SwarmDevice {
@@ -140,6 +142,7 @@ impl SwarmDevice {
             roots: cuda.alloc_zeros::<u8>(16),
             count: 0,
             slices: 0,
+            belt: (0.0, 0.0, 0.0),
         }
     }
 
@@ -156,6 +159,7 @@ impl SwarmDevice {
         write(&mut self.bodies, bytemuck::cast_slice(bodies));
         self.count = bodies.len() as u32;
         self.slices = 0;
+        self.belt = swarm_belt(bodies);
         if !brute_force && !bodies.is_empty() {
             let bvh = swarm_bvh(bodies);
             write(&mut self.nodes, bytemuck::cast_slice(&bvh.nodes));
@@ -195,6 +199,9 @@ impl SwarmDevice {
         builder.arg(&self.items);
         builder.arg(&self.roots);
         builder.arg(&self.slices);
+        builder.arg(&self.belt.0);
+        builder.arg(&self.belt.1);
+        builder.arg(&self.belt.2);
         builder.arg(&experiments);
         unsafe {
             builder
@@ -231,10 +238,16 @@ pub fn init_geodesic_pipeline(mut commands: Commands) {
         last_objects: None,
         last_disk: None,
         swarm: SwarmDevice::new(),
+        // Opt-in: with its belt check the BVH is as fast, and OptiX reserves a 512 MB queue.
         #[cfg(feature = "optix")]
-        optix: super::optix::OptixRender::new()
-            .inspect_err(|e| warn!("OptiX unavailable, using the software BVH: {e}"))
-            .ok(),
+        optix: std::env::args_os()
+            .any(|arg| arg == "--optix")
+            .then(|| {
+                super::optix::OptixRender::new()
+                    .inspect_err(|e| warn!("OptiX unavailable, using the software BVH: {e}"))
+                    .ok()
+            })
+            .flatten(),
         #[cfg(feature = "optix")]
         optix_bodies: Vec::new(),
     });

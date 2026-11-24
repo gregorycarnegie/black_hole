@@ -1880,6 +1880,15 @@ fn swarm_segment_hit(
     result
 }
 
+/// Whether the step stays outside the shell that holds every body over its duration
+/// dt: radii [inner - pad, outer + pad] with pad = spread dt^2, the largest arc
+/// sagitta `swarm_body_hit` adds. See `swarm_belt` in `src/swarm.rs`.
+#[inline(always)]
+fn beyond_belt(q: SwarmQuery, inner: f32, outer: f32, spread: f32) -> bool {
+    let pad = spread * (q.t1 - q.t0) * (q.t1 - q.t0);
+    q.far_r < inner - pad || q.near_r > outer + pad
+}
+
 #[inline(always)]
 fn safe_reciprocal(v: f32) -> f32 {
     if v.abs() < 1.0e-20 { 1.0e20 } else { 1.0 / v }
@@ -1899,7 +1908,8 @@ fn segment_meets_box(q: SwarmQuery, inv: Vec3, lo: Vec3, hi: Vec3) -> bool {
 /// in the step's time slice meets the segment. Node i is `nodes[2i]` (box minimum,
 /// then the right child or the first item) and `nodes[2i + 1]` (box maximum, then
 /// 0 for an internal node or the item count); an internal node's left child follows
-/// it. Steps that fit no slice fall back to brute force.
+/// it. Steps outside the belt miss; other steps that fit no slice fall back to
+/// brute force. With no slices this is plain brute force, the unfiltered reference.
 #[cuda_device::device]
 fn swarm_bvh_hit(
     start: Vec3,
@@ -1912,13 +1922,17 @@ fn swarm_bvh_hit(
     items: *const u32,
     roots: *const u32,
     slices: u32,
+    belt: (f32, f32, f32),
 ) -> Vec4 {
+    let q = swarm_query(start, end, t0, t1);
+    if slices > 0 && beyond_belt(q, belt.0, belt.1, belt.2) {
+        return vec4_splat(0.0);
+    }
     let middle = -0.5 * (t0 + t1);
     let slice = (middle / SWARM_SLICE_WIDTH) as u32;
     if !(middle >= 0.0 && (t0 - t1).abs() <= SWARM_STEP_SPAN && slice < slices) {
         return swarm_segment_hit(start, end, t0, t1, swarm, count);
     }
-    let q = swarm_query(start, end, t0, t1);
     let inv = vec3(
         safe_reciprocal(q.segment.x),
         safe_reciprocal(q.segment.y),
@@ -2515,6 +2529,9 @@ pub unsafe fn bh_geodesic_swarm(
     bvh_items: *const u32,
     bvh_roots: *const u32,
     bvh_slices: u32,
+    belt_inner: f32,
+    belt_outer: f32,
+    belt_spread: f32,
     experiments: u32,
 ) {
     unsafe {
@@ -2523,6 +2540,7 @@ pub unsafe fn bh_geodesic_swarm(
             core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, gid_x(), gid_y(),
             |start, end, t0, t1, _| swarm_bvh_hit(
                 start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
+                (belt_inner, belt_outer, belt_spread),
             ),
         );
     }
@@ -2549,10 +2567,9 @@ fn atomic_max_u32(address: *mut u32, value: u32) {
 /// instead of tested. Entry e holds
 /// the step in `queue[2e..2e + 2]` as (start, t0), (end, t1), and the pixel state
 /// before it in `states[3e..3e + 3]` as (rgb, transmission), stokes, (pixel,
-/// iterations) bits. Steps outside OptiX's time window, and steps past `capacity`,
-/// are tested here by brute force; `counter` still counts every queued step. Every
-/// body lies within radii [belt_inner - pad, belt_outer + pad] over a step of
-/// duration dt, with pad = belt_spread dt^2 (the arc's sagitta in `swarm_body_hit`).
+/// iterations) bits. Steps outside the belt miss. Steps outside OptiX's time window,
+/// and steps past `capacity`, are tested here by brute force; `counter` still counts
+/// every queued step.
 #[cuda_device::kernel]
 pub unsafe fn bh_geodesic_swarm_record(
     out_image: *mut Vec4,
@@ -2583,10 +2600,7 @@ pub unsafe fn bh_geodesic_swarm_record(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, x, y,
             |start, end, t0, t1, state| {
-                // Every body's radial test would reject this step.
-                let q = swarm_query(start, end, t0, t1);
-                let pad = belt_spread * (t1 - t0) * (t1 - t0);
-                if q.far_r < belt_inner - pad || q.near_r > belt_outer + pad {
+                if beyond_belt(swarm_query(start, end, t0, t1), belt_inner, belt_outer, belt_spread) {
                     return vec4_splat(0.0);
                 }
                 let middle = -0.5 * (t0 + t1);

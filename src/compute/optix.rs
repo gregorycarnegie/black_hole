@@ -560,14 +560,7 @@ impl OptixRender {
         let (_gas, handle, _keys, backoff) = self.pipeline.build(bodies);
         let build_ms = start.elapsed().as_secs_f64() * 1000.0;
         let (width, height, sky_w, sky_h) = inputs.size;
-        // Bounds the radial rejection in `swarm_body_hit`; 0.01 covers rounding.
-        let (mut belt_inner, mut belt_outer, mut belt_spread) = (f32::INFINITY, 0.0_f32, 0.0_f32);
-        for body in bodies {
-            let (orbit, radius, omega) = (body.axis_a[3], body.axis_b[3], body.orbit[1]);
-            belt_inner = belt_inner.min(orbit - radius - 0.01);
-            belt_outer = belt_outer.max(orbit + radius + 0.01);
-            belt_spread = belt_spread.max(0.125 * orbit * omega * omega * 1.001);
-        }
+        let (belt_inner, belt_outer, belt_spread) = crate::swarm::swarm_belt(bodies);
         let pixels = (width * height) as usize;
         if self.pixels < pixels {
             self.first = DeviceBuffer::new(pixels * 4);

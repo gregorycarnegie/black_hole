@@ -106,6 +106,21 @@ pub(crate) struct SwarmBvh {
     pub roots: Vec<u32>,
 }
 
+/// (inner, outer, spread) for `beyond_belt` in `tools/cuda/kernels.rs`: every body
+/// stays within radii [inner - spread dt^2, outer + spread dt^2] over a step of
+/// duration dt, including the sagitta padding of the per-body test. The margins
+/// cover rounding.
+pub(crate) fn swarm_belt(bodies: &[GpuSwarmBody]) -> (f32, f32, f32) {
+    let (mut inner, mut outer, mut spread) = (f32::INFINITY, 0.0_f32, 0.0_f32);
+    for body in bodies {
+        let (orbit, radius, omega) = (body.axis_a[3], body.axis_b[3], body.orbit[1]);
+        inner = inner.min(orbit - radius - 0.01);
+        outer = outer.max(orbit + radius + 0.01);
+        spread = spread.max(0.125 * orbit * omega * omega * 1.001);
+    }
+    (inner, outer, spread)
+}
+
 pub(crate) fn swarm_bvh(bodies: &[GpuSwarmBody]) -> SwarmBvh {
     let mut bvh = SwarmBvh::default();
     for slice in 0..SLICES {
