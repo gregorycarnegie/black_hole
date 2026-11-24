@@ -1630,6 +1630,22 @@ fn relative_size(e: Vec4, y: Vec4) -> f32 {
     d.x.max(d.y).max(d.z.max(d.w))
 }
 
+/// Dormand–Prince 5(4) tableau: stage rows, fifth-order weights over k1–k6 and error
+/// weights (fifth minus fourth order) over k1–k7. `verification/BlackHole/DormandPrince.lean`
+/// proves the order conditions; `tests/dormand_prince_tableau.rs` checks these literals
+/// against it.
+const DP_A: [[f32; 5]; 5] = [
+    [1.0 / 5.0, 0.0, 0.0, 0.0, 0.0],
+    [3.0 / 40.0, 9.0 / 40.0, 0.0, 0.0, 0.0],
+    [44.0 / 45.0, -56.0 / 15.0, 32.0 / 9.0, 0.0, 0.0],
+    [19372.0 / 6561.0, -25360.0 / 2187.0, 64448.0 / 6561.0, -212.0 / 729.0, 0.0],
+    [9017.0 / 3168.0, -355.0 / 33.0, 46732.0 / 5247.0, 49.0 / 176.0, -5103.0 / 18656.0],
+];
+const DP_B: [f32; 6] = [35.0 / 384.0, 0.0, 500.0 / 1113.0, 125.0 / 192.0, -2187.0 / 6784.0, 11.0 / 84.0];
+const DP_E: [f32; 7] = [
+    71.0 / 57600.0, 0.0, -71.0 / 16695.0, 71.0 / 1920.0, -17253.0 / 339200.0, 22.0 / 525.0, -1.0 / 40.0,
+];
+
 /// Experiment (checklist P1.1): embedded Dormand–Prince 5(4), advancing the fifth-order
 /// solution. Six metric evaluations per first-try step against eleven for step doubling.
 /// No FSAL: callers rewrite `screen` between steps, and the endpoint metric is reused anyway.
@@ -1655,16 +1671,16 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
     for retry in 0..12 {
         let h = next_h;
         next_h = 0.5 * h;
-        let Some(k2) = dp_stage(ray, scale_derivs(0.2, k1), h, gauged, objects) else {
+        let Some(k2) = dp_stage(ray, scale_derivs(DP_A[0][0], k1), h, gauged, objects) else {
             continue;
         };
-        let d = add_derivs(scale_derivs(3.0 / 40.0, k1), 9.0 / 40.0, k2);
+        let d = add_derivs(scale_derivs(DP_A[1][0], k1), DP_A[1][1], k2);
         let Some(k3) = dp_stage(ray, d, h, gauged, objects) else {
             continue;
         };
         let d = add_derivs(
-            add_derivs(scale_derivs(44.0 / 45.0, k1), -56.0 / 15.0, k2),
-            32.0 / 9.0,
+            add_derivs(scale_derivs(DP_A[2][0], k1), DP_A[2][1], k2),
+            DP_A[2][2],
             k3,
         );
         let Some(k4) = dp_stage(ray, d, h, gauged, objects) else {
@@ -1672,11 +1688,11 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
         };
         let d = add_derivs(
             add_derivs(
-                add_derivs(scale_derivs(19372.0 / 6561.0, k1), -25360.0 / 2187.0, k2),
-                64448.0 / 6561.0,
+                add_derivs(scale_derivs(DP_A[3][0], k1), DP_A[3][1], k2),
+                DP_A[3][2],
                 k3,
             ),
-            -212.0 / 729.0,
+            DP_A[3][3],
             k4,
         );
         let Some(k5) = dp_stage(ray, d, h, gauged, objects) else {
@@ -1685,14 +1701,14 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
         let d = add_derivs(
             add_derivs(
                 add_derivs(
-                    add_derivs(scale_derivs(9017.0 / 3168.0, k1), -355.0 / 33.0, k2),
-                    46732.0 / 5247.0,
+                    add_derivs(scale_derivs(DP_A[4][0], k1), DP_A[4][1], k2),
+                    DP_A[4][2],
                     k3,
                 ),
-                49.0 / 176.0,
+                DP_A[4][3],
                 k4,
             ),
-            -5103.0 / 18656.0,
+            DP_A[4][4],
             k5,
         );
         let Some(k6) = dp_stage(ray, d, h, gauged, objects) else {
@@ -1701,14 +1717,14 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
         let d = add_derivs(
             add_derivs(
                 add_derivs(
-                    add_derivs(scale_derivs(35.0 / 384.0, k1), 500.0 / 1113.0, k3),
-                    125.0 / 192.0,
+                    add_derivs(scale_derivs(DP_B[0], k1), DP_B[2], k3),
+                    DP_B[3],
                     k4,
                 ),
-                -2187.0 / 6784.0,
+                DP_B[4],
                 k5,
             ),
-            11.0 / 84.0,
+            DP_B[5],
             k6,
         );
         let next = rk_state(ray, d, h);
@@ -1728,17 +1744,17 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
                 add_derivs(
                     add_derivs(
                         add_derivs(
-                            add_derivs(scale_derivs(71.0 / 57600.0, k1), -71.0 / 16695.0, k3),
-                            71.0 / 1920.0,
+                            add_derivs(scale_derivs(DP_E[0], k1), DP_E[2], k3),
+                            DP_E[3],
                             k4,
                         ),
-                        -17253.0 / 339200.0,
+                        DP_E[4],
                         k5,
                     ),
-                    22.0 / 525.0,
+                    DP_E[5],
                     k6,
                 ),
-                -1.0 / 40.0,
+                DP_E[6],
                 k7,
             ),
         );

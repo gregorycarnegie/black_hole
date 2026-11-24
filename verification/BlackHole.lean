@@ -80,6 +80,7 @@ public import BlackHole.DirectionError
 public import BlackHole.CheckedData
 public import BlackHole.RayCertificate
 public import BlackHole.RK4Order
+public import BlackHole.DormandPrince
 public import BlackHole.TaylorLine
 public import BlackHole.WgslTransferPhi
 public import BlackHole.WgslTransferCell

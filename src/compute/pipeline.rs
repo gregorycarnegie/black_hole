@@ -918,6 +918,16 @@ mod swarm_gpu {
 
     /// Renders with `bh_geodesic`, or with `bh_geodesic_swarm` when bodies are given.
     fn render(scene: &Scene, swarm: Option<&SwarmDevice>) -> (Vec<f32>, f64) {
+        render_with(scene, swarm, 0)
+    }
+
+    /// As `render`, with the experiment bits; without bodies, nonzero bits select
+    /// `bh_geodesic_experiments`.
+    fn render_with(
+        scene: &Scene,
+        swarm: Option<&SwarmDevice>,
+        experiments: u32,
+    ) -> (Vec<f32>, f64) {
         let cuda = shared_cuda();
         let mut output = cuda.alloc_zeros::<f32>((WIDTH * HEIGHT * 4) as usize);
         let cfg = ray_launch_config(WIDTH, HEIGHT, true);
@@ -925,9 +935,14 @@ mod swarm_gpu {
         cuda.stream.synchronize().unwrap();
         let start = std::time::Instant::now();
         if let Some(swarm) = swarm {
-            swarm.launch(&mut output, args, (WIDTH, HEIGHT, 2, 1), 0, cfg);
+            swarm.launch(&mut output, args, (WIDTH, HEIGHT, 2, 1), experiments, cfg);
         } else {
-            let mut builder = cuda.stream.launch_builder(&cuda.geodesic);
+            let kernel = if experiments == 0 {
+                &cuda.geodesic
+            } else {
+                &cuda.geodesic_experiments
+            };
+            let mut builder = cuda.stream.launch_builder(kernel);
             builder.arg(&mut output);
             builder.arg(args.0);
             builder.arg(args.1);
@@ -937,6 +952,9 @@ mod swarm_gpu {
             builder.arg(&HEIGHT);
             builder.arg(&2u32);
             builder.arg(&1u32);
+            if experiments != 0 {
+                builder.arg(&experiments);
+            }
             unsafe { builder.launch(cfg).unwrap() };
         }
         cuda.stream.synchronize().unwrap();
@@ -1087,6 +1105,7 @@ mod swarm_gpu {
         optix: &mut crate::compute::optix::OptixRender,
         scene: &Scene,
         bodies: &[GpuSwarmBody],
+        experiments: u32,
     ) -> (Vec<f32>, f64, crate::compute::optix::RenderStats) {
         use cudarc::driver::DevicePtr;
         let cuda = shared_cuda();
@@ -1108,7 +1127,7 @@ mod swarm_gpu {
                     objects,
                     skybox,
                     size: (WIDTH, HEIGHT, 2, 1),
-                    experiments: 0,
+                    experiments,
                     cfg: ray_launch_config(WIDTH, HEIGHT, true),
                 },
                 bodies,
@@ -1138,15 +1157,15 @@ mod swarm_gpu {
             let mut bvh_times: Vec<f64> = (0..5).map(|_| render(&scene, Some(&bvh)).1).collect();
             bvh_times.sort_by(f64::total_cmp);
             // The first frame sizes the queue.
-            render_optix(&mut optix, &scene, bodies);
+            render_optix(&mut optix, &scene, bodies, 0);
             let mut runs: Vec<(f64, f64, u32)> = (0..5)
                 .map(|_| {
-                    let (_, total, stats) = render_optix(&mut optix, &scene, bodies);
+                    let (_, total, stats) = render_optix(&mut optix, &scene, bodies, 0);
                     (total, stats.build_ms, stats.queued)
                 })
                 .collect();
             runs.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let (image, _, _) = render_optix(&mut optix, &scene, bodies);
+            let (image, _, _) = render_optix(&mut optix, &scene, bodies, 0);
             let differing = if count <= 1024 {
                 let (brute, _) = render(&scene, Some(&device(bodies, true)));
                 brute
@@ -1179,6 +1198,61 @@ mod swarm_gpu {
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
         assert_eq!(differing, 0, "{differing} channels differ");
+    }
+
+    /// The swarm with and without the Dormand–Prince controller (bit 2), BVH and,
+    /// with `--features optix`, OptiX; alternating launches, medians of five. The
+    /// accelerated images must still match brute force under DP45.
+    #[test]
+    #[ignore = "requires a CUDA GPU; benchmark, run with --release -- --ignored --nocapture"]
+    fn swarm_dp45_timing() {
+        let scene = single_hole();
+        #[cfg(feature = "optix")]
+        let mut optix = crate::compute::optix::OptixRender::new().unwrap();
+        let median = |mut v: Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for count in crate::swarm::SWARM_COUNTS.into_iter().chain([16384]) {
+            let bodies = swarm_bodies(count, SPIN, 1000.0);
+            let bvh = (count > 0).then(|| device(&bodies, false));
+            let mut times = [Vec::new(), Vec::new()];
+            for sample in 0..6 {
+                for (variant, experiments) in [0, 4].into_iter().enumerate() {
+                    let ms = render_with(&scene, bvh.as_ref(), experiments).1;
+                    if sample > 0 {
+                        times[variant].push(ms);
+                    }
+                }
+            }
+            let [rk4, dp45] = times.map(median);
+            let mut row = format!("{count:>6} bodies: BVH rk4 {rk4:6.1} ms, dp45 {dp45:6.1} ms");
+            if (1..=1024).contains(&count) {
+                let brute = render_with(&scene, Some(&device(&bodies, true)), 4).0;
+                let fast = render_with(&scene, bvh.as_ref(), 4).0;
+                assert!(brute.iter().zip(&fast).all(|(a, b)| a.to_bits() == b.to_bits()));
+            }
+            #[cfg(feature = "optix")]
+            if count > 0 {
+                let mut times = [Vec::new(), Vec::new()];
+                for sample in 0..6 {
+                    for (variant, experiments) in [0, 4].into_iter().enumerate() {
+                        let ms = render_optix(&mut optix, &scene, &bodies, experiments).1;
+                        if sample > 0 {
+                            times[variant].push(ms);
+                        }
+                    }
+                }
+                let [rk4, dp45] = times.map(median);
+                row += &format!("; OptiX rk4 {rk4:6.1} ms, dp45 {dp45:6.1} ms");
+                if count <= 1024 {
+                    let brute = render_with(&scene, Some(&device(&bodies, true)), 4).0;
+                    let image = render_optix(&mut optix, &scene, &bodies, 4).0;
+                    assert!(brute.iter().zip(&image).all(|(a, b)| a.to_bits() == b.to_bits()));
+                }
+            }
+            println!("{row}");
+        }
     }
 
     /// Brute force against the space-time BVH, including the host build and upload.

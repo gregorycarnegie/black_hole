@@ -117,7 +117,7 @@ With both experiments enabled, the change saves about 3 ms per frame. The defaul
 
 ## Experimental Dormand–Prince controller
 
-Enable with `--experiment-dp45`. Unlike the two experiments above, it applies to every scene, including binaries and the swarm. It replaces the step-doubling RK4 controller with an embedded Dormand–Prince 5(4) step that advances the fifth-order solution. The stages form the error estimate directly, so binary32 rounding of the two end states does not hide it. A step accepted on the first try costs 6 `scene_metric` evaluations inside the controller instead of 11. It does not reuse the last stage as the next step's first stage, because the renderer rewrites the screen vector between steps and the endpoint metric is already reused. Validity, null-constraint, stagnation and retry rules are unchanged, as is `STEP_TOLERANCE`. [Controller](tools/cuda/kernels.rs#L1637)
+Enable with `--experiment-dp45`. Unlike the two experiments above, it applies to every scene, including binaries and the swarm. It replaces the step-doubling RK4 controller with an embedded Dormand–Prince 5(4) step that advances the fifth-order solution. The stages form the error estimate directly, so binary32 rounding of the two end states does not hide it. A step accepted on the first try costs 6 `scene_metric` evaluations inside the controller instead of 11. It does not reuse the last stage as the next step's first stage, because the renderer rewrites the screen vector between steps and the endpoint metric is already reused. Validity, null-constraint, stagnation and retry rules are unchanged, as is `STEP_TOLERANCE`. [Controller](tools/cuda/kernels.rs#L1653) · [Tableau proof](verification/BlackHole/DormandPrince.lean)
 
 Measured on 2026-11-24 with `--profile-renderer`, release build, RTX 4090, alternating runs:
 
@@ -132,7 +132,7 @@ Accepted steps fell by only 0.2% (42.90M to 42.80M), and rejected attempts by 6%
 
 In the binary64 Schwarzschild trajectory test, DP45 cut the near-critical errors about threefold. At impact 5.3 the position error went from 1.646e-3 to 5.70e-4 and the momentum error from 1.500e-5 to 5.12e-6. At 5.25 the position error went from 1.584e-3 to 5.62e-4. Both still miss the target. Impact 10 rose from 1.87e-5 to 4.16e-5 and stays within its 9.88e-5 target. Impact 30 was unchanged. [Trajectory test](tests/common/controller.rs#L85)
 
-`dp45_controller_benchmark` times `bh_geodesic` against `bh_geodesic_experiments` with only DP45 enabled. It uses CUDA events, alternates launches, and takes 20 samples after three warm-ups. It uses the default camera, a 2×1 sky and thermal intensity. Run it with `cargo test --release --bin black_hole -- --ignored dp45_controller_benchmark --nocapture`. [Benchmark](src/compute/pipeline.rs#L1221)
+`dp45_controller_benchmark` times `bh_geodesic` against `bh_geodesic_experiments` with only DP45 enabled. It uses CUDA events, alternates launches, and takes 20 samples after three warm-ups. It uses the default camera, a 2×1 sky and thermal intensity. Run it with `cargo test --release --bin black_hole -- --ignored dp45_controller_benchmark --nocapture`. [Benchmark](src/compute/pipeline.rs#L1295)
 
 | Scene | RK4 median / p95 (ms) | DP45 median / p95 (ms) | Pixels differing by more than 1/255 | Largest channel difference |
 |---|---:|---:|---:|---:|
@@ -141,15 +141,25 @@ In the binary64 Schwarzschild trajectory test, DP45 cut the near-critical errors
 | Binary 400×300 | 33.3 / 33.5 | 23.4 / 23.7 | 1 | 0.008 |
 | Binary 960×540 | 80.3 / 81.2 | 53.0 / 53.8 | 3 | 0.019 |
 
-The driver reports 255 registers for both kernels. Local memory is 704 bytes per thread for `bh_geodesic` and 1,128 bytes for `bh_geodesic_experiments`. That kernel also carries the early-capture and far-field code, so the figure is an upper bound for DP45 alone.
+The driver reports 255 registers for both kernels. Local memory is 704 bytes per thread for `bh_geodesic` and 1,128 bytes for `bh_geodesic_experiments`. That kernel also carries the early-capture and far-field code. A build of `bh_geodesic` with DP45 alone (not kept) needs 255 registers and 320 bytes of local memory, under half the RK4 kernel's 704. On the same run it took 62.6, 76.3, 17.6 and 38.9 ms for the four scenes in the table, against 125.1, 148.0, 32.5 and 77.6 ms for RK4 and 80.5, 102.2, 22.8 and 51.5 ms for DP45 in the experiments kernel. Its images matched the experiments kernel's DP45 images exactly. So a DP45 default would halve the frame time, and the stage sums need no restructuring for local memory.
 
 The EHT snapshot test traces its gauged path with both controllers and writes `image-gpu.f32` and `image-gpu-dp45.f32`. Compare each with `check_image.py compare --image <file>`. Both resolve every ray (990 captured, 24,610 escaped). Against the refined Zig reference, Stokes I L2 error is 0.719% for RK4 and 0.704% for DP45. The worst I error is 2.75% and 2.87% of the reference peak. The worst relative I error above the floor is 24.27% for both. The maximum null residual is 4.06e-5 and 2.37e-5. The Q, U and V L2 errors are within 0.0001 of each other. Path error does not dominate this image's error. A single launch of each took 711 ms (RK4, run first) and 431 ms (DP45). That is not a controlled timing. The recorded RK4 median is 546 ms.
 
 `dp45_disagreements_against_a_binary64_reference` traces the 16 close-up pixels where the controllers' escape directions differ most. It uses binary64 RK4 on the CPU Kerr field (`certified::Kerr`), starting from the GPU's own initial state. Halving the reference step changed directions by at most 9e-8 rad. The two image outliers top that list. At (196, 103) the error against the reference is 9.1e-2 rad for RK4 and 1.6e-2 for DP45; at (183, 112) it is 2.1e-2 and 4.1e-3. DP45 is closer at 13 of the 16 pixels. Four ordinary pixels agree with the reference to 3e-7 rad under both controllers.
 
-The near-critical classification regression (256 consecutive binary32 impacts around the Schwarzschild critical value, run twice) blocks a default switch as written. RK4 gives zero wrong resolved answers, and DP45 gives 2 per run, all within 1.2e-7 of the critical margin. RK4's zero is not robust, though. Changing the geometric step factor from 0.12 to 0.11 or 0.13 gave RK4 5 and 9 wrong answers per run, against 1 and 2 for DP45. Tightening the DP45 tolerance to 1e-8 or 2e-9 did not help: more steps meant more binary32 rounding, and impact 5.25 rose to 2.9e-3 position error at 2e-9. Neither controller reliably ends near-critical rays as unresolved.
+The near-critical classification regression (256 consecutive binary32 impacts around the Schwarzschild critical value, run twice) blocks a default switch as written. RK4 gives zero wrong resolved answers, and DP45 gives 2 per run, all within 1.2e-7 of the critical margin. RK4's zero is not robust, though. Changing the geometric step factor from 0.12 to 0.11 or 0.13 gave RK4 5 and 9 wrong answers per run, against 1 and 2 for DP45. Tightening the DP45 tolerance to 1e-8 or 2e-9 did not help: more steps meant more binary32 rounding, and impact 5.25 rose to 2.9e-3 position error at 2e-9. Neither controller reliably ends near-critical rays as unresolved. So DP45 stays opt-in until an unresolved band (checklist P1.6) applies to both controllers and DP45 gives zero wrong definitive answers.
 
-Not yet measured: the swarm scenes.
+`swarm_dp45_timing` times the swarm with and without DP45. It uses the default 400×300 view, alternating launches, and the median of five after one warm-up. OptiX frames include the host GAS build. With DP45, the BVH and OptiX images still match brute force bit for bit at 256 and 1,024 bodies. Run it with `cargo test --release --features optix --bin black_hole -- --ignored swarm_dp45_timing --nocapture`; without the feature it times the BVH only. [Benchmark](src/compute/pipeline.rs#L1208)
+
+| Bodies | BVH RK4 | BVH DP45 | OptiX RK4 | OptiX DP45 |
+|---:|---:|---:|---:|---:|
+| 0 | 119.1 ms | 78.9 ms | — | — |
+| 256 | 131.8 ms | 86.3 ms | 164.1 ms | 110.5 ms |
+| 1,024 | 140.4 ms | 90.4 ms | 171.9 ms | 102.8 ms |
+| 4,096 | 155.2 ms | 86.7 ms | 171.0 ms | 121.2 ms |
+| 16,384 | 144.8 ms | 93.9 ms | 211.6 ms | 161.0 ms |
+
+DP45 saves 34–44% with the BVH and 24–40% with OptiX. The BVH times leave out its host rebuild, which the table above puts at up to 75 ms.
 
 ## Experiment order
 
