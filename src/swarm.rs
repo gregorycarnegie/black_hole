@@ -57,7 +57,6 @@ pub(crate) struct GpuSwarmBody {
 
 impl GpuSwarmBody {
     /// Centre at camera-relative coordinate time `t`.
-    #[cfg(test)]
     pub(crate) fn center(&self, t: f64) -> [f64; 3] {
         let angle = f64::from(self.orbit[0]) + f64::from(self.orbit[1]) * t;
         let (sin, cos) = angle.sin_cos();
@@ -66,6 +65,91 @@ impl GpuSwarmBody {
             r * (cos * f64::from(self.axis_a[k]) + sin * f64::from(self.axis_b[k]))
         })
     }
+
+    /// A box holding the body, padded as the kernel pads it, while `early ≤ t ≤ late`.
+    fn swept_box(&self, early: f64, late: f64) -> [[f32; 3]; 2] {
+        let r = f64::from(self.axis_a[3]);
+        let turn = f64::from(self.orbit[1]) * (late - early);
+        assert!(
+            turn.abs() < std::f64::consts::PI,
+            "slice too long for the chord bound"
+        );
+        // The arc stays within its sagitta of the chord; the kernel's per-step
+        // padding is at most r turn² / 8; the rest covers binary32 positions.
+        let pad = f64::from(self.axis_b[3])
+            + r * (1.0 - (0.5 * turn).cos())
+            + 0.125 * r * turn * turn
+            + 0.01;
+        let (a, b) = (self.center(early), self.center(late));
+        [
+            std::array::from_fn(|k| (a[k].min(b[k]) - pad) as f32),
+            std::array::from_fn(|k| (a[k].max(b[k]) + pad) as f32),
+        ]
+    }
+}
+
+/// Width and step limit of the BVH time slices, in r_g/c of camera-relative time.
+/// Must match `SWARM_SLICE_WIDTH` and `SWARM_STEP_SPAN` in `tools/cuda/kernels.rs`.
+const SLICE_WIDTH: f64 = 8.0;
+const STEP_SPAN: f64 = 12.0;
+/// Rays older than SLICES × SLICE_WIDTH fall back to brute force.
+pub(crate) const SLICES: u32 = 40;
+const LEAF_SIZE: usize = 4;
+
+/// One bounding-volume hierarchy per time slice, in the kernel's layout: node i
+/// is `nodes[2i]` (minimum, then the right child or first item as bits) and
+/// `nodes[2i + 1]` (maximum, then 0 or the leaf's item count as bits).
+#[derive(Default)]
+pub(crate) struct SwarmBvh {
+    pub nodes: Vec<[f32; 4]>,
+    pub items: Vec<u32>,
+    pub roots: Vec<u32>,
+}
+
+pub(crate) fn swarm_bvh(bodies: &[GpuSwarmBody]) -> SwarmBvh {
+    let mut bvh = SwarmBvh::default();
+    for slice in 0..SLICES {
+        let late = -f64::from(slice) * SLICE_WIDTH + 0.5 * STEP_SPAN;
+        let early = -f64::from(slice + 1) * SLICE_WIDTH - 0.5 * STEP_SPAN;
+        let boxes: Vec<_> = bodies.iter().map(|b| b.swept_box(early, late)).collect();
+        let mut items: Vec<u32> = (0..bodies.len() as u32).collect();
+        let root = build_node(&mut bvh, &boxes, &mut items);
+        bvh.roots.push(root);
+    }
+    bvh
+}
+
+fn build_node(bvh: &mut SwarmBvh, boxes: &[[[f32; 3]; 2]], items: &mut [u32]) -> u32 {
+    let node = (bvh.nodes.len() / 2) as u32;
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for &item in items.iter() {
+        for k in 0..3 {
+            lo[k] = lo[k].min(boxes[item as usize][0][k]);
+            hi[k] = hi[k].max(boxes[item as usize][1][k]);
+        }
+    }
+    bvh.nodes.push([lo[0], lo[1], lo[2], 0.0]);
+    bvh.nodes.push([hi[0], hi[1], hi[2], 0.0]);
+    let (link, count) = if items.len() <= LEAF_SIZE {
+        let first = bvh.items.len() as u32;
+        bvh.items.extend_from_slice(items);
+        (first, items.len() as u32)
+    } else {
+        // Median split of the box centres along the widest axis.
+        let axis = (0..3)
+            .max_by(|&a, &b| (hi[a] - lo[a]).total_cmp(&(hi[b] - lo[b])))
+            .unwrap();
+        let centre = |item: &u32| boxes[*item as usize][0][axis] + boxes[*item as usize][1][axis];
+        let middle = items.len() / 2;
+        items.select_nth_unstable_by(middle, |a, b| centre(a).total_cmp(&centre(b)));
+        let (left, right) = items.split_at_mut(middle);
+        build_node(bvh, boxes, left); // The left child follows its parent.
+        (build_node(bvh, boxes, right), 0)
+    };
+    bvh.nodes[2 * node as usize][3] = f32::from_bits(link);
+    bvh.nodes[2 * node as usize + 1][3] = f32::from_bits(count);
+    node
 }
 
 pub struct SwarmPlugin;
@@ -171,6 +255,57 @@ mod tests {
         app.update();
         assert_eq!(app.world().resource::<Swarm>().count, 256);
         assert!(app.world().resource::<OrbitalCamera>().is_moving);
+    }
+
+    #[rstest]
+    #[case::one_leaf(3)]
+    #[case::uneven(1000)]
+    #[case::largest_preset(4096)]
+    fn each_slice_tree_holds_every_body_once_inside_nested_boxes(#[case] count: u32) {
+        let bodies = swarm_bodies(count, 0.82, 77.0);
+        let bvh = swarm_bvh(&bodies);
+        assert_eq!(bvh.roots.len(), SLICES as usize);
+        let contains = |outer: usize, inner: usize| {
+            (0..3).all(|k| {
+                bvh.nodes[2 * outer][k] <= bvh.nodes[2 * inner][k]
+                    && bvh.nodes[2 * outer + 1][k] >= bvh.nodes[2 * inner + 1][k]
+            })
+        };
+        for (slice, &root) in bvh.roots.iter().enumerate() {
+            let mut seen = vec![0u32; count as usize];
+            let mut stack = vec![root as usize];
+            while let Some(node) = stack.pop() {
+                let link = bvh.nodes[2 * node][3].to_bits() as usize;
+                let leaf = bvh.nodes[2 * node + 1][3].to_bits() as usize;
+                if leaf == 0 {
+                    assert!(contains(node, node + 1) && contains(node, link));
+                    stack.extend([node + 1, link]);
+                } else {
+                    assert!(leaf <= LEAF_SIZE);
+                    for &item in &bvh.items[link..link + leaf] {
+                        seen[item as usize] += 1;
+                        // The body's box over the slice's whole window fits its leaf.
+                        let late = -(slice as f64) * SLICE_WIDTH + 0.5 * STEP_SPAN;
+                        let early = late - SLICE_WIDTH - STEP_SPAN;
+                        let b = bodies[item as usize].swept_box(early, late);
+                        assert!((0..3).all(|k| bvh.nodes[2 * node][k] <= b[0][k]
+                            && bvh.nodes[2 * node + 1][k] >= b[1][k]));
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&n| n == 1), "slice {slice}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn swept_boxes_hold_the_body_throughout_the_window(index in 0u32..256, early in -400.0..0.0_f64, span in 0.0..20.0_f64, s in 0.0..=1.0_f64) {
+            let body = swarm_bodies(index + 1, 0.82, 5.0)[index as usize];
+            let [lo, hi] = body.swept_box(early, early + span);
+            let c = body.center(early + s * span);
+            let r = f64::from(body.axis_b[3]);
+            prop_assert!((0..3).all(|k| f64::from(lo[k]) <= c[k] - r && c[k] + r <= f64::from(hi[k])));
+        }
     }
 
     #[test]

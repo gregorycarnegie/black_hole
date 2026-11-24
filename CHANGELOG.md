@@ -8,7 +8,7 @@
 - Opt-in single-hole ray experiments: `--experiment-early-capture` ends inward rays once a binary64 check of the Kerr radial potential rules out a turning point before the horizon. The Lean lemmas in `verification/BlackHole/KerrCapture.lean` prove that check in exact arithmetic. `--experiment-far-field` takes larger outward steps outside a sphere enclosing the disk and the hole. Together they cut the polarized close-up from about 177 ms to 29–32 ms per frame on an RTX 4090. All exit classifications match the full trace, and sky directions shift by at most 0.72 microradians. `RENDERING_PERFORMANCE.md` records the measurements.
 - GPU regressions for early capture against the analytic equatorial Kerr potential at five spins, and for near-critical Schwarzschild classification with a disk inner edge.
 
-- A swarm of up to 4096 small bodies on prescribed circular orbits (K, or the Swarm panel row), drawn where each was when the light reaching the camera passed it. Every ray step tests every body by brute force, which sets the baseline for space-time acceleration structures. GPU tests check the intersection against exact orbits and show that an empty swarm leaves the image unchanged bit for bit.
+- A swarm of up to 4096 small bodies on prescribed circular orbits (K, or the Swarm panel row), drawn where each was when the light reaching the camera passed it. A space-time BVH, rebuilt per frame over 40 time slices, renders the same image as brute force bit for bit and cuts the 4096-body frame from 4.4 s to 0.38 s on an RTX 4090. GPU tests check the intersection against exact orbits and show that an empty swarm leaves the image unchanged bit for bit.
 
 ### Changed
 

@@ -129,17 +129,21 @@ With both experiments enabled, the change saves about 3 ms per frame. The defaul
 
 Press K (or use the Swarm panel row) to add 256–4096 small bodies on circular orbits 12–40 r_g out. The kernel tracks coordinate time along each ray and places every body where it was when the light passed it. Inner bodies move several r_g during one crossing of the belt, so straight 3D bounds are not enough. Each ray step tests every body. It skips bodies whose orbit sphere or orbital plane the segment cannot reach, and only then solves linearized relative motion, with the radius padded by the arc's sagitta. [Swarm intersection](tools/cuda/kernels.rs) · [Body generator](src/swarm.rs)
 
-`cargo test --release --bin black_hole -- --ignored swarm_brute_force_cost --nocapture` times the default single-hole view at 400×300 on the RTX 4090:
+### Space-time BVH
 
-| Bodies | Ray kernel median |
-|---:|---:|
-| 0 | 117 ms |
-| 256 | 247 ms |
-| 1,024 | 854 ms |
-| 4,096 | 4,308 ms |
-| 16,384 | 15,926 ms |
+Camera-relative time is cut into 40 slices, each 8 r_g/c wide. For each slice, the host builds a binary BVH over every body's swept box, with median splits and up to four bodies per leaf. Each box holds the body throughout the slice plus 6 r_g/c on either side, padded by the arc's sagitta and by the kernel's own per-step padding. A ray step therefore traverses only the slice its midpoint time falls in, provided the step spans at most 12 r_g/c. Longer steps, and steps more than 320 r_g/c before the camera time, fall back to brute force. The leaves run the same per-body test as brute force, so the hits are the same. Bodies move every frame, so the trees are rebuilt and uploaded every frame. [Traversal](tools/cuda/kernels.rs) · [Builder](src/swarm.rs)
 
-Cost grows linearly with the body count. A BVH over each body's swept volume in space and time, refit or rebuilt per frame, should make it close to logarithmic. `swarm_hits_match_exact_circular_orbits` is the reference that any accelerated version must still pass.
+`cargo test --release --bin black_hole -- --ignored swarm_bvh_against_brute_force --nocapture` times the default single-hole view at 400×300 on the RTX 4090. Each kernel time is the median of five launches. The build column is the host build plus upload.
+
+| Bodies | Brute force | BVH | BVH build and upload |
+|---:|---:|---:|---:|
+| 0 | 117 ms | 130 ms | — |
+| 256 | 251 ms | 159 ms | 1 ms |
+| 1,024 | 947 ms | 213 ms | 4 ms |
+| 4,096 | 4,357 ms | 384 ms | 18 ms |
+| 16,384 | about 16 s | 890 ms | 78 ms |
+
+At 1,024 bodies the BVH image matches brute force bit for bit (`the_bvh_renders_the_brute_force_image`). `swarm_hits_match_exact_circular_orbits` checks the shared per-body test against exact orbits. Possible next steps include refitting instead of rebuilding, building on the GPU, and choosing slice widths from the measured step spans. RT cores would need an OptiX backend, which the cuda-oxide toolchain does not target.
 
 The current binary renderer freezes positions and spins for each trace, so 3D bounds suffice for those geometry queries. RT cores accelerate conventional straight-ray traversal and triangle intersections. A mesh-heavy scene could use a 3D BVH to find candidates along short geodesic segments, with the integrator still computing the trajectory. If accuracy is defined against the curved trajectory, the broad phase needs a conservative bound on the curve's departure from each segment, followed by a refined test for candidate hits. Measure the traversal overhead against the direct loop before adopting it. [Frozen metric](README.md#L91) · [NVIDIA RT cores](https://developer.nvidia.com/blog/?p=11872) · [OptiX ray API](https://raytracing-docs.nvidia.com/optix8/api/group__optix__device__api.html)
 

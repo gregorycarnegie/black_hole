@@ -1771,11 +1771,93 @@ fn intersect_objects_segment(start: Vec3, end: Vec3, objects: &Objects) -> Objec
     result
 }
 
-/// Brute-force space-time test of the segment `start → end`, traversed between
-/// camera-relative times `t0 → t1`, against every swarm body. Each body's motion
-/// over the step is linearized and its radius padded by the arc's sagitta, so the
-/// test is conservative. Returns the lit colour of the earliest hit in xyz with
-/// w = 1, or w = 0 for a miss.
+/// Time slices of the swarm BVH, in camera-relative coordinate time. Slice k
+/// covers [-(k+1) W, -k W]; its boxes also cover SWARM_STEP_SPAN / 2 on each side,
+/// so any step no longer than SWARM_STEP_SPAN whose midpoint lies in the slice fits.
+/// Must match `SLICE_WIDTH` and `STEP_SPAN` in `src/swarm.rs`.
+const SWARM_SLICE_WIDTH: f32 = 8.0;
+const SWARM_STEP_SPAN: f32 = 12.0;
+
+/// Segment `start → end`, traversed between camera-relative times `t0 → t1`.
+#[derive(Clone, Copy)]
+struct SwarmQuery {
+    start: Vec3,
+    segment: Vec3,
+    t0: f32,
+    t1: f32,
+    near_r: f32,
+    far_r: f32,
+}
+
+#[inline(always)]
+fn swarm_query(start: Vec3, end: Vec3, t0: f32, t1: f32) -> SwarmQuery {
+    let segment = end - start;
+    let segment_len2 = segment.dot(segment).max(1.0e-12);
+    let nearest = clamp_f32(-start.dot(segment) / segment_len2, 0.0, 1.0);
+    SwarmQuery {
+        start,
+        segment,
+        t0,
+        t1,
+        near_r: (start + nearest * segment).length(),
+        far_r: start.length().max(end.length()),
+    }
+}
+
+/// Tests one body. Its motion over the step is linearized and its radius padded by
+/// the arc's sagitta, so the test is conservative. Keeps the earliest hit in
+/// `best` (segment parameter) and its lit colour in `result`.
+#[cuda_device::device]
+fn swarm_body_hit(q: SwarmQuery, body: SwarmBody, best: &mut f32, result: &mut Vec4) {
+    let orbit_r = body.axis_a.w;
+    let omega = body.orbit.y;
+    let turn = omega * (q.t1 - q.t0);
+    let radius = body.axis_b.w + 0.125 * orbit_r * turn * turn;
+    // Each orbit lies on a sphere of radius orbit_r and in a fixed plane; skip
+    // bodies the segment cannot reach before evaluating their positions.
+    if orbit_r + radius < q.near_r || orbit_r - radius > q.far_r {
+        return;
+    }
+    let end = q.start + q.segment;
+    let normal = body.axis_a.xyz().cross(body.axis_b.xyz());
+    let h0 = normal.dot(q.start);
+    let h1 = normal.dot(end);
+    if (h0 > radius && h1 > radius) || (h0 < -radius && h1 < -radius) {
+        return;
+    }
+    let s0 = sincos(body.orbit.x + omega * q.t0);
+    let s1 = sincos(body.orbit.x + omega * q.t1);
+    let c0 = orbit_r * (s0.y * body.axis_a.xyz() + s0.x * body.axis_b.xyz());
+    let c1 = orbit_r * (s1.y * body.axis_a.xyz() + s1.x * body.axis_b.xyz());
+    // Relative motion: |rel + s d| = radius for s in [0, 1].
+    let rel = q.start - c0;
+    let d = q.segment - (c1 - c0);
+    let dd = d.dot(d).max(1.0e-12);
+    let half_b = rel.dot(d);
+    let disc = half_b * half_b - dd * (rel.dot(rel) - radius * radius);
+    if disc < 0.0 {
+        return;
+    }
+    let root = sqrt(disc);
+    let entry = (-half_b - root) / dd;
+    let exit = (-half_b + root) / dd;
+    let s = entry.max(0.0);
+    if exit >= 0.0 && entry <= 1.0 && s < *best {
+        *best = s;
+        let center = c0 + s * (c1 - c0);
+        let normal = (rel + s * d).normalize();
+        // Lit by the inner disk: the hemisphere facing the hole is bright.
+        let facing = normal.dot(-center.normalize()).max(0.0);
+        let light = (10.0 / orbit_r) * (10.0 / orbit_r);
+        *result = vec4_v3_f(
+            body.orbit.z * vec3(0.62, 0.52, 0.44) * (0.03 + 4.0 * light * facing),
+            1.0,
+        );
+    }
+}
+
+/// Brute force over every body. Returns the lit colour of the earliest hit in xyz
+/// with w = 1, or w = 0 for a miss.
 #[cuda_device::device]
 fn swarm_segment_hit(
     start: Vec3,
@@ -1785,59 +1867,86 @@ fn swarm_segment_hit(
     swarm: *const SwarmBody,
     count: u32,
 ) -> Vec4 {
-    let segment = end - start;
-    let segment_len2 = segment.dot(segment).max(1.0e-12);
-    let nearest = clamp_f32(-start.dot(segment) / segment_len2, 0.0, 1.0);
-    let near_r = (start + nearest * segment).length();
-    let far_r = start.length().max(end.length());
+    let q = swarm_query(start, end, t0, t1);
     let mut best = 2.0_f32;
     let mut result = vec4_splat(0.0);
     let mut i = 0u32;
     while i < count {
-        let body = unsafe { *swarm.add(i as usize) };
+        swarm_body_hit(q, unsafe { *swarm.add(i as usize) }, &mut best, &mut result);
         i += 1;
-        let orbit_r = body.axis_a.w;
-        let omega = body.orbit.y;
-        let turn = omega * (t1 - t0);
-        let radius = body.axis_b.w + 0.125 * orbit_r * turn * turn;
-        // Each orbit lies on a sphere of radius orbit_r and in a fixed plane; skip
-        // bodies the segment cannot reach before evaluating their positions.
-        if orbit_r + radius < near_r || orbit_r - radius > far_r {
+    }
+    result
+}
+
+#[inline(always)]
+fn safe_reciprocal(v: f32) -> f32 {
+    if v.abs() < 1.0e-20 { 1.0e20 } else { 1.0 / v }
+}
+
+/// Whether the segment meets the box [lo, hi].
+#[inline(always)]
+fn segment_meets_box(q: SwarmQuery, inv: Vec3, lo: Vec3, hi: Vec3) -> bool {
+    let a = (lo - q.start) * inv;
+    let b = (hi - q.start) * inv;
+    let near = a.x.min(b.x).max(a.y.min(b.y)).max(a.z.min(b.z)).max(0.0);
+    let far = a.x.max(b.x).min(a.y.max(b.y)).min(a.z.max(b.z)).min(1.0);
+    near <= far
+}
+
+/// The same result as `swarm_segment_hit`, testing only the bodies whose swept box
+/// in the step's time slice meets the segment. Node i is `nodes[2i]` (box minimum,
+/// then the right child or the first item) and `nodes[2i + 1]` (box maximum, then
+/// 0 for an internal node or the item count); an internal node's left child follows
+/// it. Steps that fit no slice fall back to brute force.
+#[cuda_device::device]
+fn swarm_bvh_hit(
+    start: Vec3,
+    end: Vec3,
+    t0: f32,
+    t1: f32,
+    swarm: *const SwarmBody,
+    count: u32,
+    nodes: *const Vec4,
+    items: *const u32,
+    roots: *const u32,
+    slices: u32,
+) -> Vec4 {
+    let middle = -0.5 * (t0 + t1);
+    let slice = (middle / SWARM_SLICE_WIDTH) as u32;
+    if !(middle >= 0.0 && (t0 - t1).abs() <= SWARM_STEP_SPAN && slice < slices) {
+        return swarm_segment_hit(start, end, t0, t1, swarm, count);
+    }
+    let q = swarm_query(start, end, t0, t1);
+    let inv = vec3(
+        safe_reciprocal(q.segment.x),
+        safe_reciprocal(q.segment.y),
+        safe_reciprocal(q.segment.z),
+    );
+    let mut best = 2.0_f32;
+    let mut result = vec4_splat(0.0);
+    let mut stack = [0u32; 32];
+    let mut depth = 1usize;
+    stack[0] = unsafe { *roots.add(slice as usize) };
+    while depth > 0 {
+        depth -= 1;
+        let node = stack[depth];
+        let lo = unsafe { *nodes.add(2 * node as usize) };
+        let hi = unsafe { *nodes.add(2 * node as usize + 1) };
+        if !segment_meets_box(q, inv, lo.xyz(), hi.xyz()) {
             continue;
         }
-        let normal = body.axis_a.xyz().cross(body.axis_b.xyz());
-        let h0 = normal.dot(start);
-        let h1 = normal.dot(end);
-        if (h0 > radius && h1 > radius) || (h0 < -radius && h1 < -radius) {
-            continue;
-        }
-        let s0 = sincos(body.orbit.x + omega * t0);
-        let s1 = sincos(body.orbit.x + omega * t1);
-        let c0 = orbit_r * (s0.y * body.axis_a.xyz() + s0.x * body.axis_b.xyz());
-        let c1 = orbit_r * (s1.y * body.axis_a.xyz() + s1.x * body.axis_b.xyz());
-        // Relative motion: |rel + s d| = radius for s in [0, 1].
-        let rel = start - c0;
-        let d = segment - (c1 - c0);
-        let dd = d.dot(d).max(1.0e-12);
-        let half_b = rel.dot(d);
-        let disc = half_b * half_b - dd * (rel.dot(rel) - radius * radius);
-        if disc >= 0.0 {
-            let root = sqrt(disc);
-            let entry = (-half_b - root) / dd;
-            let exit = (-half_b + root) / dd;
-            let s = entry.max(0.0);
-            if exit >= 0.0 && entry <= 1.0 && s < best {
-                best = s;
-                let center = c0 + s * (c1 - c0);
-                let normal = (rel + s * d).normalize();
-                // Lit by the inner disk: the hemisphere facing the hole is bright.
-                let facing = normal.dot(-center.normalize()).max(0.0);
-                let light = (10.0 / orbit_r) * (10.0 / orbit_r);
-                let albedo = body.orbit.z;
-                result = vec4_v3_f(
-                    albedo * vec3(0.62, 0.52, 0.44) * (0.03 + 4.0 * light * facing),
-                    1.0,
-                );
+        let link = lo.w.to_bits();
+        let leaf_count = hi.w.to_bits();
+        if leaf_count == 0 {
+            stack[depth] = link;
+            stack[depth + 1] = node + 1;
+            depth += 2;
+        } else {
+            let mut k = 0u32;
+            while k < leaf_count {
+                let index = unsafe { *items.add((link + k) as usize) };
+                swarm_body_hit(q, unsafe { *swarm.add(index as usize) }, &mut best, &mut result);
+                k += 1;
             }
         }
     }
@@ -2338,6 +2447,7 @@ pub unsafe fn bh_geodesic(
         render_geodesic::<false, false>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), false, false, core::ptr::null(), 0,
+            (core::ptr::null(), core::ptr::null(), core::ptr::null(), 0),
         );
     }
 }
@@ -2358,6 +2468,7 @@ pub unsafe fn bh_geodesic_early_capture(
         render_geodesic::<false, false>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), true, false, core::ptr::null(), 0,
+            (core::ptr::null(), core::ptr::null(), core::ptr::null(), 0),
         );
     }
 }
@@ -2379,6 +2490,7 @@ pub unsafe fn bh_geodesic_far_field(
         render_geodesic::<false, false>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), early_capture != 0, true, core::ptr::null(), 0,
+            (core::ptr::null(), core::ptr::null(), core::ptr::null(), 0),
         );
     }
 }
@@ -2397,12 +2509,17 @@ pub unsafe fn bh_geodesic_swarm(
     sky_h: u32,
     swarm: *const SwarmBody,
     swarm_count: u32,
+    bvh_nodes: *const Vec4,
+    bvh_items: *const u32,
+    bvh_roots: *const u32,
+    bvh_slices: u32,
     experiments: u32,
 ) {
     unsafe {
         render_geodesic::<false, true>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, swarm, swarm_count,
+            (bvh_nodes, bvh_items, bvh_roots, bvh_slices),
         );
     }
 }
@@ -2479,6 +2596,7 @@ pub unsafe fn bh_geodesic_diagnostics(
         render_geodesic::<true, false>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
             experiments & 1 != 0, experiments & 2 != 0, core::ptr::null(), 0,
+            (core::ptr::null(), core::ptr::null(), core::ptr::null(), 0),
         );
     }
 }
@@ -2510,6 +2628,7 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool>(
     far_field: bool,
     swarm: *const SwarmBody,
     swarm_count: u32,
+    bvh: (*const Vec4, *const u32, *const u32, u32),
 ) {
     let pix_x = gid_x();
     let pix_y = gid_y();
@@ -2638,7 +2757,9 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool>(
         if SWARM {
             // Trapezoidal dt/dλ; `metric` now holds the accepted endpoint's metric.
             let end_time = ray_time + 0.5 * h * (start_dt + (metric.inv * next.p).x);
-            let body = swarm_segment_hit(ray.pos, next.pos, ray_time, end_time, swarm, swarm_count);
+            let body = swarm_bvh_hit(
+                ray.pos, next.pos, ray_time, end_time, swarm, swarm_count, bvh.0, bvh.1, bvh.2, bvh.3,
+            );
             ray_time = end_time;
             if body.w > 0.0 {
                 rgb += transmission * body.xyz();

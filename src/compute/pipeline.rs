@@ -16,7 +16,7 @@ use crate::{
     simulation::{
         BINARY_DISK_INNER_RS, SCHWARZSCHILD_RADIUS, kerr_horizon_radius, kerr_isco_radius,
     },
-    swarm::{Swarm, swarm_bodies},
+    swarm::{GpuSwarmBody, SLICES, Swarm, swarm_bodies, swarm_bvh},
 };
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
@@ -102,8 +102,92 @@ pub struct GeodesicPipeline {
     bound_other_sky_handle: Option<Handle<Image>>,
     last_objects: Option<GpuObjectsUniform>,
     last_disk: Option<GpuDiskUniform>,
-    swarm_buf: CudaSlice<u8>,
-    swarm_count: u32,
+    swarm: SwarmDevice,
+}
+
+/// Swarm bodies and their per-slice BVHs on the device.
+pub(super) struct SwarmDevice {
+    bodies: CudaSlice<u8>,
+    nodes: CudaSlice<u8>,
+    items: CudaSlice<u8>,
+    roots: CudaSlice<u8>,
+    count: u32,
+    /// 0 selects the brute-force path.
+    slices: u32,
+}
+
+impl SwarmDevice {
+    fn new() -> Self {
+        let cuda = shared_cuda();
+        Self {
+            bodies: cuda.alloc_zeros::<u8>(16),
+            nodes: cuda.alloc_zeros::<u8>(16),
+            items: cuda.alloc_zeros::<u8>(16),
+            roots: cuda.alloc_zeros::<u8>(16),
+            count: 0,
+            slices: 0,
+        }
+    }
+
+    /// Uploads `bodies`, with their BVHs unless `brute_force`.
+    fn upload(&mut self, bodies: &[GpuSwarmBody], brute_force: bool) {
+        fn write(buffer: &mut CudaSlice<u8>, bytes: &[u8]) {
+            let cuda = shared_cuda();
+            if buffer.len() == bytes.len() {
+                cuda.memcpy_htod(bytes, buffer);
+            } else {
+                *buffer = cuda.clone_htod(bytes);
+            }
+        }
+        write(&mut self.bodies, bytemuck::cast_slice(bodies));
+        self.count = bodies.len() as u32;
+        self.slices = 0;
+        if !brute_force && !bodies.is_empty() {
+            let bvh = swarm_bvh(bodies);
+            write(&mut self.nodes, bytemuck::cast_slice(&bvh.nodes));
+            write(&mut self.items, bytemuck::cast_slice(&bvh.items));
+            write(&mut self.roots, bytemuck::cast_slice(&bvh.roots));
+            self.slices = SLICES;
+        }
+    }
+
+    fn launch(
+        &self,
+        output: &mut CudaSlice<f32>,
+        args: (
+            &CudaSlice<u8>,
+            &CudaSlice<u8>,
+            &CudaSlice<u8>,
+            &CudaSlice<u8>,
+        ),
+        size: (u32, u32, u32, u32),
+        experiments: u32,
+        cfg: LaunchConfig,
+    ) {
+        let cuda = shared_cuda();
+        let mut builder = cuda.stream.launch_builder(&cuda.geodesic_swarm);
+        builder.arg(output);
+        builder.arg(args.0);
+        builder.arg(args.1);
+        builder.arg(args.2);
+        builder.arg(args.3);
+        builder.arg(&size.0);
+        builder.arg(&size.1);
+        builder.arg(&size.2);
+        builder.arg(&size.3);
+        builder.arg(&self.bodies);
+        builder.arg(&self.count);
+        builder.arg(&self.nodes);
+        builder.arg(&self.items);
+        builder.arg(&self.roots);
+        builder.arg(&self.slices);
+        builder.arg(&experiments);
+        unsafe {
+            builder
+                .launch(cfg)
+                .expect("CUDA bh_geodesic_swarm kernel launch failed");
+        }
+    }
 }
 
 pub fn init_geodesic_pipeline(mut commands: Commands) {
@@ -132,8 +216,7 @@ pub fn init_geodesic_pipeline(mut commands: Commands) {
         bound_other_sky_handle: None,
         last_objects: None,
         last_disk: None,
-        swarm_buf: cuda.alloc_zeros::<u8>(16),
-        swarm_count: 0,
+        swarm: SwarmDevice::new(),
     });
 }
 
@@ -245,16 +328,10 @@ pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets
     }
 
     // Swarm phases move every frame, so upload them whenever bodies are shown.
-    pipeline.swarm_count = 0;
+    pipeline.swarm.count = 0;
     if let Some(swarm) = sources.swarm.filter(|swarm| swarm.count > 0) {
         let bodies = swarm_bodies(swarm.count, disk_config.spin, swarm.time);
-        let bytes = bytemuck::cast_slice(&bodies);
-        if pipeline.swarm_buf.len() == bytes.len() {
-            cuda.memcpy_htod(bytes, &mut pipeline.swarm_buf);
-        } else {
-            pipeline.swarm_buf = cuda.clone_htod(bytes);
-        }
-        pipeline.swarm_count = swarm.count;
+        pipeline.swarm.upload(&bodies, false);
     }
 
     // Output geodesic buffer — reallocate when handle or resolution changes.
@@ -408,8 +485,7 @@ pub fn dispatch_geodesic(
         ref mut geodesic_buf,
         ref skybox_buf,
         ref other_skybox_buf,
-        ref swarm_buf,
-        swarm_count,
+        ref swarm,
         width,
         height,
         sky_width,
@@ -451,25 +527,14 @@ pub fn dispatch_geodesic(
         return;
     }
     let enabled = active_experiments(single_source, experiments.as_deref());
-    if swarm_count > 0 {
-        let mut builder = cuda.stream.launch_builder(&cuda.geodesic_swarm);
-        builder.arg(geodesic_buf);
-        builder.arg(camera_buf);
-        builder.arg(disk_buf);
-        builder.arg(objects_buf);
-        builder.arg(skybox_buf);
-        builder.arg(&width);
-        builder.arg(&height);
-        builder.arg(&sky_width);
-        builder.arg(&sky_height);
-        builder.arg(swarm_buf);
-        builder.arg(&swarm_count);
-        builder.arg(&enabled);
-        unsafe {
-            builder
-                .launch(cfg)
-                .expect("CUDA bh_geodesic_swarm kernel launch failed");
-        }
+    if swarm.count > 0 {
+        swarm.launch(
+            geodesic_buf,
+            (camera_buf, disk_buf, objects_buf, skybox_buf),
+            (width, height, sky_width, sky_height),
+            enabled,
+            cfg,
+        );
         return;
     }
     let kernel = match enabled {
@@ -724,7 +789,7 @@ mod swarm_gpu {
         camera: CudaSlice<u8>,
         disk: CudaSlice<u8>,
         objects: CudaSlice<u8>,
-        sky: CudaSlice<f32>,
+        sky: CudaSlice<u8>,
     }
 
     /// The default single-hole view.
@@ -763,46 +828,42 @@ mod swarm_gpu {
             disk: cuda.clone_htod(bytemuck::bytes_of(&disk)),
             objects: cuda.clone_htod(bytemuck::bytes_of(&objects)),
             // A 2×1 sky, so the escape direction shows up in the image.
-            sky: cuda.clone_htod(&[0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0]),
+            sky: cuda.clone_htod(bytemuck::cast_slice(&[0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0])),
         }
     }
 
     /// Renders with `bh_geodesic`, or with `bh_geodesic_swarm` when bodies are given.
-    fn render(scene: &Scene, swarm: Option<(&CudaSlice<u8>, u32)>) -> (Vec<f32>, f64) {
+    fn render(scene: &Scene, swarm: Option<&SwarmDevice>) -> (Vec<f32>, f64) {
         let cuda = shared_cuda();
         let mut output = cuda.alloc_zeros::<f32>((WIDTH * HEIGHT * 4) as usize);
-        let count = swarm.map_or(0, |(_, count)| count);
-        let kernel = if swarm.is_some() {
-            &cuda.geodesic_swarm
-        } else {
-            &cuda.geodesic
-        };
-        let mut builder = cuda.stream.launch_builder(kernel);
-        builder.arg(&mut output);
-        builder.arg(&scene.camera);
-        builder.arg(&scene.disk);
-        builder.arg(&scene.objects);
-        builder.arg(&scene.sky);
-        builder.arg(&WIDTH);
-        builder.arg(&HEIGHT);
-        builder.arg(&2u32);
-        builder.arg(&1u32);
-        if let Some((bodies, _)) = swarm {
-            builder.arg(bodies);
-            builder.arg(&count);
-            builder.arg(&0u32);
-        }
+        let cfg = ray_launch_config(WIDTH, HEIGHT, true);
+        let args = (&scene.camera, &scene.disk, &scene.objects, &scene.sky);
         cuda.stream.synchronize().unwrap();
         let start = std::time::Instant::now();
-        unsafe {
-            builder
-                .launch(ray_launch_config(WIDTH, HEIGHT, true))
-                .unwrap()
-        };
+        if let Some(swarm) = swarm {
+            swarm.launch(&mut output, args, (WIDTH, HEIGHT, 2, 1), 0, cfg);
+        } else {
+            let mut builder = cuda.stream.launch_builder(&cuda.geodesic);
+            builder.arg(&mut output);
+            builder.arg(args.0);
+            builder.arg(args.1);
+            builder.arg(args.2);
+            builder.arg(args.3);
+            builder.arg(&WIDTH);
+            builder.arg(&HEIGHT);
+            builder.arg(&2u32);
+            builder.arg(&1u32);
+            unsafe { builder.launch(cfg).unwrap() };
+        }
         cuda.stream.synchronize().unwrap();
         let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        drop(builder);
         (cuda.clone_dtoh(&output), elapsed)
+    }
+
+    fn device(bodies: &[GpuSwarmBody], brute_force: bool) -> SwarmDevice {
+        let mut device = SwarmDevice::new();
+        device.upload(bodies, brute_force);
+        device
     }
 
     fn upload(bodies: &[GpuSwarmBody]) -> CudaSlice<u8> {
@@ -813,9 +874,8 @@ mod swarm_gpu {
     #[ignore = "requires a CUDA GPU"]
     fn an_empty_swarm_renders_the_ordinary_image() {
         let scene = single_hole();
-        let empty = upload(&swarm_bodies(1, SPIN, 0.0));
         let (ordinary, _) = render(&scene, None);
-        let (swarm, _) = render(&scene, Some((&empty, 0)));
+        let (swarm, _) = render(&scene, Some(&device(&[], true)));
         assert!(
             ordinary
                 .iter()
@@ -936,27 +996,50 @@ mod swarm_gpu {
         assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(5)]);
     }
 
-    /// Brute-force baseline for space-time acceleration structures.
+    /// The BVH must pick exactly the hits brute force picks.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn the_bvh_renders_the_brute_force_image() {
+        let scene = single_hole();
+        let bodies = swarm_bodies(1024, SPIN, 1000.0);
+        let (brute, _) = render(&scene, Some(&device(&bodies, true)));
+        let (bvh, _) = render(&scene, Some(&device(&bodies, false)));
+        let differing = brute
+            .iter()
+            .zip(&bvh)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "{differing} channels differ");
+    }
+
+    /// Brute force against the space-time BVH, including the host build and upload.
     #[test]
     #[ignore = "requires a CUDA GPU; benchmark, run with --release -- --ignored --nocapture"]
-    fn swarm_brute_force_cost() {
+    fn swarm_bvh_against_brute_force() {
         let scene = single_hole();
         for count in crate::swarm::SWARM_COUNTS.into_iter().chain([16384]) {
-            let bodies = upload(&swarm_bodies(count.max(1), SPIN, 1000.0));
-            let swarm = Some((&bodies, count));
-            render(&scene, swarm);
-            let mut times: Vec<f64> = (0..5).map(|_| render(&scene, swarm).1).collect();
-            times.sort_by(f64::total_cmp);
-            let (image, _) = render(&scene, swarm);
-            std::fs::write(
-                format!("target/swarm-{count}.rgba32f"),
-                bytemuck::cast_slice(&image),
-            )
-            .unwrap();
-            println!(
-                "{count:>6} bodies: median {:7.1} ms over 5 launches",
-                times[2]
-            );
+            let bodies = swarm_bodies(count, SPIN, 1000.0);
+            let mut row = format!("{count:>6} bodies:");
+            for brute_force in [true, false] {
+                if brute_force && count > 4096 {
+                    row += "  brute force skipped";
+                    continue;
+                }
+                let start = std::time::Instant::now();
+                let swarm = device(&bodies, brute_force);
+                let build = start.elapsed().as_secs_f64() * 1000.0;
+                render(&scene, Some(&swarm));
+                let mut times: Vec<f64> = (0..5).map(|_| render(&scene, Some(&swarm)).1).collect();
+                times.sort_by(f64::total_cmp);
+                let name = if brute_force { "brute force" } else { "BVH" };
+                row += &format!("  {name} {:7.1} ms (upload {build:.1} ms)", times[2]);
+                if !brute_force && count == 1024 {
+                    let (image, _) = render(&scene, Some(&swarm));
+                    std::fs::write("target/swarm-1024.rgba32f", bytemuck::cast_slice(&image))
+                        .unwrap();
+                }
+            }
+            println!("{row}");
         }
     }
 }
