@@ -1777,6 +1777,9 @@ fn intersect_objects_segment(start: Vec3, end: Vec3, objects: &Objects) -> Objec
 /// Must match `SLICE_WIDTH` and `STEP_SPAN` in `src/swarm.rs`.
 const SWARM_SLICE_WIDTH: f32 = 8.0;
 const SWARM_STEP_SPAN: f32 = 12.0;
+/// Slices the host builds; must match `SLICES` in `src/swarm.rs`.
+#[allow(dead_code)]
+const SWARM_SLICES: f32 = 40.0;
 
 /// Segment `start → end`, traversed between camera-relative times `t0 → t1`.
 #[derive(Clone, Copy)]
@@ -2444,10 +2447,10 @@ pub unsafe fn bh_geodesic(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false>(
+        render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), false, false, core::ptr::null(), 0,
-            (core::ptr::null(), core::ptr::null(), core::ptr::null(), 0),
+            core::ptr::null_mut(), false, false,
+            gid_x(), gid_y(), no_swarm,
         );
     }
 }
@@ -2465,10 +2468,10 @@ pub unsafe fn bh_geodesic_early_capture(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false>(
+        render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false, core::ptr::null(), 0,
-            (core::ptr::null(), core::ptr::null(), core::ptr::null(), 0),
+            core::ptr::null_mut(), true, false,
+            gid_x(), gid_y(), no_swarm,
         );
     }
 }
@@ -2487,10 +2490,10 @@ pub unsafe fn bh_geodesic_far_field(
     early_capture: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false>(
+        render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), early_capture != 0, true, core::ptr::null(), 0,
-            (core::ptr::null(), core::ptr::null(), core::ptr::null(), 0),
+            core::ptr::null_mut(), early_capture != 0, true,
+            gid_x(), gid_y(), no_swarm,
         );
     }
 }
@@ -2516,10 +2519,12 @@ pub unsafe fn bh_geodesic_swarm(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<false, true>(
+        render_geodesic::<false, true, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, swarm, swarm_count,
-            (bvh_nodes, bvh_items, bvh_roots, bvh_slices),
+            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, gid_x(), gid_y(),
+            |start, end, t0, t1| swarm_bvh_hit(
+                start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
+            ),
         );
     }
 }
@@ -2593,10 +2598,9 @@ pub unsafe fn bh_geodesic_diagnostics(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<true, false>(
+        render_geodesic::<true, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
-            experiments & 1 != 0, experiments & 2 != 0, core::ptr::null(), 0,
-            (core::ptr::null(), core::ptr::null(), core::ptr::null(), 0),
+            experiments & 1 != 0, experiments & 2 != 0, gid_x(), gid_y(), no_swarm,
         );
     }
 }
@@ -2612,8 +2616,16 @@ fn advance_render_ray<const DIAGNOSTICS: bool>(
     }
 }
 
+/// A swarm query that never hits, for kernels without a swarm.
 #[inline(always)]
-unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool>(
+fn no_swarm(_: Vec3, _: Vec3, _: f32, _: f32) -> Vec4 {
+    vec4_splat(0.0)
+}
+
+/// Renders pixel (`pix_x`, `pix_y`). With SWARM, `swarm_hit(start, end, t0, t1)`
+/// tests each accepted step against the swarm, as `swarm_segment_hit` does.
+#[inline(always)]
+unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool, F: Fn(Vec3, Vec3, f32, f32) -> Vec4>(
     out_image: *mut Vec4,
     cam: *const Camera,
     disk: *const Disk,
@@ -2626,12 +2638,10 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool>(
     diagnostics: *mut RayDiagnostics,
     early_capture: bool,
     far_field: bool,
-    swarm: *const SwarmBody,
-    swarm_count: u32,
-    bvh: (*const Vec4, *const u32, *const u32, u32),
+    pix_x: u32,
+    pix_y: u32,
+    swarm_hit: F,
 ) {
-    let pix_x = gid_x();
-    let pix_y = gid_y();
     if pix_x >= width || pix_y >= height {
         return;
     }
@@ -2757,9 +2767,7 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool>(
         if SWARM {
             // Trapezoidal dt/dλ; `metric` now holds the accepted endpoint's metric.
             let end_time = ray_time + 0.5 * h * (start_dt + (metric.inv * next.p).x);
-            let body = swarm_bvh_hit(
-                ray.pos, next.pos, ray_time, end_time, swarm, swarm_count, bvh.0, bvh.1, bvh.2, bvh.3,
-            );
+            let body = swarm_hit(ray.pos, next.pos, ray_time, end_time);
             ray_time = end_time;
             if body.w > 0.0 {
                 rgb += transmission * body.xyz();

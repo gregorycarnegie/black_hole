@@ -103,6 +103,20 @@ pub struct GeodesicPipeline {
     last_objects: Option<GpuObjectsUniform>,
     last_disk: Option<GpuDiskUniform>,
     swarm: SwarmDevice,
+    /// RT-core swarm queries, when built with `--features optix` and a driver supports them.
+    #[cfg(feature = "optix")]
+    optix: Option<super::optix::OptixRender>,
+    #[cfg(feature = "optix")]
+    optix_bodies: Vec<GpuSwarmBody>,
+}
+
+impl GeodesicPipeline {
+    fn optix_ready(&self) -> bool {
+        #[cfg(feature = "optix")]
+        return self.optix.is_some();
+        #[cfg(not(feature = "optix"))]
+        false
+    }
 }
 
 /// Swarm bodies and their per-slice BVHs on the device.
@@ -217,6 +231,18 @@ pub fn init_geodesic_pipeline(mut commands: Commands) {
         last_objects: None,
         last_disk: None,
         swarm: SwarmDevice::new(),
+        // Opt-in: the single-pass OptiX renderer is currently slower than the BVH.
+        #[cfg(feature = "optix")]
+        optix: std::env::args_os()
+            .any(|arg| arg == "--optix")
+            .then(|| {
+                super::optix::OptixRender::new()
+                    .inspect_err(|e| warn!("OptiX unavailable, using the software BVH: {e}"))
+                    .ok()
+            })
+            .flatten(),
+        #[cfg(feature = "optix")]
+        optix_bodies: Vec::new(),
     });
 }
 
@@ -331,7 +357,13 @@ pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets
     pipeline.swarm.count = 0;
     if let Some(swarm) = sources.swarm.filter(|swarm| swarm.count > 0) {
         let bodies = swarm_bodies(swarm.count, disk_config.spin, swarm.time);
-        pipeline.swarm.upload(&bodies, false);
+        // OptiX builds its own motion GAS, so skip the software BVH then.
+        let optix = pipeline.optix_ready();
+        pipeline.swarm.upload(&bodies, optix);
+        #[cfg(feature = "optix")]
+        if optix {
+            pipeline.optix_bodies = bodies;
+        }
     }
 
     // Output geodesic buffer — reallocate when handle or resolution changes.
@@ -478,6 +510,12 @@ pub fn dispatch_geodesic(
         .last_objects
         .as_ref()
         .is_some_and(|objects| objects.num_objects == 1);
+    #[cfg(feature = "optix")]
+    if !wormhole && pipeline.swarm.count > 0 && pipeline.optix_ready() {
+        let experiments = active_experiments(single_source, experiments.as_deref());
+        render_swarm_with_optix(&mut pipeline, experiments);
+        return;
+    }
     let GeodesicPipeline {
         ref camera_buf,
         ref disk_buf,
@@ -560,6 +598,30 @@ pub fn dispatch_geodesic(
         builder
             .launch(cfg)
             .expect("CUDA bh_geodesic kernel launch failed");
+    }
+}
+
+#[cfg(feature = "optix")]
+fn render_swarm_with_optix(pipeline: &mut GeodesicPipeline, experiments: u32) {
+    use cudarc::driver::DevicePtr;
+    let stream = &shared_cuda().stream;
+    let p = pipeline;
+    let (out_image, _out) = p.geodesic_buf.device_ptr(stream);
+    let (cam, _cam) = p.camera_buf.device_ptr(stream);
+    let (disk, _disk) = p.disk_buf.device_ptr(stream);
+    let (objects, _objects) = p.objects_buf.device_ptr(stream);
+    let (skybox, _skybox) = p.skybox_buf.device_ptr(stream);
+    let inputs = super::optix::RenderInputs {
+        out_image,
+        cam,
+        disk,
+        objects,
+        skybox,
+        size: (p.width, p.height, p.sky_width, p.sky_height),
+        experiments,
+    };
+    if let Some(optix) = p.optix.as_mut() {
+        optix.render(&inputs, &p.optix_bodies);
     }
 }
 
@@ -994,6 +1056,82 @@ mod swarm_gpu {
         );
         assert!(hits > 300 && misses > 500, "too few decisive cases");
         assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(5)]);
+    }
+
+    /// Renders through OptiX with RT-core swarm queries; returns the image, the
+    /// host GAS build time and the launch time.
+    #[cfg(feature = "optix")]
+    fn render_optix(
+        optix: &mut crate::compute::optix::OptixRender,
+        scene: &Scene,
+        bodies: &[GpuSwarmBody],
+    ) -> (Vec<f32>, f64, f64) {
+        use cudarc::driver::DevicePtr;
+        let cuda = shared_cuda();
+        let output = cuda.alloc_zeros::<f32>((WIDTH * HEIGHT * 4) as usize);
+        let stream = &cuda.stream;
+        let (build, launch) = {
+            let (out_image, _a) = output.device_ptr(stream);
+            let (cam, _b) = scene.camera.device_ptr(stream);
+            let (disk, _c) = scene.disk.device_ptr(stream);
+            let (objects, _d) = scene.objects.device_ptr(stream);
+            let (skybox, _e) = scene.sky.device_ptr(stream);
+            optix.render(
+                &crate::compute::optix::RenderInputs {
+                    out_image,
+                    cam,
+                    disk,
+                    objects,
+                    skybox,
+                    size: (WIDTH, HEIGHT, 2, 1),
+                    experiments: 0,
+                },
+                bodies,
+            )
+        };
+        (cuda.clone_dtoh(&output), build, launch)
+    }
+
+    /// RT cores must pick exactly the hits brute force picks, in the full renderer.
+    #[cfg(feature = "optix")]
+    #[test]
+    #[ignore = "requires an NVIDIA RTX driver and OPTIX_ROOT; run with --release -- --ignored --nocapture"]
+    fn optix_renders_the_brute_force_image() {
+        let scene = single_hole();
+        let mut optix = crate::compute::optix::OptixRender::new().unwrap();
+        // The app only takes the OptiX path with bodies to trace.
+        for count in crate::swarm::SWARM_COUNTS.into_iter().skip(1).chain([16384]) {
+            let bodies = swarm_bodies(count.max(1), SPIN, 1000.0);
+            let bodies = &bodies[..count as usize];
+            let bvh = device(bodies, false);
+            render(&scene, Some(&bvh));
+            let mut bvh_times: Vec<f64> = (0..5).map(|_| render(&scene, Some(&bvh)).1).collect();
+            bvh_times.sort_by(f64::total_cmp);
+            render_optix(&mut optix, &scene, bodies);
+            let mut runs: Vec<(f64, f64)> = (0..5)
+                .map(|_| {
+                    let (_, build, launch) = render_optix(&mut optix, &scene, bodies);
+                    (launch, build)
+                })
+                .collect();
+            runs.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let (image, _, _) = render_optix(&mut optix, &scene, bodies);
+            let differing = if count <= 1024 {
+                let (brute, _) = render(&scene, Some(&device(bodies, true)));
+                brute
+                    .iter()
+                    .zip(&image)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count()
+            } else {
+                0
+            };
+            println!(
+                "{count:>6} bodies: BVH {:7.1} ms, OptiX {:7.1} ms (+{:.1} ms host GAS build); {differing} channels differ from brute force",
+                bvh_times[2], runs[2].0, runs[2].1
+            );
+            assert_eq!(differing, 0);
+        }
     }
 
     /// The BVH must pick exactly the hits brute force picks.

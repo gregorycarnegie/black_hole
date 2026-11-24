@@ -132,15 +132,22 @@ pub unsafe fn __raygen__segments() {
 #[cuda_device::kernel]
 pub unsafe fn __anyhit__swarm() {
     let q = sbt_queries();
+    keep_earliest_hit(q.segments, q.bodies);
+}
+
+/// The any-hit work: payload 2 indexes the segment pair in `segments`.
+#[inline(always)]
+fn keep_earliest_hit(segments: *const Vec4, bodies: *const SwarmBody) {
+    let q_bodies = bodies;
     let segment = get_payload(2);
-    let a = unsafe { *q.segments.add(2 * segment as usize) };
-    let b = unsafe { *q.segments.add(2 * segment as usize + 1) };
+    let a = unsafe { *segments.add(2 * segment as usize) };
+    let b = unsafe { *segments.add(2 * segment as usize + 1) };
     let body = primitive_index();
     let mut s = 2.0_f32;
     let mut colour = vec4_splat(0.0);
     swarm_body_hit(
         swarm_query(a.xyz(), b.xyz(), a.w, b.w),
-        unsafe { *q.bodies.add(body as usize) },
+        unsafe { *q_bodies.add(body as usize) },
         &mut s,
         &mut colour,
     );
@@ -154,3 +161,110 @@ pub unsafe fn __anyhit__swarm() {
 
 #[cuda_device::kernel]
 pub unsafe fn __miss__none() {}
+
+/// The production renderer with RT-core swarm queries. Matches `RenderParams` in
+/// `src/compute/optix.rs`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RenderParams {
+    pub out_image: *mut Vec4,
+    pub cam: *const Camera,
+    pub disk: *const Disk,
+    pub objects: *const Objects,
+    pub skybox: *const Vec4,
+    pub bodies: *const SwarmBody,
+    /// Two Vec4s per pixel: the step the any-hit program tests.
+    pub scratch: *mut Vec4,
+    pub handle: u64,
+    pub width: u32,
+    pub height: u32,
+    pub sky_w: u32,
+    pub sky_h: u32,
+    pub body_count: u32,
+    pub experiments: u32,
+    pub backoff: f32,
+    /// Radial shell holding every body's padded orbit: steps outside it cannot hit.
+    pub belt_inner: f32,
+    pub belt_outer: f32,
+    pub _pad: u32,
+}
+
+#[inline(always)]
+fn sbt_render() -> &'static RenderParams {
+    let pointer: u64;
+    unsafe {
+        cuda_device::ptx_asm!("call (%0), _optix_get_sbt_data_ptr_64, ();", out("=l") pointer);
+        &**(pointer as *const *const RenderParams)
+    }
+}
+
+#[inline(always)]
+fn launch_index_y() -> u32 {
+    let index: u32;
+    unsafe { cuda_device::ptx_asm!("call (%0), _optix_get_launch_index_y, ();", out("=r") index) };
+    index
+}
+
+/// Same results as `swarm_bvh_hit`: steps the BVH would send to brute force go
+/// there too; the rest trace one ray at the step's mid time.
+#[inline(always)]
+fn optix_swarm_hit(q: &RenderParams, slot: u32, start: Vec3, end: Vec3, t0: f32, t1: f32) -> Vec4 {
+    let middle = -0.5 * (t0 + t1);
+    if !(middle >= 0.0
+        && (t0 - t1).abs() <= SWARM_STEP_SPAN
+        && middle < SWARM_SLICE_WIDTH * SWARM_SLICES)
+    {
+        return swarm_segment_hit(start, end, t0, t1, q.bodies, q.body_count);
+    }
+    // Every body's own radial test would reject this step, so skip the trace.
+    let shell = swarm_query(start, end, t0, t1);
+    if shell.far_r < q.belt_inner || shell.near_r > q.belt_outer {
+        return vec4_splat(0.0);
+    }
+    unsafe {
+        *q.scratch.add(2 * slot as usize) = vec4_v3_f(start, t0);
+        *q.scratch.add(2 * slot as usize + 1) = vec4_v3_f(end, t1);
+    }
+    let d = end - start;
+    let length = d.length().max(1.0e-12);
+    let direction = d / length;
+    let (_, body) = trace3(
+        q.handle,
+        start - q.backoff * direction,
+        direction,
+        length + q.backoff,
+        -middle,
+        [2.0_f32.to_bits(), u32::MAX, slot],
+    );
+    let mut result = vec4_splat(0.0);
+    if body != u32::MAX {
+        let mut best = 2.0_f32;
+        swarm_body_hit(
+            swarm_query(start, end, t0, t1),
+            unsafe { *q.bodies.add(body as usize) },
+            &mut best,
+            &mut result,
+        );
+    }
+    result
+}
+
+#[cuda_device::kernel]
+pub unsafe fn __raygen__render() {
+    let q = sbt_render();
+    let (x, y) = (launch_index_x(), launch_index_y());
+    let slot = y * q.width + x;
+    unsafe {
+        render_geodesic::<false, true, _>(
+            q.out_image, q.cam, q.disk, q.objects, q.skybox, q.width, q.height, q.sky_w, q.sky_h,
+            core::ptr::null_mut(), q.experiments & 1 != 0, q.experiments & 2 != 0, x, y,
+            |start, end, t0, t1| optix_swarm_hit(q, slot, start, end, t0, t1),
+        );
+    }
+}
+
+#[cuda_device::kernel]
+pub unsafe fn __anyhit__render() {
+    let q = sbt_render();
+    keep_earliest_hit(q.scratch, q.bodies);
+}

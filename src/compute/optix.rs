@@ -159,6 +159,7 @@ impl SegmentPipeline {
         sys::OptixModuleCompileOptions,
         sys::OptixPipelineCompileOptions,
     ) {
+        // An explicit 255-register limit made the render raygen about 3x slower.
         let module = sys::OptixModuleCompileOptions::default();
         let pipeline = sys::OptixPipelineCompileOptions {
             usesMotionBlur: 1,
@@ -172,6 +173,10 @@ impl SegmentPipeline {
     }
 
     pub(crate) fn new() -> Result<Self, String> {
+        Self::with_programs(c"__raygen__segments", c"__anyhit__swarm")
+    }
+
+    fn with_programs(raygen_name: &std::ffi::CStr, anyhit_name: &std::ffi::CStr) -> Result<Self, String> {
         let optix = Optix::new()?;
         let t = &optix.table;
         let (module_options, pipeline_options) = Self::compile_options();
@@ -230,7 +235,7 @@ impl SegmentPipeline {
         };
         raygen.__bindgen_anon_1.raygen = sys::OptixProgramGroupSingleModule {
             module,
-            entryFunctionName: c"__raygen__segments".as_ptr(),
+            entryFunctionName: raygen_name.as_ptr(),
         };
         let mut miss = sys::OptixProgramGroupDesc {
             kind: sys::OptixProgramGroupKind_OPTIX_PROGRAM_GROUP_KIND_MISS,
@@ -246,7 +251,7 @@ impl SegmentPipeline {
         };
         hit.__bindgen_anon_1.hitgroup = sys::OptixProgramGroupHitgroup {
             moduleAH: module,
-            entryFunctionNameAH: c"__anyhit__swarm".as_ptr(),
+            entryFunctionNameAH: anyhit_name.as_ptr(),
             moduleIS: sphere_module,
             ..Default::default()
         };
@@ -468,6 +473,141 @@ impl SegmentPipeline {
         let mut results = vec![[0.0_f32; 4]; count];
         unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut results, d_results.0).unwrap() };
         (results, elapsed)
+    }
+}
+
+/// Matches `RenderParams` in `tools/optix/programs.rs`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RenderParams {
+    out_image: u64,
+    cam: u64,
+    disk: u64,
+    objects: u64,
+    skybox: u64,
+    bodies: u64,
+    scratch: u64,
+    handle: u64,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+    body_count: u32,
+    experiments: u32,
+    backoff: f32,
+    belt_inner: f32,
+    belt_outer: f32,
+    _pad: u32,
+}
+
+/// Device pointers the render launch reads.
+pub(crate) struct RenderInputs {
+    pub out_image: u64,
+    pub cam: u64,
+    pub disk: u64,
+    pub objects: u64,
+    pub skybox: u64,
+    pub size: (u32, u32, u32, u32),
+    pub experiments: u32,
+}
+
+/// The production renderer launched through OptiX, with RT-core swarm queries.
+pub(crate) struct OptixRender {
+    pipeline: SegmentPipeline,
+    scratch: DeviceBuffer,
+    scratch_pixels: usize,
+}
+
+// SAFETY: OptiX host calls are thread-safe, and Bevy gives one system at a time
+// mutable access to the resource that owns this.
+unsafe impl Send for OptixRender {}
+unsafe impl Sync for OptixRender {}
+
+impl OptixRender {
+    pub(crate) fn new() -> Result<Self, String> {
+        Ok(Self {
+            pipeline: SegmentPipeline::with_programs(c"__raygen__render", c"__anyhit__render")?,
+            scratch: DeviceBuffer::new(16),
+            scratch_pixels: 0,
+        })
+    }
+
+    /// Renders one frame; returns the host time to build the GAS and the launch time, in ms.
+    pub(crate) fn render(
+        &mut self,
+        inputs: &RenderInputs,
+        bodies: &[crate::swarm::GpuSwarmBody],
+    ) -> (f64, f64) {
+        let start = std::time::Instant::now();
+        let (_gas, handle, _keys, backoff) = self.pipeline.build(bodies);
+        let build = start.elapsed().as_secs_f64() * 1000.0;
+        let (width, height, sky_w, sky_h) = inputs.size;
+        // Matches the radial rejection in `swarm_body_hit` for steps up to STEP_SPAN.
+        let (mut belt_inner, mut belt_outer) = (f32::INFINITY, 0.0_f32);
+        for body in bodies {
+            let turn = body.orbit[1] * STEP_SPAN;
+            let reach = body.axis_b[3] + 0.125 * body.axis_a[3] * turn * turn + 0.01;
+            belt_inner = belt_inner.min(body.axis_a[3] - reach);
+            belt_outer = belt_outer.max(body.axis_a[3] + reach);
+        }
+        let pixels = (width * height) as usize;
+        if self.scratch_pixels < pixels {
+            self.scratch = DeviceBuffer::new(pixels * 32);
+            self.scratch_pixels = pixels;
+        }
+        let d_bodies = DeviceBuffer::from(bodies);
+        let params = DeviceBuffer::from(&[RenderParams {
+            out_image: inputs.out_image,
+            cam: inputs.cam,
+            disk: inputs.disk,
+            objects: inputs.objects,
+            skybox: inputs.skybox,
+            bodies: d_bodies.0,
+            scratch: self.scratch.0,
+            handle,
+            width,
+            height,
+            sky_w,
+            sky_h,
+            body_count: bodies.len() as u32,
+            experiments: inputs.experiments,
+            backoff,
+            belt_inner,
+            belt_outer,
+            _pad: 0,
+        }]);
+        let t = &self.pipeline.optix.table;
+        let mut records = vec![0u8; 3 * SBT_RECORD];
+        for (i, group) in self.pipeline.groups.iter().enumerate() {
+            let record = &mut records[i * SBT_RECORD..(i + 1) * SBT_RECORD];
+            check(
+                unsafe { t.optixSbtRecordPackHeader.unwrap()(*group, record.as_mut_ptr().cast()) },
+                "optixSbtRecordPackHeader",
+            )
+            .unwrap();
+            record[SBT_HEADER..SBT_HEADER + 8].copy_from_slice(&params.0.to_le_bytes());
+        }
+        let d_records = DeviceBuffer::from(&records);
+        let sbt = sys::OptixShaderBindingTable {
+            raygenRecord: d_records.0,
+            missRecordBase: d_records.0 + SBT_RECORD as u64,
+            missRecordStrideInBytes: SBT_RECORD as u32,
+            missRecordCount: 1,
+            hitgroupRecordBase: d_records.0 + 2 * SBT_RECORD as u64,
+            hitgroupRecordStrideInBytes: SBT_RECORD as u32,
+            hitgroupRecordCount: 1,
+            ..Default::default()
+        };
+        let stream = shared_cuda().stream.cu_stream() as sys::CUstream;
+        let start = std::time::Instant::now();
+        check(
+            unsafe { t.optixLaunch.unwrap()(self.pipeline.pipeline, stream, 0, 0, &sbt, width, height, 1) },
+            "optixLaunch",
+        )
+        .unwrap();
+        // The GAS, records and parameters are freed on return, so finish first.
+        shared_cuda().stream.synchronize().unwrap();
+        (build, start.elapsed().as_secs_f64() * 1000.0)
     }
 }
 
