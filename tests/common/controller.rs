@@ -1,6 +1,6 @@
 //! Production adaptive stepping against the trajectory targets (obligation N3).
 //!
-//! `tests/controller.wesl` traces Schwarzschild rays with `advance_ray` and the
+//! The `bh_test_controller_trace` CUDA kernel traces Schwarzschild rays with `advance_ray` and the
 //! renderer's step-size rule up to a fixed affine parameter. Two independent
 //! measures of the error at the end point are compared with TARGETS.md:
 //!

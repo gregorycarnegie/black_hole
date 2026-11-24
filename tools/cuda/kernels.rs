@@ -834,7 +834,7 @@ const IDENTITY4: Mat4 = mat4(
     vec4(0.0, 0.0, 0.0, 1.0),
 );
 
-// -- Polarized transfer (polarized_transfer.wesl) ----------------------------
+// -- Polarized transfer -------------------------------------------------------
 
 #[derive(Clone, Copy, Default)]
 pub struct TransferCoefficients {
@@ -908,7 +908,7 @@ fn transfer_cell(initial: Vec4, c: TransferCoefficients, ds: f32) -> TransferRes
     result
 }
 
-// -- Thermal coefficients (thermal.wesl) -------------------------------------
+// -- Thermal coefficients -----------------------------------------------------
 
 #[derive(Clone, Copy, Default)]
 pub struct ThermalResult {
@@ -1027,7 +1027,7 @@ unsafe fn thermal_coefficients(
     result
 }
 
-// -- Snapshot sampling (snapshot.wesl) ---------------------------------------
+// -- Snapshot sampling --------------------------------------------------------
 
 #[derive(Clone, Copy, Default)]
 pub struct SnapshotSample {
@@ -1189,7 +1189,7 @@ unsafe fn sample_snapshot(
     result
 }
 
-// -- Geodesic ray-tracer & Kerr-Schild metric (geodesic.wesl) ----------------
+// -- Geodesic ray-tracer & Kerr-Schild metric ---------------------------------
 
 #[inline(always)]
 fn outer(a: Vec4, b: Vec4) -> Mat4 {

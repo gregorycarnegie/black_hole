@@ -47,7 +47,7 @@ pub(crate) fn enable_ray_experiments(app: &mut App, early_capture: bool, far_fie
 
 // ── Resources extracted from main world → render world ──────────────────────
 
-/// Raw frame written by geodesic.wesl each tick.
+/// Raw frame written by the CUDA geodesic kernel each tick.
 #[derive(Resource, Clone, ExtractResource)]
 #[extract_app(RenderApp)]
 pub struct GeodesicImage(pub Handle<Image>);
@@ -107,7 +107,7 @@ pub struct RenderFrameCount(pub u32);
 #[extract_app(RenderApp)]
 pub struct FrameParity(pub bool);
 
-/// Camera data packed for the uniform buffer (matches Camera struct in geodesic.wesl, 112 bytes).
+/// Camera data for the GPU (matches `Camera` in `tools/cuda/kernels.rs`, 112 bytes).
 #[derive(Resource, Clone, Default, ExtractResource)]
 #[extract_app(RenderApp)]
 pub struct CameraUniform {

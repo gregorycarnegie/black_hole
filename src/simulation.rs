@@ -842,7 +842,7 @@ mod tests {
 
     // ── Disk models ──────────────────────────────────────────────────────────
 
-    /// `as_u32` is the `model` switch value in geodesic.wesl.
+    /// `as_u32` is the `model` switch value in `tools/cuda/kernels.rs`.
     #[rstest]
     #[case(DiskModel::ThinNt, 0)]
     #[case(DiskModel::TruncatedHotFlow, 1)]
