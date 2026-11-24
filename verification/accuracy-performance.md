@@ -58,11 +58,22 @@ does not mean that its trajectories meet the accuracy targets.
 - **Some production trajectories miss their targets.** The independently
   converged Schwarzschild test at impact 5.3 has position error 1.646e-3
   versus target 1.023e-4, and momentum error 1.500e-5 versus 1e-6. Impact 5.25
-  also fails. A useful experiment is higher-order extrapolation from the
-  coarse/fine RK4 results already computed by the controller: no additional
-  force evaluations, but accuracy, stage/event guards and runtime still need
-  measuring before adoption. Compensated accumulation or selective precision
-  for sensitive rays are subsequent experiments, not established fixes.
+  also fails. Richardson extrapolation of the controller's coarse/fine pair
+  (`fine + (fine − coarse)/15`) was tried on 2026-11-24 and rejected. It made
+  impact 5.3 worse (position 2.127e-3, momentum 1.926e-5, 130 steps) and
+  impact 5.25 worse (4.106e-3 versus 1.584e-3), raised impact 10 from 1.867e-5
+  to 5.682e-5, and left impact 30 unchanged. Loosening `STEP_TOLERANCE` tenfold
+  to 5e-7 left the step counts (128/137) and the baseline errors unchanged. At
+  5e-9 the rays no longer reached their affine span. So on these rays the
+  geometric step limit (0.12 × clearance) sets the step, not the error
+  controller. The step-doubling estimate differences two binary32 end states,
+  so it cannot resolve truncation error below their rounding. The opt-in
+  Dormand–Prince 5(4) controller (`--experiment-dp45`) forms its estimate from
+  the stages. With the same tolerance it reduced impact 5.3 to 5.70e-4 position
+  and 5.12e-6 momentum error, and impact 5.25 to 5.62e-4. That is about three
+  times smaller, but still above target. So part of the miss was truncation.
+  Compensated accumulation or selective precision for sensitive rays remain
+  experiments, not established fixes. [Measurements](../RENDERING_PERFORMANCE.md)
 - **The full image still fails.** Current intensity L2 discrepancy is 0.719%;
   worst intensity error is 2.75% of reference peak and worst relative intensity
   error above the floor is 24.3%. These are comparisons to an uncertain

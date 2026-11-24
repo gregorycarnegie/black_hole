@@ -148,13 +148,14 @@ pub(super) fn write_ray_profile(
         "early_capture",
     ];
     create_dir_all("target")?;
-    let path = match experiments {
-        1 => "target/renderer-rays-early-capture.csv",
-        2 => "target/renderer-rays-far-field.csv",
-        3 => "target/renderer-rays-early-capture-far-field.csv",
-        _ => "target/renderer-rays.csv",
-    };
-    let mut file = BufWriter::new(File::create(path)?);
+    let mut path = String::from("target/renderer-rays");
+    for (bit, name) in [(1, "-early-capture"), (2, "-far-field"), (4, "-dp45")] {
+        if experiments & bit != 0 {
+            path.push_str(name);
+        }
+    }
+    path.push_str(".csv");
+    let mut file = BufWriter::new(File::create(&path)?);
     writeln!(
         file,
         "x,y,iterations,steps,rejected_attempts,near_horizon_steps,far_field_steps,disk_limited_steps,controller_limited_steps,exit,wide_steps,sky_x,sky_y,sky_z,plasma_steps,vacuum_disk_steps,stokes_i,stokes_q,stokes_u,stokes_v"

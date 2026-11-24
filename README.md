@@ -104,6 +104,7 @@ Pass options after `--`, for example `cargo run --release -- --experiment-far-fi
 |---|---|
 | `--experiment-early-capture` | Single hole only: ends rays early once a proved Kerr test shows they will fall into the horizon. Faster, with the same exit classification. |
 | `--experiment-far-field` | Single hole only: takes larger steps far from the hole and disk. |
+| `--experiment-dp45` | All scenes: uses a Dormand–Prince 5(4) step controller instead of step-doubling RK4. Fewer metric evaluations per step. |
 | `--profile-renderer` | Runs a fixed benchmark and writes per-ray diagnostics to `target/renderer-rays*.csv`, then exits. |
 | `--optix` | In an RTX build (below), starts with the RTX button on. |
 

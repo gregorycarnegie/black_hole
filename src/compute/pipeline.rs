@@ -595,7 +595,7 @@ pub fn dispatch_geodesic(
     let kernel = match enabled {
         0 => &cuda.geodesic,
         1 => &cuda.geodesic_early_capture,
-        _ => &cuda.geodesic_far_field,
+        _ => &cuda.geodesic_experiments,
     };
     let mut builder = cuda.stream.launch_builder(kernel);
     builder.arg(geodesic_buf);
@@ -607,9 +607,8 @@ pub fn dispatch_geodesic(
     builder.arg(&height);
     builder.arg(&sky_width);
     builder.arg(&sky_height);
-    let early_capture = enabled & 1;
-    if enabled & 2 != 0 {
-        builder.arg(&early_capture);
+    if enabled > 1 {
+        builder.arg(&enabled);
     }
     unsafe {
         builder
@@ -644,11 +643,16 @@ fn render_swarm_with_optix(pipeline: &mut GeodesicPipeline, experiments: u32, cf
 }
 
 fn active_experiments(single_source: bool, experiments: Option<&RayExperiments>) -> u32 {
-    if let Some(experiments) = experiments.filter(|_| single_source) {
+    let Some(experiments) = experiments else {
+        return 0;
+    };
+    // Early capture and far field assume a single source; the controller does not.
+    let single = if single_source {
         u32::from(experiments.early_capture) | (u32::from(experiments.far_field) << 1)
     } else {
         0
-    }
+    };
+    single | (u32::from(experiments.dormand_prince) << 2)
 }
 
 fn ray_launch_config(width: u32, height: u32, single_source_kerr: bool) -> LaunchConfig {

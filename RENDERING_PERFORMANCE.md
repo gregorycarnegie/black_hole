@@ -115,6 +115,25 @@ The windowed A/B swapped the checked-in PTX between runs in new, old, old, new o
 
 With both experiments enabled, the change saves about 3 ms per frame. The default renderer shows no difference beyond run-to-run noise, because its close-up frame is dominated by near-horizon steps rather than plasma samples. Codex's earlier experiment timings of 36–40 ms came from a separate session, so they overstate the gain when compared with these results.
 
+## Experimental Dormand–Prince controller
+
+Enable with `--experiment-dp45`. Unlike the two experiments above, it applies to every scene, including binaries and the swarm. It replaces the step-doubling RK4 controller with an embedded Dormand–Prince 5(4) step that advances the fifth-order solution. The stages form the error estimate directly, so binary32 rounding of the two end states does not hide it. A step accepted on the first try costs 6 `scene_metric` evaluations inside the controller instead of 11. It does not reuse the last stage as the next step's first stage, because the renderer rewrites the screen vector between steps and the endpoint metric is already reused. Validity, null-constraint, stagnation and retry rules are unchanged, as is `STEP_TOLERANCE`. [Controller](tools/cuda/kernels.rs#L1637)
+
+Measured on 2026-11-24 with `--profile-renderer`, release build, RTX 4090, alternating runs:
+
+| Flags | Still median / p95 (ms) | Orbit median / p95 (ms) |
+|---|---:|---:|
+| none | 174.8 / 206.2, 177.2 / 205.6 | 179.9 / 209.0, 173.3 / 196.2 |
+| `--experiment-dp45` | 118.2 / 134.4, 118.4 / 129.9 | 117.2 / 134.4, 117.8 / 135.0 |
+| `--experiment-early-capture` | 33.1 / 39.5 | 30.3 / 31.9 |
+| early capture + DP45 | 23.9 / 30.7 | 22.1 / 23.9 |
+
+Accepted steps fell by only 0.2% (42.90M to 42.80M), and rejected attempts by 6%. The gain comes from cheaper steps, not longer ones. The geometric step limit, not the error tolerance, sets most steps. Across the 120,000 diagnostic rays, two changed their exit class: one went from affine stagnation to horizon, and one from the iteration limit to affine stagnation. No ray moved between escape and any other class. For rays that escaped both times, the sky-direction difference had a median of 1.7e-7 rad, a 99th percentile of 3.8e-6 rad, and a maximum of 0.075 rad. Stokes I differs by 0.38% in relative L2. Seven pixels differ by more than 0.1% of peak intensity, and two by more than 10%. Those two are grazing rays at (183, 112) and (196, 103). Without an independent reference, that comparison cannot say which controller is right.
+
+In the binary64 Schwarzschild trajectory test, DP45 cut the near-critical errors about threefold. At impact 5.3 the position error went from 1.646e-3 to 5.70e-4 and the momentum error from 1.500e-5 to 5.12e-6. At 5.25 the position error went from 1.584e-3 to 5.62e-4. Both still miss the target. Impact 10 rose from 1.87e-5 to 4.16e-5 and stays within its 9.88e-5 target. Impact 30 was unchanged. [Trajectory test](tests/common/controller.rs#L85)
+
+Not yet measured: the binary and swarm scenes, register and local-memory counts, and the two outlier pixels against the reference.
+
 ## Experiment order
 
 1. **Measure the interactive frame.** Fix the camera, spin, disk preset, pixel dimensions, and render mode for each comparison. Start with single-hole thermal intensity, then compare polarized or synchrotron-heavy rendering and the binary scene. Include a view with a prominent photon ring and measure the Ellis kernel separately if the wormhole view is slow. Record median and 95th-percentile frame times after warm-up. Time the geodesic and accumulation kernels with CUDA events. Measure the host wait/readback, Bevy texture upload, and total frame time separately. Use the `H` heatmap to locate long rays and count rejected attempts separately from outer iterations. If a few long-running rays dominate, check warp divergence, register pressure, and spills before changing block size or splitting up the ray work. [Existing CUDA-event example](tests/common/gpu.rs#L229) · [Kernel dispatch](src/compute/pipeline.rs#L356) · [Display path](src/compute/accumulate.rs#L156)

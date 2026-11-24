@@ -66,7 +66,7 @@ pub fn controller_trace(objects: &[u8], input: &[u8], count: u32) -> Vec<f32> {
     cuda.bind_to_thread();
     let d_obj = cuda.clone_htod(objects);
     let d_in = cuda.clone_htod(input);
-    let mut d_out = cuda.alloc_zeros::<f32>((count as usize) * 16);
+    let mut d_out = cuda.alloc_zeros::<f32>((count as usize) * 20);
 
     let cfg = LaunchConfig {
         grid_dim: (count, 1, 1),

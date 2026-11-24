@@ -1597,6 +1597,182 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
 }
 
 #[inline(always)]
+fn add_derivs(a: Derivs, w: f32, k: Derivs) -> Derivs {
+    Derivs {
+        pos: a.pos + w * k.pos,
+        p: a.p + w * k.p,
+        screen: a.screen + w * k.screen,
+    }
+}
+
+#[inline(always)]
+fn scale_derivs(w: f32, k: Derivs) -> Derivs {
+    Derivs {
+        pos: w * k.pos,
+        p: w * k.p,
+        screen: w * k.screen,
+    }
+}
+
+#[inline(always)]
+fn dp_stage(ray: Ray, d: Derivs, h: f32, gauged: bool, objects: &Objects) -> Option<Derivs> {
+    let r = rk_state(ray, d, h);
+    let m = scene_metric(r.pos, objects);
+    if !ray_valid(r, m) {
+        return None;
+    }
+    Some(ray_rhs(r, m, gauged))
+}
+
+#[inline(always)]
+fn relative_size(e: Vec4, y: Vec4) -> f32 {
+    let d = e.abs() / vec4_splat(1.0).max(y.abs());
+    d.x.max(d.y).max(d.z.max(d.w))
+}
+
+/// Experiment (checklist P1.1): embedded Dormand–Prince 5(4), advancing the fifth-order
+/// solution. Six metric evaluations per first-try step against eleven for step doubling.
+/// No FSAL: callers rewrite `screen` between steps, and the endpoint metric is reused anyway.
+#[inline(always)]
+fn advance_ray_dp45<const DIAGNOSTICS: bool>(
+    ray: Ray,
+    requested_h: f32,
+    m: &mut Metric,
+    gauged: bool,
+    objects: &Objects,
+    rejected: &mut u32,
+) -> AdaptiveStep {
+    if !(requested_h > 0.0 && requested_h < 1.0e8 && ray_valid(ray, *m)) {
+        return AdaptiveStep {
+            ray,
+            h: 0.0,
+            error: 1.0e30,
+            accepted: false,
+        };
+    }
+    let k1 = ray_rhs(ray, *m, gauged);
+    let mut next_h = requested_h;
+    for retry in 0..12 {
+        let h = next_h;
+        next_h = 0.5 * h;
+        let Some(k2) = dp_stage(ray, scale_derivs(0.2, k1), h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(scale_derivs(3.0 / 40.0, k1), 9.0 / 40.0, k2);
+        let Some(k3) = dp_stage(ray, d, h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(
+            add_derivs(scale_derivs(44.0 / 45.0, k1), -56.0 / 15.0, k2),
+            32.0 / 9.0,
+            k3,
+        );
+        let Some(k4) = dp_stage(ray, d, h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(
+            add_derivs(
+                add_derivs(scale_derivs(19372.0 / 6561.0, k1), -25360.0 / 2187.0, k2),
+                64448.0 / 6561.0,
+                k3,
+            ),
+            -212.0 / 729.0,
+            k4,
+        );
+        let Some(k5) = dp_stage(ray, d, h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(
+            add_derivs(
+                add_derivs(
+                    add_derivs(scale_derivs(9017.0 / 3168.0, k1), -355.0 / 33.0, k2),
+                    46732.0 / 5247.0,
+                    k3,
+                ),
+                49.0 / 176.0,
+                k4,
+            ),
+            -5103.0 / 18656.0,
+            k5,
+        );
+        let Some(k6) = dp_stage(ray, d, h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(
+            add_derivs(
+                add_derivs(
+                    add_derivs(scale_derivs(35.0 / 384.0, k1), 500.0 / 1113.0, k3),
+                    125.0 / 192.0,
+                    k4,
+                ),
+                -2187.0 / 6784.0,
+                k5,
+            ),
+            11.0 / 84.0,
+            k6,
+        );
+        let next = rk_state(ray, d, h);
+        if !ray_endpoint_valid(next, objects) {
+            continue;
+        }
+        let metric = scene_metric(next.pos, objects);
+        if !ray_valid(next, metric) {
+            continue;
+        }
+        let k7 = ray_rhs(next, metric, gauged);
+        // Difference between the fifth- and fourth-order solutions, formed directly
+        // from the stages so it is not lost to binary32 rounding of the two states.
+        let e = scale_derivs(
+            h,
+            add_derivs(
+                add_derivs(
+                    add_derivs(
+                        add_derivs(
+                            add_derivs(scale_derivs(71.0 / 57600.0, k1), -71.0 / 16695.0, k3),
+                            71.0 / 1920.0,
+                            k4,
+                        ),
+                        -17253.0 / 339200.0,
+                        k5,
+                    ),
+                    22.0 / 525.0,
+                    k6,
+                ),
+                -1.0 / 40.0,
+                k7,
+            ),
+        );
+        let error = relative_size(vec4_v3_f(e.pos, 0.0), vec4_v3_f(next.pos, 0.0))
+            .max(relative_size(e.p, next.p).max(relative_size(e.screen, next.screen)));
+        let null_error = next.p.dot(metric.inv * next.p).abs() / next.p.dot(next.p).max(1.0e-10);
+        if error <= STEP_TOLERANCE
+            && null_error < 2.0e-4
+            && (next.pos.x != ray.pos.x || next.pos.y != ray.pos.y || next.pos.z != ray.pos.z)
+        {
+            if DIAGNOSTICS {
+                *rejected += retry;
+            }
+            *m = metric;
+            return AdaptiveStep {
+                ray: next,
+                h,
+                error,
+                accepted: true,
+            };
+        }
+    }
+    if DIAGNOSTICS {
+        *rejected += 12;
+    }
+    AdaptiveStep {
+        ray,
+        h: 0.0,
+        error: 1.0e30,
+        accepted: false,
+    }
+}
+
+#[inline(always)]
 fn advance_ray(ray: Ray, requested_h: f32, mut m: Metric, objects: &Objects) -> AdaptiveStep {
     advance_ray_gauge(ray, requested_h, &mut m, false, objects)
 }
@@ -2462,7 +2638,7 @@ pub unsafe fn bh_geodesic(
     unsafe {
         render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), false, false,
+            core::ptr::null_mut(), false, false, false,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -2483,14 +2659,16 @@ pub unsafe fn bh_geodesic_early_capture(
     unsafe {
         render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false,
+            core::ptr::null_mut(), true, false, false,
             gid_x(), gid_y(), no_swarm,
         );
     }
 }
 
+/// Any combination of the ray experiments: bit 0 early capture, bit 1 far field,
+/// bit 2 the Dormand–Prince controller.
 #[cuda_device::kernel]
-pub unsafe fn bh_geodesic_far_field(
+pub unsafe fn bh_geodesic_experiments(
     out_image: *mut Vec4,
     cam: *const Camera,
     disk: *const Disk,
@@ -2500,12 +2678,12 @@ pub unsafe fn bh_geodesic_far_field(
     height: u32,
     sky_w: u32,
     sky_h: u32,
-    early_capture: u32,
+    experiments: u32,
 ) {
     unsafe {
         render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), early_capture != 0, true,
+            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 != 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -2537,7 +2715,8 @@ pub unsafe fn bh_geodesic_swarm(
     unsafe {
         render_geodesic::<false, true, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, gid_x(), gid_y(),
+            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 != 0,
+            gid_x(), gid_y(),
             |start, end, t0, t1, _| swarm_bvh_hit(
                 start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
                 (belt_inner, belt_outer, belt_spread),
@@ -2598,7 +2777,8 @@ pub unsafe fn bh_geodesic_swarm_record(
     unsafe {
         render_geodesic::<false, true, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, x, y,
+            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 != 0,
+            x, y,
             |start, end, t0, t1, state| {
                 if beyond_belt(swarm_query(start, end, t0, t1), belt_inner, belt_outer, belt_spread) {
                     return vec4_splat(0.0);
@@ -2740,7 +2920,8 @@ pub unsafe fn bh_geodesic_diagnostics(
     unsafe {
         render_geodesic::<true, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
-            experiments & 1 != 0, experiments & 2 != 0, gid_x(), gid_y(), no_swarm,
+            experiments & 1 != 0, experiments & 2 != 0, experiments & 4 != 0,
+            gid_x(), gid_y(), no_swarm,
         );
     }
 }
@@ -2748,8 +2929,11 @@ pub unsafe fn bh_geodesic_diagnostics(
 #[inline(always)]
 fn advance_render_ray<const DIAGNOSTICS: bool>(
     ray: Ray, h: f32, metric: &mut Metric, objects: &Objects, stats: &mut RayDiagnostics,
+    dormand_prince: bool,
 ) -> AdaptiveStep {
-    if DIAGNOSTICS {
+    if dormand_prince {
+        advance_ray_dp45::<DIAGNOSTICS>(ray, h, metric, false, objects, &mut stats.rejected_attempts)
+    } else if DIAGNOSTICS {
         advance_ray_counting::<true>(ray, h, metric, false, objects, &mut stats.rejected_attempts)
     } else {
         advance_ray_gauge(ray, h, metric, false, objects)
@@ -2804,6 +2988,7 @@ unsafe fn render_geodesic<
     diagnostics: *mut RayDiagnostics,
     early_capture: bool,
     far_field: bool,
+    dormand_prince: bool,
     pix_x: u32,
     pix_y: u32,
     swarm_hit: F,
@@ -2889,7 +3074,7 @@ unsafe fn render_geodesic<
         } else {
             ordinary_h
         };
-        let mut step = advance_render_ray::<DIAGNOSTICS>(ray, proposed_h, &mut metric, objects, &mut stats);
+        let mut step = advance_render_ray::<DIAGNOSTICS>(ray, proposed_h, &mut metric, objects, &mut stats, dormand_prince);
         if far_field && proposed_h > ordinary_h
             && (!step.accepted || ray.pos.dot(step.ray.pos - ray.pos) < 0.0)
         {
@@ -2897,7 +3082,7 @@ unsafe fn render_geodesic<
             if step.accepted {
                 metric = scene_metric(ray.pos, objects);
             }
-            step = advance_render_ray::<DIAGNOSTICS>(ray, ordinary_h, &mut metric, objects, &mut stats);
+            step = advance_render_ray::<DIAGNOSTICS>(ray, ordinary_h, &mut metric, objects, &mut stats, dormand_prince);
         }
         // Stop when the affine parameter can no longer advance in binary32.
         if !step.accepted || affine + step.h == affine {
@@ -3803,6 +3988,7 @@ pub unsafe fn bh_test_controller_trace(
     let mut affine = 0.0_f32;
     let mut next_h = 1.0e8_f32;
     let mut steps = 0u32;
+    let mut rejected = 0u32;
     let mut status = 1.0_f32;
     let mut i = 0u32;
     while i < 200000 && affine < c.y {
@@ -3815,7 +4001,13 @@ pub unsafe fn bh_test_controller_trace(
         let wanted = (distance / velocity.length().max(1.0e-6))
             .min(next_h)
             .min(c.y - affine);
-        let step = advance_ray(ray, wanted, metric, objects);
+        // cases.z != 0 selects the Dormand–Prince experiment; zero keeps the production controller.
+        let mut m = metric;
+        let step = if c.z != 0.0 {
+            advance_ray_dp45::<true>(ray, wanted, &mut m, false, objects, &mut rejected)
+        } else {
+            advance_ray_counting::<true>(ray, wanted, &mut m, false, objects, &mut rejected)
+        };
         if !step.accepted {
             status = 3.0;
             break;
@@ -3833,12 +4025,13 @@ pub unsafe fn bh_test_controller_trace(
         steps += 1;
         i += 1;
     }
-    let base = (4 * id) as usize;
+    let base = (5 * id) as usize;
     unsafe {
         *results.add(base) = vec4_v3_f(start.pos, status);
         *results.add(base + 1) = start.p;
         *results.add(base + 2) = vec4_v3_f(ray.pos, affine);
         *results.add(base + 3) = vec4_v3_f(ray.p.yzw(), steps as f32);
+        *results.add(base + 4) = vec4(rejected as f32, 0.0, 0.0, 0.0);
     }
 }
 

@@ -36,12 +36,19 @@ pub struct GeodesicComputePlugin;
 pub(super) struct RayExperiments {
     early_capture: bool,
     far_field: bool,
+    dormand_prince: bool,
 }
 
-pub(crate) fn enable_ray_experiments(app: &mut App, early_capture: bool, far_field: bool) {
+pub(crate) fn enable_ray_experiments(
+    app: &mut App,
+    early_capture: bool,
+    far_field: bool,
+    dormand_prince: bool,
+) {
     app.sub_app_mut(RenderApp).insert_resource(RayExperiments {
         early_capture,
         far_field,
+        dormand_prince,
     });
 }
 

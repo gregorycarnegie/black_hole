@@ -1,6 +1,7 @@
 //! Production adaptive stepping against the trajectory targets (obligation N3).
 //!
-//! The `bh_test_controller_trace` CUDA kernel traces Schwarzschild rays with `advance_ray` and the
+//! The `bh_test_controller_trace` CUDA kernel traces Schwarzschild rays with the production controller (and, with `cases.z`
+//! set, the Dormand–Prince experiment of checklist P1.1) and the
 //! renderer's step-size rule up to a fixed affine parameter. Two independent
 //! measures of the error at the end point are compared with TARGETS.md:
 //!
@@ -85,19 +86,24 @@ fn adaptive_controller_misses_trajectory_targets() {
     // (impact parameter, affine span): a wide deflection, two near-critical
     // passes around the photon sphere, and a direct long ray.
     let cases: [(f32, f32); 4] = [(10.0, 220.0), (5.3, 220.0), (5.25, 260.0), (30.0, 400.0)];
+    // Each case runs with the production controller, then with the Dormand–Prince
+    // experiment; only the first set is held to the counterexample.
     let mut input = Vec::new();
-    for (impact, span) in cases {
-        for value in [impact, span, 0.0, 0.0] {
-            input.extend_from_slice(&value.to_le_bytes());
+    for dormand_prince in [0.0, 1.0] {
+        for (impact, span) in cases {
+            for value in [impact, span, dormand_prince, 0.0] {
+                input.extend_from_slice(&value.to_le_bytes());
+            }
         }
     }
     let mut objects = vec![0u8; 1040];
     objects[..4].copy_from_slice(&1i32.to_le_bytes());
     objects[528..532].copy_from_slice(&1f32.to_le_bytes());
-    let values = crate::gpu::controller_trace(&objects, &input, cases.len() as u32);
-    let mut failures = 0;
-    for (n, (impact, _)) in cases.iter().enumerate() {
-        let v: Vec<f64> = values[16 * n..16 * n + 16].iter().map(|&x| f64::from(x)).collect();
+    let values = crate::gpu::controller_trace(&objects, &input, 2 * cases.len() as u32);
+    let mut failures = [0; 2];
+    for (n, (impact, _)) in cases.iter().cycle().take(2 * cases.len()).enumerate() {
+        let (label, evaluations) = if n < cases.len() { ("rk4", 11.0) } else { ("dp45", 6.0) };
+        let v: Vec<f64> = values[20 * n..20 * n + 20].iter().map(|&x| f64::from(x)).collect();
         assert_eq!(v[3], 1.0, "ray {impact} did not reach its affine span: status {}", v[3]);
         let span = v[11];
         let start = [v[0], v[1], v[2], v[4], v[5], v[6], v[7]];
@@ -121,19 +127,22 @@ fn adaptive_controller_misses_trajectory_targets() {
             + 2.0 * max_abs(&gpu_pos) * p_target
             + 2.0 * pos_target * p_target;
         println!(
-            "impact {impact}: affine {span}, {} accepted steps; position error {pos_error:.3e} \
+            "{label} impact {impact}: affine {span}, {} accepted steps, {} rejected \
+             (at most {} metric evaluations); position error {pos_error:.3e} \
              (target {pos_target:.3e}), momentum error {p_error:.3e} (target {p_target:.3e}), \
              |ΔL| {drift:.3e} (targets allow {allowed:.3e}); reference agreement {agreement:.1e}",
-            v[15]
+            v[15],
+            v[16],
+            (v[15] + v[16]) * evaluations
         );
         if pos_error > pos_target || p_error > p_target {
-            failures += 1;
+            failures[n / cases.len()] += 1;
         }
     }
     // Records the counterexample: at least one accepted trajectory exceeds the
     // TARGETS.md position or momentum error. Remove this assertion once the
     // controller is certified.
-    assert!(failures > 0, "every traced ray met the trajectory targets");
+    assert!(failures[0] > 0, "every traced ray met the trajectory targets");
 }
 
 /// Schwarzschild classification (obligation N4). A geodesic with conserved
