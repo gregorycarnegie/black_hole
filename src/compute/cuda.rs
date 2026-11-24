@@ -10,7 +10,7 @@ use cudarc::{
 
 pub const PTX: &str = include_str!("kernels.ptx");
 
-pub const KERNEL_NAMES: [&str; 21] = [
+pub const KERNEL_NAMES: [&str; 24] = [
     "bh_test_dust",
     "bh_wormhole",
     "bh_test_wormhole",
@@ -19,6 +19,9 @@ pub const KERNEL_NAMES: [&str; 21] = [
     "bh_geodesic_far_field",
     "bh_geodesic_diagnostics",
     "bh_geodesic_swarm",
+    "bh_geodesic_swarm_record",
+    "bh_swarm_first_hit",
+    "bh_swarm_apply",
     "bh_test_swarm_segment",
     "bh_accumulate",
     "bh_check_relativity",

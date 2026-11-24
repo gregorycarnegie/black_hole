@@ -1778,7 +1778,6 @@ fn intersect_objects_segment(start: Vec3, end: Vec3, objects: &Objects) -> Objec
 const SWARM_SLICE_WIDTH: f32 = 8.0;
 const SWARM_STEP_SPAN: f32 = 12.0;
 /// Slices the host builds; must match `SLICES` in `src/swarm.rs`.
-#[allow(dead_code)]
 const SWARM_SLICES: f32 = 40.0;
 
 /// Segment `start → end`, traversed between camera-relative times `t0 → t1`.
@@ -2522,11 +2521,138 @@ pub unsafe fn bh_geodesic_swarm(
         render_geodesic::<false, true, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, gid_x(), gid_y(),
-            |start, end, t0, t1| swarm_bvh_hit(
+            |start, end, t0, t1, _| swarm_bvh_hit(
                 start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
             ),
         );
     }
+}
+
+#[inline(always)]
+fn atomic_add_u32(address: *mut u32, value: u32) -> u32 {
+    let address = address as u64;
+    let old: u32;
+    unsafe {
+        cuda_device::ptx_asm!("atom.global.add.u32 %0, [%1], %2;", out("=r") old, in("l") address, in("r") value)
+    };
+    old
+}
+
+#[inline(always)]
+fn atomic_max_u32(address: *mut u32, value: u32) {
+    let address = address as u64;
+    unsafe { cuda_device::ptx_asm!("red.global.max.u32 [%0], %1;", in("l") address, in("r") value) };
+}
+
+/// First pass of the OptiX swarm renderer: renders rows from `row0` as
+/// `bh_geodesic_swarm` would, except that steps which may meet the belt are queued
+/// instead of tested. Entry e holds
+/// the step in `queue[2e..2e + 2]` as (start, t0), (end, t1), and the pixel state
+/// before it in `states[3e..3e + 3]` as (rgb, transmission), stokes, (pixel,
+/// iterations) bits. Steps outside OptiX's time window, and steps past `capacity`,
+/// are tested here by brute force; `counter` still counts every queued step. Every
+/// body lies within radii [belt_inner - pad, belt_outer + pad] over a step of
+/// duration dt, with pad = belt_spread dt^2 (the arc's sagitta in `swarm_body_hit`).
+#[cuda_device::kernel]
+pub unsafe fn bh_geodesic_swarm_record(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+    row0: u32,
+    swarm: *const SwarmBody,
+    swarm_count: u32,
+    queue: *mut Vec4,
+    states: *mut Vec4,
+    counter: *mut u32,
+    capacity: u32,
+    belt_inner: f32,
+    belt_outer: f32,
+    belt_spread: f32,
+    experiments: u32,
+) {
+    let (x, y) = (gid_x(), gid_y() + row0);
+    let pixel = y * width + x;
+    unsafe {
+        render_geodesic::<false, true, _>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, x, y,
+            |start, end, t0, t1, state| {
+                // Every body's radial test would reject this step.
+                let q = swarm_query(start, end, t0, t1);
+                let pad = belt_spread * (t1 - t0) * (t1 - t0);
+                if q.far_r < belt_inner - pad || q.near_r > belt_outer + pad {
+                    return vec4_splat(0.0);
+                }
+                let middle = -0.5 * (t0 + t1);
+                if !(middle >= 0.0
+                    && (t0 - t1).abs() <= SWARM_STEP_SPAN
+                    && middle < SWARM_SLICE_WIDTH * SWARM_SLICES)
+                {
+                    return swarm_segment_hit(start, end, t0, t1, swarm, swarm_count);
+                }
+                let slot = atomic_add_u32(counter, 1);
+                if slot >= capacity {
+                    return swarm_segment_hit(start, end, t0, t1, swarm, swarm_count);
+                }
+                let e = slot as usize;
+                *queue.add(2 * e) = vec4_v3_f(start, t0);
+                *queue.add(2 * e + 1) = vec4_v3_f(end, t1);
+                *states.add(3 * e) = vec4_v3_f(state.rgb, state.transmission);
+                *states.add(3 * e + 1) = state.stokes;
+                *states.add(3 * e + 2) =
+                    vec4(f32::from_bits(pixel), f32::from_bits(state.iterations), 0.0, 0.0);
+                vec4_splat(0.0)
+            },
+        );
+    }
+}
+
+/// Marks each pixel's earliest queued hit: `first[pixel]` = u32::MAX - iterations,
+/// so a zeroed buffer means none.
+#[cuda_device::kernel]
+pub unsafe fn bh_swarm_first_hit(results: *const Vec4, states: *const Vec4, first: *mut u32, count: u32) {
+    let e = gid_x() as usize;
+    if e >= count as usize || unsafe { (*results.add(e)).w } <= 0.0 {
+        return;
+    }
+    let tag = unsafe { *states.add(3 * e + 2) };
+    atomic_max_u32(unsafe { first.add(tag.x.to_bits() as usize) }, u32::MAX - tag.y.to_bits());
+}
+
+/// Rewrites each pixel whose earliest swarm hit was a queued step, as
+/// `render_geodesic` would have finished it there.
+#[cuda_device::kernel]
+pub unsafe fn bh_swarm_apply(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    results: *const Vec4,
+    states: *const Vec4,
+    first: *const u32,
+    count: u32,
+) {
+    let e = gid_x() as usize;
+    if e >= count as usize {
+        return;
+    }
+    let body = unsafe { *results.add(e) };
+    let tag = unsafe { *states.add(3 * e + 2) };
+    let (pixel, iterations) = (tag.x.to_bits() as usize, tag.y.to_bits());
+    if body.w <= 0.0 || unsafe { *first.add(pixel) } != u32::MAX - iterations {
+        return;
+    }
+    let lit = unsafe { *states.add(3 * e) };
+    let mut stokes = unsafe { *states.add(3 * e + 1) };
+    let transmission = lit.w;
+    // The same arithmetic as the hit in `render_geodesic`.
+    let rgb = lit.xyz() + transmission * body.xyz();
+    stokes.x += transmission * body.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
+    unsafe { *out_image.add(pixel) = vec4_v3_f(pixel_output(rgb, stokes, iterations, &*cam), 1.0) };
 }
 
 /// Each case is two Vec4s, (start, t0) and (end, t1); the result is the hit colour and flag.
@@ -2618,14 +2744,40 @@ fn advance_render_ray<const DIAGNOSTICS: bool>(
 
 /// A swarm query that never hits, for kernels without a swarm.
 #[inline(always)]
-fn no_swarm(_: Vec3, _: Vec3, _: f32, _: f32) -> Vec4 {
+fn no_swarm(_: Vec3, _: Vec3, _: f32, _: f32, _: PixelState) -> Vec4 {
     vec4_splat(0.0)
 }
 
-/// Renders pixel (`pix_x`, `pix_y`). With SWARM, `swarm_hit(start, end, t0, t1)`
+/// A pixel's accumulated light before a step, which a swarm hit there would end.
+#[derive(Clone, Copy)]
+struct PixelState {
+    rgb: Vec3,
+    transmission: f32,
+    stokes: Vec4,
+    iterations: u32,
+}
+
+/// The pixel colour for the light a ray gathered.
+#[inline(always)]
+fn pixel_output(rgb: Vec3, stokes: Vec4, iterations: u32, cam: &Camera) -> Vec3 {
+    let mut output = tonemap(rgb);
+    if cam.polarization_view != 0 {
+        output = polarization_color(stokes, cam);
+    }
+    if cam.debug_heatmap != 0 {
+        output = heatmap_color(iterations as f32 / cam.max_iter.max(1) as f32);
+    }
+    output
+}
+
+/// Renders pixel (`pix_x`, `pix_y`). With SWARM, `swarm_hit(start, end, t0, t1, state)`
 /// tests each accepted step against the swarm, as `swarm_segment_hit` does.
 #[inline(always)]
-unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool, F: Fn(Vec3, Vec3, f32, f32) -> Vec4>(
+unsafe fn render_geodesic<
+    const DIAGNOSTICS: bool,
+    const SWARM: bool,
+    F: Fn(Vec3, Vec3, f32, f32, PixelState) -> Vec4,
+>(
     out_image: *mut Vec4,
     cam: *const Camera,
     disk: *const Disk,
@@ -2767,7 +2919,8 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool, F: Fn(Vec3
         if SWARM {
             // Trapezoidal dt/dλ; `metric` now holds the accepted endpoint's metric.
             let end_time = ray_time + 0.5 * h * (start_dt + (metric.inv * next.p).x);
-            let body = swarm_hit(ray.pos, next.pos, ray_time, end_time);
+            let state = PixelState { rgb, transmission, stokes, iterations };
+            let body = swarm_hit(ray.pos, next.pos, ray_time, end_time, state);
             ray_time = end_time;
             if body.w > 0.0 {
                 rgb += transmission * body.xyz();
@@ -2827,13 +2980,7 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool, F: Fn(Vec3
         }
         i += 1;
     }
-    let mut output = tonemap(rgb);
-    if cam.polarization_view != 0 {
-        output = polarization_color(stokes, cam);
-    }
-    if cam.debug_heatmap != 0 {
-        output = heatmap_color(iterations as f32 / cam.max_iter.max(1) as f32);
-    }
+    let output = pixel_output(rgb, stokes, iterations, cam);
     if DIAGNOSTICS {
         stats.iterations = iterations;
         stats.exit = exit as u32;

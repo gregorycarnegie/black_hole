@@ -1,6 +1,4 @@
 //! Experimental OptiX ray queries for the swarm (cargo feature `optix`).
-// Only the GPU tests use this until the renderer adopts RT-core queries.
-#![cfg_attr(not(test), allow(dead_code))]
 
 #[allow(
     non_camel_case_types,
@@ -14,6 +12,8 @@ mod sys {
 }
 
 use std::ffi::c_void;
+
+use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 
 use super::cuda::shared_cuda;
 
@@ -159,7 +159,6 @@ impl SegmentPipeline {
         sys::OptixModuleCompileOptions,
         sys::OptixPipelineCompileOptions,
     ) {
-        // An explicit 255-register limit made the render raygen about 3x slower.
         let module = sys::OptixModuleCompileOptions::default();
         let pipeline = sys::OptixPipelineCompileOptions {
             usesMotionBlur: 1,
@@ -173,10 +172,6 @@ impl SegmentPipeline {
     }
 
     pub(crate) fn new() -> Result<Self, String> {
-        Self::with_programs(c"__raygen__segments", c"__anyhit__swarm")
-    }
-
-    fn with_programs(raygen_name: &std::ffi::CStr, anyhit_name: &std::ffi::CStr) -> Result<Self, String> {
         let optix = Optix::new()?;
         let t = &optix.table;
         let (module_options, pipeline_options) = Self::compile_options();
@@ -235,7 +230,7 @@ impl SegmentPipeline {
         };
         raygen.__bindgen_anon_1.raygen = sys::OptixProgramGroupSingleModule {
             module,
-            entryFunctionName: raygen_name.as_ptr(),
+            entryFunctionName: c"__raygen__segments".as_ptr(),
         };
         let mut miss = sys::OptixProgramGroupDesc {
             kind: sys::OptixProgramGroupKind_OPTIX_PROGRAM_GROUP_KIND_MISS,
@@ -251,7 +246,7 @@ impl SegmentPipeline {
         };
         hit.__bindgen_anon_1.hitgroup = sys::OptixProgramGroupHitgroup {
             moduleAH: module,
-            entryFunctionNameAH: anyhit_name.as_ptr(),
+            entryFunctionNameAH: c"__anyhit__swarm".as_ptr(),
             moduleIS: sphere_module,
             ..Default::default()
         };
@@ -415,25 +410,44 @@ impl SegmentPipeline {
 
     /// Hit colour and flag for each segment pair, as `bh_test_swarm_segment` returns.
     /// Also returns the launch time in milliseconds.
+    #[cfg(test)]
     pub(crate) fn query(
         &self,
         segments: &[[f32; 4]],
         bodies: &[crate::swarm::GpuSwarmBody],
     ) -> (Vec<[f32; 4]>, f64) {
-        let t = &self.optix.table;
         let (_gas, handle, _keys, backoff) = self.build(bodies);
         let count = segments.len() / 2;
         let d_segments = DeviceBuffer::from(segments);
         let d_bodies = DeviceBuffer::from(bodies);
         let d_results = DeviceBuffer::new(count * 16);
-        let queries = DeviceBuffer::from(&[SegmentQueries {
+        let queries = SegmentQueries {
             segments: d_segments.0,
             bodies: d_bodies.0,
             results: d_results.0,
             handle,
             count: count as u32,
             backoff,
-        }]);
+        };
+        let run = || {
+            let _launch = self.launch(queries);
+            shared_cuda().stream.synchronize().unwrap();
+        };
+        run();
+        let start = std::time::Instant::now();
+        run();
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let mut results = vec![[0.0_f32; 4]; count];
+        unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut results, d_results.0).unwrap() };
+        (results, elapsed)
+    }
+
+    /// Starts `queries` on the shared stream. The returned buffers hold the launch's
+    /// parameters, so keep them until the stream has finished it.
+    fn launch(&self, queries: SegmentQueries) -> [DeviceBuffer; 2] {
+        let t = &self.optix.table;
+        let count = queries.count;
+        let queries = DeviceBuffer::from(&[queries]);
         let mut records = vec![0u8; 3 * SBT_RECORD];
         for (i, group) in self.groups.iter().enumerate() {
             let record = &mut records[i * SBT_RECORD..(i + 1) * SBT_RECORD];
@@ -456,51 +470,16 @@ impl SegmentPipeline {
             ..Default::default()
         };
         let stream = shared_cuda().stream.cu_stream() as sys::CUstream;
-        let launch = || {
-            check(
-                unsafe {
-                    t.optixLaunch.unwrap()(self.pipeline, stream, 0, 0, &sbt, count as u32, 1, 1)
-                },
-                "optixLaunch",
-            )
-            .unwrap();
-            shared_cuda().stream.synchronize().unwrap();
-        };
-        launch();
-        let start = std::time::Instant::now();
-        launch();
-        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
-        let mut results = vec![[0.0_f32; 4]; count];
-        unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut results, d_results.0).unwrap() };
-        (results, elapsed)
+        check(
+            unsafe { t.optixLaunch.unwrap()(self.pipeline, stream, 0, 0, &sbt, count, 1, 1) },
+            "optixLaunch",
+        )
+        .unwrap();
+        [queries, d_records]
     }
 }
 
-/// Matches `RenderParams` in `tools/optix/programs.rs`.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RenderParams {
-    out_image: u64,
-    cam: u64,
-    disk: u64,
-    objects: u64,
-    skybox: u64,
-    bodies: u64,
-    scratch: u64,
-    handle: u64,
-    width: u32,
-    height: u32,
-    sky_w: u32,
-    sky_h: u32,
-    body_count: u32,
-    experiments: u32,
-    backoff: f32,
-    belt_inner: f32,
-    belt_outer: f32,
-    _pad: u32,
-}
-
-/// Device pointers the render launch reads.
+/// Device pointers and sizes for one swarm frame.
 pub(crate) struct RenderInputs {
     pub out_image: u64,
     pub cam: u64,
@@ -509,13 +488,39 @@ pub(crate) struct RenderInputs {
     pub skybox: u64,
     pub size: (u32, u32, u32, u32),
     pub experiments: u32,
+    pub cfg: LaunchConfig,
 }
 
-/// The production renderer launched through OptiX, with RT-core swarm queries.
+/// What one frame took, for benchmarks.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RenderStats {
+    /// Host time to build and upload the motion GAS, in ms.
+    pub build_ms: f64,
+    /// Steps the first pass queued for OptiX.
+    pub queued: u32,
+}
+
+/// Queue entries (96 bytes each: the step, then the pixel state) per band.
+const QUEUE_ENTRIES: u32 = (512 << 20) / 96;
+
+/// The swarm renderer with RT-core queries, in three stages per band of rows:
+/// `bh_geodesic_swarm_record` renders without the swarm and queues each step that
+/// may meet it, one OptiX launch tests the queue, and `bh_swarm_first_hit` /
+/// `bh_swarm_apply` redo the pixels whose earliest hit was a queued step. Bands
+/// keep the queue within QUEUE_ENTRIES.
 pub(crate) struct OptixRender {
     pipeline: SegmentPipeline,
-    scratch: DeviceBuffer,
-    scratch_pixels: usize,
+    record: CudaFunction,
+    first_hit: CudaFunction,
+    apply: CudaFunction,
+    queue: DeviceBuffer,
+    states: DeviceBuffer,
+    results: DeviceBuffer,
+    pixels: usize,
+    first: DeviceBuffer,
+    counter: DeviceBuffer,
+    /// The most queued steps per pixel in any band of the last frame.
+    steps_per_pixel: f32,
 }
 
 // SAFETY: OptiX host calls are thread-safe, and Bevy gives one system at a time
@@ -525,89 +530,129 @@ unsafe impl Sync for OptixRender {}
 
 impl OptixRender {
     pub(crate) fn new() -> Result<Self, String> {
+        let module = &shared_cuda().module;
+        let load = |name: &str| module.load_function(name).map_err(|e| format!("{name}: {e}"));
+        let entries = QUEUE_ENTRIES as usize;
         Ok(Self {
-            pipeline: SegmentPipeline::with_programs(c"__raygen__render", c"__anyhit__render")?,
-            scratch: DeviceBuffer::new(16),
-            scratch_pixels: 0,
+            pipeline: SegmentPipeline::new()?,
+            record: load("bh_geodesic_swarm_record")?,
+            first_hit: load("bh_swarm_first_hit")?,
+            apply: load("bh_swarm_apply")?,
+            queue: DeviceBuffer::new(entries * 32),
+            states: DeviceBuffer::new(entries * 48),
+            results: DeviceBuffer::new(entries * 16),
+            pixels: 0,
+            first: DeviceBuffer::new(0),
+            counter: DeviceBuffer::new(4),
+            steps_per_pixel: 100.0,
         })
     }
 
-    /// Renders one frame; returns the host time to build the GAS and the launch time, in ms.
+    /// Renders one frame into `inputs.out_image`.
     pub(crate) fn render(
         &mut self,
         inputs: &RenderInputs,
         bodies: &[crate::swarm::GpuSwarmBody],
-    ) -> (f64, f64) {
+    ) -> RenderStats {
+        let cuda = shared_cuda();
+        let stream = &cuda.stream;
         let start = std::time::Instant::now();
         let (_gas, handle, _keys, backoff) = self.pipeline.build(bodies);
-        let build = start.elapsed().as_secs_f64() * 1000.0;
+        let build_ms = start.elapsed().as_secs_f64() * 1000.0;
         let (width, height, sky_w, sky_h) = inputs.size;
-        // Matches the radial rejection in `swarm_body_hit` for steps up to STEP_SPAN.
-        let (mut belt_inner, mut belt_outer) = (f32::INFINITY, 0.0_f32);
+        // Bounds the radial rejection in `swarm_body_hit`; 0.01 covers rounding.
+        let (mut belt_inner, mut belt_outer, mut belt_spread) = (f32::INFINITY, 0.0_f32, 0.0_f32);
         for body in bodies {
-            let turn = body.orbit[1] * STEP_SPAN;
-            let reach = body.axis_b[3] + 0.125 * body.axis_a[3] * turn * turn + 0.01;
-            belt_inner = belt_inner.min(body.axis_a[3] - reach);
-            belt_outer = belt_outer.max(body.axis_a[3] + reach);
+            let (orbit, radius, omega) = (body.axis_a[3], body.axis_b[3], body.orbit[1]);
+            belt_inner = belt_inner.min(orbit - radius - 0.01);
+            belt_outer = belt_outer.max(orbit + radius + 0.01);
+            belt_spread = belt_spread.max(0.125 * orbit * omega * omega * 1.001);
         }
         let pixels = (width * height) as usize;
-        if self.scratch_pixels < pixels {
-            self.scratch = DeviceBuffer::new(pixels * 32);
-            self.scratch_pixels = pixels;
+        if self.pixels < pixels {
+            self.first = DeviceBuffer::new(pixels * 4);
+            self.pixels = pixels;
         }
         let d_bodies = DeviceBuffer::from(bodies);
-        let params = DeviceBuffer::from(&[RenderParams {
-            out_image: inputs.out_image,
-            cam: inputs.cam,
-            disk: inputs.disk,
-            objects: inputs.objects,
-            skybox: inputs.skybox,
-            bodies: d_bodies.0,
-            scratch: self.scratch.0,
-            handle,
-            width,
-            height,
-            sky_w,
-            sky_h,
-            body_count: bodies.len() as u32,
-            experiments: inputs.experiments,
-            backoff,
-            belt_inner,
-            belt_outer,
-            _pad: 0,
-        }]);
-        let t = &self.pipeline.optix.table;
-        let mut records = vec![0u8; 3 * SBT_RECORD];
-        for (i, group) in self.pipeline.groups.iter().enumerate() {
-            let record = &mut records[i * SBT_RECORD..(i + 1) * SBT_RECORD];
-            check(
-                unsafe { t.optixSbtRecordPackHeader.unwrap()(*group, record.as_mut_ptr().cast()) },
-                "optixSbtRecordPackHeader",
-            )
-            .unwrap();
-            record[SBT_HEADER..SBT_HEADER + 8].copy_from_slice(&params.0.to_le_bytes());
-        }
-        let d_records = DeviceBuffer::from(&records);
-        let sbt = sys::OptixShaderBindingTable {
-            raygenRecord: d_records.0,
-            missRecordBase: d_records.0 + SBT_RECORD as u64,
-            missRecordStrideInBytes: SBT_RECORD as u32,
-            missRecordCount: 1,
-            hitgroupRecordBase: d_records.0 + 2 * SBT_RECORD as u64,
-            hitgroupRecordStrideInBytes: SBT_RECORD as u32,
-            hitgroupRecordCount: 1,
-            ..Default::default()
+        let body_count = bodies.len() as u32;
+        let memset = |buffer: &DeviceBuffer, bytes: usize| unsafe {
+            cudarc::driver::result::memset_d8_async(buffer.0, 0, bytes, stream.cu_stream()).unwrap()
         };
-        let stream = shared_cuda().stream.cu_stream() as sys::CUstream;
-        let start = std::time::Instant::now();
-        check(
-            unsafe { t.optixLaunch.unwrap()(self.pipeline.pipeline, stream, 0, 0, &sbt, width, height, 1) },
-            "optixLaunch",
-        )
-        .unwrap();
-        // The GAS, records and parameters are freed on return, so finish first.
-        shared_cuda().stream.synchronize().unwrap();
-        (build, start.elapsed().as_secs_f64() * 1000.0)
+        let block_rows = inputs.cfg.block_dim.1;
+        let mut densest = 0.0_f32;
+        let mut queued_total = 0_u32;
+        let mut row0 = 0;
+        while row0 < height {
+            // Whole blocks of rows, with headroom; a band that still overflows tests
+            // the excess by brute force in the first pass.
+            let fit = (QUEUE_ENTRIES as f32 / (1.25 * self.steps_per_pixel * width as f32)) as u32;
+            let rows = (fit / block_rows).max(1) * block_rows;
+            let rows = rows.min(height - row0);
+            memset(&self.counter, 4);
+            let cfg = LaunchConfig {
+                grid_dim: (inputs.cfg.grid_dim.0, rows.div_ceil(block_rows), 1),
+                ..inputs.cfg
+            };
+            let mut builder = stream.launch_builder(&self.record);
+            builder
+                .arg(&inputs.out_image)
+                .arg(&inputs.cam)
+                .arg(&inputs.disk)
+                .arg(&inputs.objects)
+                .arg(&inputs.skybox)
+                .arg(&width)
+                .arg(&height)
+                .arg(&sky_w)
+                .arg(&sky_h)
+                .arg(&row0)
+                .arg(&d_bodies.0)
+                .arg(&body_count)
+                .arg(&self.queue.0)
+                .arg(&self.states.0)
+                .arg(&self.counter.0)
+                .arg(&QUEUE_ENTRIES)
+                .arg(&belt_inner)
+                .arg(&belt_outer)
+                .arg(&belt_spread)
+                .arg(&inputs.experiments);
+            unsafe { builder.launch(cfg) }.expect("bh_geodesic_swarm_record launch failed");
+            stream.synchronize().unwrap();
+            let mut counted = [0u32];
+            unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut counted, self.counter.0).unwrap() };
+            densest = densest.max(counted[0] as f32 / (rows * width) as f32);
+            self.steps_per_pixel = self.steps_per_pixel.max(densest);
+            let queued = counted[0].min(QUEUE_ENTRIES);
+            queued_total = queued_total.saturating_add(counted[0]);
+            if queued > 0 {
+                let _launch = self.pipeline.launch(SegmentQueries {
+                    segments: self.queue.0,
+                    bodies: d_bodies.0,
+                    results: self.results.0,
+                    handle,
+                    count: queued,
+                    backoff,
+                });
+                memset(&self.first, pixels * 4);
+                let cfg = LaunchConfig::for_num_elems(queued);
+                let mut builder = stream.launch_builder(&self.first_hit);
+                builder.arg(&self.results.0).arg(&self.states.0).arg(&self.first.0).arg(&queued);
+                unsafe { builder.launch(cfg) }.expect("bh_swarm_first_hit launch failed");
+                let mut builder = stream.launch_builder(&self.apply);
+                builder
+                    .arg(&inputs.out_image)
+                    .arg(&inputs.cam)
+                    .arg(&self.results.0)
+                    .arg(&self.states.0)
+                    .arg(&self.first.0)
+                    .arg(&queued);
+                unsafe { builder.launch(cfg) }.expect("bh_swarm_apply launch failed");
+                // The next band reuses the queue, and the GAS is freed on return.
+                stream.synchronize().unwrap();
+            }
+            row0 += rows;
+        }
+        self.steps_per_pixel = densest.max(1.0);
+        RenderStats { build_ms, queued: queued_total }
     }
 }
 

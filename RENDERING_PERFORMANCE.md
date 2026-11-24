@@ -143,7 +143,31 @@ Camera-relative time is cut into 40 slices, each 8 r_g/c wide. For each slice, t
 | 4,096 | 4,357 ms | 384 ms | 18 ms |
 | 16,384 | about 16 s | 890 ms | 78 ms |
 
-At 1,024 bodies the BVH image matches brute force bit for bit (`the_bvh_renders_the_brute_force_image`). `swarm_hits_match_exact_circular_orbits` checks the shared per-body test against exact orbits. Possible next steps include refitting instead of rebuilding, building on the GPU, and choosing slice widths from the measured step spans. RT cores would need an OptiX backend, which the cuda-oxide toolchain does not target.
+At 1,024 bodies the BVH image matches brute force bit for bit (`the_bvh_renders_the_brute_force_image`). `swarm_hits_match_exact_circular_orbits` checks the shared per-body test against exact orbits. Possible next steps include refitting instead of rebuilding, building on the GPU, and choosing slice widths from the measured step spans.
+
+### OptiX RT-core queries (`--features optix`)
+
+With the `optix` cargo feature, the OptiX 9.1 headers (`OPTIX_ROOT`) and libclang (`LIBCLANG_PATH`), the swarm renders through OptiX whenever the driver supports it. It falls back to the BVH otherwise. The OptiX programs are Rust built by cuda-oxide (`tools/optix/programs.rs`, `cargo oxide build --arch sm_80`). The host builds a motion GAS each frame: built-in spheres over 53 keys spanning 412 r_g/c, each padded for half a step's motion, the step's own sagitta padding and the gap between the orbit and OptiX's linear interpolation between keys. One ray per step, at the step's mid time, finds candidates. An any-hit program runs the exact per-body test on each candidate and keeps the earliest hit.
+
+The first attempt traced from inside the render loop, with one `optixTrace` per step near the belt. The image matched brute force, but frames took 0.9–11 s, 5–20 times slower than the BVH. OptiX saves and restores the integrator's whole live state around every trace, and this kernel already needs 255 registers.
+
+The renderer now works in batches, one band of rows at a time:
+
+1. `bh_geodesic_swarm_record` renders the band without swarm hits. Each step that can reach the belt goes into a queue with the pixel's state before that step: colour, transmission, Stokes vector and iteration. The belt check is a radial shell bound that widens with the square of the step's duration, so it is valid for steps of any length. Steps outside the GAS time window are tested by brute force in place, as the BVH does, and so are steps past the queue's capacity.
+2. One OptiX launch tests the whole queue.
+3. `bh_swarm_first_hit` keeps each pixel's earliest hit with an atomic max. `bh_swarm_apply` then finishes that pixel as the render loop would have finished it at that step.
+
+Each band's queue is limited to 512 MB (5.6 million entries of 96 bytes). Band heights come from the previous frame's densest band. `optix_renders_the_brute_force_image` times the same 400×300 view; the frame is the median of five and includes the host GAS build.
+
+| Bodies | BVH | OptiX | of which host GAS build | Steps queued |
+|---:|---:|---:|---:|---:|
+| 0 | 121 ms | — | — | — |
+| 256 | 161 ms | 145 ms | 2 ms | 8.55 M |
+| 1,024 | 213 ms | 144 ms | 4 ms | 8.56 M |
+| 4,096 | 382 ms | 158 ms | 8 ms | 8.57 M |
+| 16,384 | 874 ms | 198 ms | 26 ms | 8.58 M |
+
+The OptiX launch answers the 8.6 M queries in 0.2 ms at 256 bodies and 31 ms at 16,384. Most of the frame is the first pass, which costs about the same as a render without the swarm. Before the belt check was moved ahead of the brute-force fallback, the first pass took 1.15 s at 16,384 bodies. The BVH kernel still sends long steps to brute force without that check, which accounts for most of its growth with body count. At up to 1,024 bodies the OptiX image matches brute force bit for bit.
 
 The current binary renderer freezes positions and spins for each trace, so 3D bounds suffice for those geometry queries. RT cores accelerate conventional straight-ray traversal and triangle intersections. A mesh-heavy scene could use a 3D BVH to find candidates along short geodesic segments, with the integrator still computing the trajectory. If accuracy is defined against the curved trajectory, the broad phase needs a conservative bound on the curve's departure from each segment, followed by a refined test for candidate hits. Measure the traversal overhead against the direct loop before adopting it. [Frozen metric](README.md#L91) · [NVIDIA RT cores](https://developer.nvidia.com/blog/?p=11872) · [OptiX ray API](https://raytracing-docs.nvidia.com/optix8/api/group__optix__device__api.html)
 

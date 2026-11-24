@@ -9,6 +9,7 @@
 - GPU regressions for early capture against the analytic equatorial Kerr potential at five spins, and for near-critical Schwarzschild classification with a disk inner edge.
 
 - A swarm of up to 4096 small bodies on prescribed circular orbits (K, or the Swarm panel row), drawn where each was when the light reaching the camera passed it. A space-time BVH, rebuilt per frame over 40 time slices, renders the same image as brute force bit for bit and cuts the 4096-body frame from 4.4 s to 0.38 s on an RTX 4090. GPU tests check the intersection against exact orbits and show that an empty swarm leaves the image unchanged bit for bit.
+- Experimental RT-core swarm queries behind the `optix` cargo feature, which needs the OptiX 9.1 SDK headers at `OPTIX_ROOT`. The render pass queues each step that can reach the belt, one OptiX launch over a motion GAS tests them all, and a fix-up pass applies each pixel's earliest hit. The image matches brute force bit for bit. At 400×300 on an RTX 4090, frames take 145–198 ms from 256 to 16,384 bodies, against 161–874 ms with the BVH. Details are in `RENDERING_PERFORMANCE.md`.
 
 ### Changed
 
