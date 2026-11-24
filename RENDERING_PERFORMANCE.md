@@ -125,6 +125,22 @@ With both experiments enabled, the change saves about 3 ms per frame. The defaul
 
 ## Where a BVH or RT cores could help
 
+### Swarm scene: the brute-force baseline
+
+Press K (or use the Swarm panel row) to add 256–4096 small bodies on circular orbits 12–40 r_g out. The kernel tracks coordinate time along each ray and places every body where it was when the light passed it. Inner bodies move several r_g during one crossing of the belt, so straight 3D bounds are not enough. Each ray step tests every body. It skips bodies whose orbit sphere or orbital plane the segment cannot reach, and only then solves linearized relative motion, with the radius padded by the arc's sagitta. [Swarm intersection](tools/cuda/kernels.rs) · [Body generator](src/swarm.rs)
+
+`cargo test --release --bin black_hole -- --ignored swarm_brute_force_cost --nocapture` times the default single-hole view at 400×300 on the RTX 4090:
+
+| Bodies | Ray kernel median |
+|---:|---:|
+| 0 | 117 ms |
+| 256 | 247 ms |
+| 1,024 | 854 ms |
+| 4,096 | 4,308 ms |
+| 16,384 | 15,926 ms |
+
+Cost grows linearly with the body count. A BVH over each body's swept volume in space and time, refit or rebuilt per frame, should make it close to logarithmic. `swarm_hits_match_exact_circular_orbits` is the reference that any accelerated version must still pass.
+
 The current binary renderer freezes positions and spins for each trace, so 3D bounds suffice for those geometry queries. RT cores accelerate conventional straight-ray traversal and triangle intersections. A mesh-heavy scene could use a 3D BVH to find candidates along short geodesic segments, with the integrator still computing the trajectory. If accuracy is defined against the curved trajectory, the broad phase needs a conservative bound on the curve's departure from each segment, followed by a refined test for candidate hits. Measure the traversal overhead against the direct loop before adopting it. [Frozen metric](README.md#L91) · [NVIDIA RT cores](https://developer.nvidia.com/blog/?p=11872) · [OptiX ray API](https://raytracing-docs.nvidia.com/optix8/api/group__optix__device__api.html)
 
 Any future RT-core backend must have an on/off switch and fall back to the existing CUDA path when RT hardware is unavailable. Test both settings and the fallback before enabling it by default.

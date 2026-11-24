@@ -46,11 +46,12 @@ Simulates null geodesics (light paths) in Kerr spacetime in mass-independent gra
 | M               | Cycle disk geometry preset                     |
 | F               | Toggle spacetime grid                          |
 | N               | Toggle binary black holes                      |
-| G               | Toggle n-body gravity                          |
+| G               | Toggle Newtonian n-body motion (moves the debug bodies; light bending is always on) |
 | O               | Toggle debug bodies                            |
 | B               | Cycle HDR skybox                               |
 | `,` / `.`       | Decrease / increase max geodesic iterations    |
 | H               | Toggle iteration-count heatmap                 |
+| K               | Cycle the orbiting-body swarm: off, 256, 1024, 4096 bodies |
 | P               | Cycle intensity, linear polarization fraction, EVPA, Q/I, U/I, V/I |
 
 ### Xbox Controller
@@ -63,7 +64,7 @@ Simulates null geodesics (light paths) in Kerr spacetime in mass-independent gra
 | B                | Toggle binary black holes                   |
 | X                | Toggle spacetime grid                       |
 | Y                | Toggle iteration-count heatmap              |
-| Select           | Toggle n-body gravity                       |
+| Select           | Toggle Newtonian n-body motion              |
 | Start            | Toggle debug bodies                         |
 | D-pad left/right | Select binary black hole A / B              |
 | D-pad up/down    | Increase / decrease selected-hole spin a*   |

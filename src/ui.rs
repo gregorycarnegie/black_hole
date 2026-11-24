@@ -10,6 +10,7 @@ use crate::{
         BINARY_AXIS_STEP, BINARY_SPIN_STEP, BinaryBlackHoles, DebugBodiesEnabled, DiskConfig,
         GravityEnabled, SimObjects, scene_objects,
     },
+    swarm::Swarm,
 };
 
 pub struct UiPlugin;
@@ -49,6 +50,8 @@ enum UiAction {
     SkyboxNext,
     DiskModelPrev,
     DiskModelNext,
+    SwarmPrev,
+    SwarmNext,
     BinaryHolePrev,
     BinaryHoleNext,
     BinaryAxisXDown,
@@ -82,6 +85,7 @@ enum ValueDisplay {
     RenderScale,
     Skybox,
     DiskModel,
+    Swarm,
     Polarization,
     Frequency,
     Faraday,
@@ -138,6 +142,7 @@ struct ButtonPressParams<'w> {
     scale: ResMut<'w, RenderScale>,
     skybox_set: ResMut<'w, SkyboxSet>,
     skybox_active: ResMut<'w, SkyboxImage>,
+    swarm: ResMut<'w, Swarm>,
 }
 
 // ── Panel setup ──────────────────────────────────────────────────────────────
@@ -223,6 +228,13 @@ fn setup_panel(mut commands: Commands) {
                 UiAction::DiskModelNext,
                 ValueDisplay::DiskModel,
             );
+            spawn_cycle_row(
+                root,
+                "Swarm",
+                UiAction::SwarmPrev,
+                UiAction::SwarmNext,
+                ValueDisplay::Swarm,
+            );
 
             spawn_sep(root);
 
@@ -267,7 +279,7 @@ fn setup_panel(mut commands: Commands) {
             spawn_toggle_row(
                 root,
                 &[
-                    ("Gravity", UiAction::ToggleGravity, ToggleLabel::Gravity),
+                    ("N-body", UiAction::ToggleGravity, ToggleLabel::Gravity),
                     ("Heatmap", UiAction::ToggleHeatmap, ToggleLabel::Heatmap),
                 ],
             );
@@ -610,6 +622,10 @@ fn handle_button_press(query: UiButtonInteractionQuery<'_, '_>, mut params: Butt
                 *params.disk = DiskConfig::for_model(next, spin);
                 params.cam.is_moving = true;
             }
+            UiAction::SwarmPrev | UiAction::SwarmNext => {
+                params.swarm.step(*action == UiAction::SwarmNext);
+                params.cam.is_moving = true;
+            }
             UiAction::BinaryHolePrev => {
                 params.binary.select_prev();
                 params.cam.is_moving = true;
@@ -798,6 +814,7 @@ fn update_value_displays(
     binary: Res<BinaryBlackHoles>,
     scale: Res<RenderScale>,
     skybox_set: Res<SkyboxSet>,
+    swarm: Res<Swarm>,
     mut query: Query<(&mut Text, &ValueDisplay)>,
 ) {
     for (mut text, display) in &mut query {
@@ -815,6 +832,10 @@ fn update_value_displays(
             ValueDisplay::RenderScale => format!("{:.0}%", scale.0 * 100.0),
             ValueDisplay::Skybox => SKYBOX_NAMES[skybox_set.current].to_string(),
             ValueDisplay::DiskModel => disk.model.short_name().to_string(),
+            ValueDisplay::Swarm => match swarm.count {
+                0 => "Off".to_string(),
+                count => count.to_string(),
+            },
             ValueDisplay::Polarization => {
                 POLARIZATION_VIEWS[cam.polarization_view as usize].to_string()
             }
@@ -894,6 +915,7 @@ mod tests {
                 ..default()
             })
             .init_resource::<RenderScale>()
+            .init_resource::<Swarm>()
             .insert_resource(SkyboxImage(handles[0].clone()))
             .insert_resource(SkyboxSet {
                 handles,
@@ -946,6 +968,7 @@ mod tests {
         MaxIter,
         Scale,
         Polarization,
+        Swarm,
     }
 
     impl Field {
@@ -960,6 +983,7 @@ mod tests {
                 Field::MaxIter => cam(app).max_iter as f64,
                 Field::Scale => app.world().resource::<RenderScale>().0 as f64,
                 Field::Polarization => cam(app).polarization_view as f64,
+                Field::Swarm => app.world().resource::<Swarm>().count as f64,
             }
         }
 
@@ -983,6 +1007,7 @@ mod tests {
                 Field::Polarization => {
                     world.resource_mut::<OrbitalCamera>().polarization_view = value as u32
                 }
+                Field::Swarm => world.resource_mut::<Swarm>().count = value as u32,
             }
         }
 
@@ -998,11 +1023,12 @@ mod tests {
                 Field::MaxIter => ITER_PRESETS.contains(&(value as u32)),
                 Field::Scale => SCALE_PRESETS.contains(&(value as f32)),
                 Field::Polarization => value < POLARIZATION_VIEWS.len() as f64,
+                Field::Swarm => crate::swarm::SWARM_COUNTS.contains(&(value as u32)),
             }
         }
     }
 
-    const STEP_BUTTONS: [(UiAction, Field); 18] = [
+    const STEP_BUTTONS: [(UiAction, Field); 20] = [
         (UiAction::SpinDown, Field::Spin),
         (UiAction::SpinUp, Field::Spin),
         (UiAction::DiskRadiusDown, Field::Radius),
@@ -1021,6 +1047,8 @@ mod tests {
         (UiAction::RenderScaleUp, Field::Scale),
         (UiAction::PolarizationPrev, Field::Polarization),
         (UiAction::PolarizationNext, Field::Polarization),
+        (UiAction::SwarmPrev, Field::Swarm),
+        (UiAction::SwarmNext, Field::Swarm),
     ];
 
     #[test]
@@ -1289,6 +1317,7 @@ mod tests {
     #[case(ValueDisplay::RenderScale, "50%")]
     #[case(ValueDisplay::Skybox, "Checker Grid")]
     #[case(ValueDisplay::DiskModel, "Thin NT")]
+    #[case(ValueDisplay::Swarm, "Off")]
     #[case(ValueDisplay::Polarization, "Intensity")]
     #[case(ValueDisplay::Frequency, "230")]
     #[case(ValueDisplay::Faraday, "1.00")]

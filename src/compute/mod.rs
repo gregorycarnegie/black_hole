@@ -239,6 +239,7 @@ impl Plugin for GeodesicComputePlugin {
             ExtractResourcePlugin::<SkyboxImage>::default(),
             ExtractResourcePlugin::<SkyboxData>::default(),
             ExtractResourcePlugin::<OtherSkyboxData>::default(),
+            ExtractResourcePlugin::<crate::swarm::Swarm>::default(),
         ));
 
         app.init_resource::<CameraUniform>()

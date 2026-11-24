@@ -779,6 +779,20 @@ pub struct Objects {
     pub spin: [Vec4; 16],
 }
 
+/// A massless body on a prescribed circular orbit about the origin.
+/// Position at camera-relative coordinate time `t`:
+/// `axis_a.w * (cos(orbit.x + orbit.y t) axis_a.xyz + sin(orbit.x + orbit.y t) axis_b.xyz)`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SwarmBody {
+    /// Orbital axis at phase 0, then orbit radius.
+    pub axis_a: Vec4,
+    /// Direction of motion at phase 0, then body radius.
+    pub axis_b: Vec4,
+    /// Phase at the camera time, angular velocity, albedo, unused.
+    pub orbit: Vec4,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SnapshotHeader {
@@ -1757,6 +1771,79 @@ fn intersect_objects_segment(start: Vec3, end: Vec3, objects: &Objects) -> Objec
     result
 }
 
+/// Brute-force space-time test of the segment `start → end`, traversed between
+/// camera-relative times `t0 → t1`, against every swarm body. Each body's motion
+/// over the step is linearized and its radius padded by the arc's sagitta, so the
+/// test is conservative. Returns the lit colour of the earliest hit in xyz with
+/// w = 1, or w = 0 for a miss.
+#[cuda_device::device]
+fn swarm_segment_hit(
+    start: Vec3,
+    end: Vec3,
+    t0: f32,
+    t1: f32,
+    swarm: *const SwarmBody,
+    count: u32,
+) -> Vec4 {
+    let segment = end - start;
+    let segment_len2 = segment.dot(segment).max(1.0e-12);
+    let nearest = clamp_f32(-start.dot(segment) / segment_len2, 0.0, 1.0);
+    let near_r = (start + nearest * segment).length();
+    let far_r = start.length().max(end.length());
+    let mut best = 2.0_f32;
+    let mut result = vec4_splat(0.0);
+    let mut i = 0u32;
+    while i < count {
+        let body = unsafe { *swarm.add(i as usize) };
+        i += 1;
+        let orbit_r = body.axis_a.w;
+        let omega = body.orbit.y;
+        let turn = omega * (t1 - t0);
+        let radius = body.axis_b.w + 0.125 * orbit_r * turn * turn;
+        // Each orbit lies on a sphere of radius orbit_r and in a fixed plane; skip
+        // bodies the segment cannot reach before evaluating their positions.
+        if orbit_r + radius < near_r || orbit_r - radius > far_r {
+            continue;
+        }
+        let normal = body.axis_a.xyz().cross(body.axis_b.xyz());
+        let h0 = normal.dot(start);
+        let h1 = normal.dot(end);
+        if (h0 > radius && h1 > radius) || (h0 < -radius && h1 < -radius) {
+            continue;
+        }
+        let s0 = sincos(body.orbit.x + omega * t0);
+        let s1 = sincos(body.orbit.x + omega * t1);
+        let c0 = orbit_r * (s0.y * body.axis_a.xyz() + s0.x * body.axis_b.xyz());
+        let c1 = orbit_r * (s1.y * body.axis_a.xyz() + s1.x * body.axis_b.xyz());
+        // Relative motion: |rel + s d| = radius for s in [0, 1].
+        let rel = start - c0;
+        let d = segment - (c1 - c0);
+        let dd = d.dot(d).max(1.0e-12);
+        let half_b = rel.dot(d);
+        let disc = half_b * half_b - dd * (rel.dot(rel) - radius * radius);
+        if disc >= 0.0 {
+            let root = sqrt(disc);
+            let entry = (-half_b - root) / dd;
+            let exit = (-half_b + root) / dd;
+            let s = entry.max(0.0);
+            if exit >= 0.0 && entry <= 1.0 && s < best {
+                best = s;
+                let center = c0 + s * (c1 - c0);
+                let normal = (rel + s * d).normalize();
+                // Lit by the inner disk: the hemisphere facing the hole is bright.
+                let facing = normal.dot(-center.normalize()).max(0.0);
+                let light = (10.0 / orbit_r) * (10.0 / orbit_r);
+                let albedo = body.orbit.z;
+                result = vec4_v3_f(
+                    albedo * vec3(0.62, 0.52, 0.44) * (0.03 + 4.0 * light * facing),
+                    1.0,
+                );
+            }
+        }
+    }
+    result
+}
+
 #[inline(always)]
 fn nt_temp(r_disk: f32, disk: &Disk) -> f32 {
     let ratio = disk.isco_r / r_disk;
@@ -2248,9 +2335,9 @@ pub unsafe fn bh_geodesic(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false>(
+        render_geodesic::<false, false>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), false, false,
+            core::ptr::null_mut(), false, false, core::ptr::null(), 0,
         );
     }
 }
@@ -2268,9 +2355,9 @@ pub unsafe fn bh_geodesic_early_capture(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false>(
+        render_geodesic::<false, false>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false,
+            core::ptr::null_mut(), true, false, core::ptr::null(), 0,
         );
     }
 }
@@ -2289,10 +2376,55 @@ pub unsafe fn bh_geodesic_far_field(
     early_capture: u32,
 ) {
     unsafe {
-        render_geodesic::<false>(
+        render_geodesic::<false, false>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), early_capture != 0, true,
+            core::ptr::null_mut(), early_capture != 0, true, core::ptr::null(), 0,
         );
+    }
+}
+
+/// The production renderer with a swarm of moving bodies, tested by brute force.
+#[cuda_device::kernel]
+pub unsafe fn bh_geodesic_swarm(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+    swarm: *const SwarmBody,
+    swarm_count: u32,
+    experiments: u32,
+) {
+    unsafe {
+        render_geodesic::<false, true>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, swarm, swarm_count,
+        );
+    }
+}
+
+/// Each case is two Vec4s, (start, t0) and (end, t1); the result is the hit colour and flag.
+#[cuda_device::kernel]
+pub unsafe fn bh_test_swarm_segment(
+    cases: *const Vec4,
+    swarm: *const SwarmBody,
+    swarm_count: u32,
+    results: *mut Vec4,
+    count: u32,
+) {
+    let i = gid_x();
+    if i >= count {
+        return;
+    }
+    let start = unsafe { *cases.add(2 * i as usize) };
+    let end = unsafe { *cases.add(2 * i as usize + 1) };
+    unsafe {
+        *results.add(i as usize) =
+            swarm_segment_hit(start.xyz(), end.xyz(), start.w, end.w, swarm, swarm_count);
     }
 }
 
@@ -2344,9 +2476,9 @@ pub unsafe fn bh_geodesic_diagnostics(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<true>(
+        render_geodesic::<true, false>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
-            experiments & 1 != 0, experiments & 2 != 0,
+            experiments & 1 != 0, experiments & 2 != 0, core::ptr::null(), 0,
         );
     }
 }
@@ -2363,7 +2495,7 @@ fn advance_render_ray<const DIAGNOSTICS: bool>(
 }
 
 #[inline(always)]
-unsafe fn render_geodesic<const DIAGNOSTICS: bool>(
+unsafe fn render_geodesic<const DIAGNOSTICS: bool, const SWARM: bool>(
     out_image: *mut Vec4,
     cam: *const Camera,
     disk: *const Disk,
@@ -2376,6 +2508,8 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool>(
     diagnostics: *mut RayDiagnostics,
     early_capture: bool,
     far_field: bool,
+    swarm: *const SwarmBody,
+    swarm_count: u32,
 ) {
     let pix_x = gid_x();
     let pix_y = gid_y();
@@ -2417,6 +2551,8 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool>(
         0.0
     };
     let vacuum_sq = if far_field { vacuum_radius_sq(objects, disk) } else { f32::INFINITY };
+    // Coordinate time relative to the camera; it decreases along the backward ray.
+    let mut ray_time = 0.0_f32;
     let mut i = 0u32;
     while i < cam.max_iter {
         iterations = i + 1;
@@ -2427,6 +2563,7 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool>(
             break;
         }
         let velocity = (metric.inv * ray.p).yzw();
+        let start_dt = if SWARM { (metric.inv * ray.p).x } else { 0.0 };
         if early_capture && metric.clearance < capture_clearance {
             // A tighter interval may rule out a turn even if the first check could not.
             capture_clearance = 0.5 * metric.clearance;
@@ -2497,6 +2634,20 @@ unsafe fn render_geodesic<const DIAGNOSTICS: bool>(
                 exit = RayExit::ObjectHit;
             }
             break;
+        }
+        if SWARM {
+            // Trapezoidal dt/dλ; `metric` now holds the accepted endpoint's metric.
+            let end_time = ray_time + 0.5 * h * (start_dt + (metric.inv * next.p).x);
+            let body = swarm_segment_hit(ray.pos, next.pos, ray_time, end_time, swarm, swarm_count);
+            ray_time = end_time;
+            if body.w > 0.0 {
+                rgb += transmission * body.xyz();
+                stokes.x += transmission * body.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
+                if DIAGNOSTICS {
+                    exit = RayExit::ObjectHit;
+                }
+                break;
+            }
         }
         let middle = Ray {
             pos: 0.5 * (ray.pos + next.pos),

@@ -10,7 +10,7 @@ use cudarc::{
 
 pub const PTX: &str = include_str!("kernels.ptx");
 
-pub const KERNEL_NAMES: [&str; 19] = [
+pub const KERNEL_NAMES: [&str; 21] = [
     "bh_test_dust",
     "bh_wormhole",
     "bh_test_wormhole",
@@ -18,6 +18,8 @@ pub const KERNEL_NAMES: [&str; 19] = [
     "bh_geodesic_early_capture",
     "bh_geodesic_far_field",
     "bh_geodesic_diagnostics",
+    "bh_geodesic_swarm",
+    "bh_test_swarm_segment",
     "bh_accumulate",
     "bh_check_relativity",
     "bh_test_atan2",
@@ -41,6 +43,7 @@ pub struct CudaKernels {
     pub geodesic: CudaFunction,
     pub geodesic_early_capture: CudaFunction,
     pub geodesic_far_field: CudaFunction,
+    pub geodesic_swarm: CudaFunction,
     pub wormhole: CudaFunction,
     pub test_wormhole: CudaFunction,
     pub test_dust: CudaFunction,
@@ -97,6 +100,7 @@ impl CudaKernels {
             geodesic: load("bh_geodesic")?,
             geodesic_early_capture: load("bh_geodesic_early_capture")?,
             geodesic_far_field: load("bh_geodesic_far_field")?,
+            geodesic_swarm: load("bh_geodesic_swarm")?,
             accumulate: load("bh_accumulate")?,
             check_relativity: load("bh_check_relativity")?,
             test_atan2: load("bh_test_atan2")?,

@@ -12,8 +12,11 @@ use super::{
     cuda::shared_cuda,
     profile::{RAY_FIELDS, RayProfile, write_ray_profile},
 };
-use crate::simulation::{
-    BINARY_DISK_INNER_RS, SCHWARZSCHILD_RADIUS, kerr_horizon_radius, kerr_isco_radius,
+use crate::{
+    simulation::{
+        BINARY_DISK_INNER_RS, SCHWARZSCHILD_RADIUS, kerr_horizon_radius, kerr_isco_radius,
+    },
+    swarm::{Swarm, swarm_bodies},
 };
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
@@ -99,6 +102,8 @@ pub struct GeodesicPipeline {
     bound_other_sky_handle: Option<Handle<Image>>,
     last_objects: Option<GpuObjectsUniform>,
     last_disk: Option<GpuDiskUniform>,
+    swarm_buf: CudaSlice<u8>,
+    swarm_count: u32,
 }
 
 pub fn init_geodesic_pipeline(mut commands: Commands) {
@@ -127,6 +132,8 @@ pub fn init_geodesic_pipeline(mut commands: Commands) {
         bound_other_sky_handle: None,
         last_objects: None,
         last_disk: None,
+        swarm_buf: cuda.alloc_zeros::<u8>(16),
+        swarm_count: 0,
     });
 }
 
@@ -168,6 +175,7 @@ pub struct GeodesicSources<'w> {
     disk_config: Option<Res<'w, DiskConfigUniform>>,
     skybox_data: Option<Res<'w, SkyboxData>>,
     other_skybox_data: Option<Res<'w, OtherSkyboxData>>,
+    swarm: Option<Res<'w, Swarm>>,
 }
 
 pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets<GpuImage>>) {
@@ -234,6 +242,19 @@ pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets
     if pipeline.last_disk != Some(gpu_disk) {
         cuda.memcpy_htod(bytemuck::bytes_of(&gpu_disk), &mut pipeline.disk_buf);
         pipeline.last_disk = Some(gpu_disk);
+    }
+
+    // Swarm phases move every frame, so upload them whenever bodies are shown.
+    pipeline.swarm_count = 0;
+    if let Some(swarm) = sources.swarm.filter(|swarm| swarm.count > 0) {
+        let bodies = swarm_bodies(swarm.count, disk_config.spin, swarm.time);
+        let bytes = bytemuck::cast_slice(&bodies);
+        if pipeline.swarm_buf.len() == bytes.len() {
+            cuda.memcpy_htod(bytes, &mut pipeline.swarm_buf);
+        } else {
+            pipeline.swarm_buf = cuda.clone_htod(bytes);
+        }
+        pipeline.swarm_count = swarm.count;
     }
 
     // Output geodesic buffer — reallocate when handle or resolution changes.
@@ -387,6 +408,8 @@ pub fn dispatch_geodesic(
         ref mut geodesic_buf,
         ref skybox_buf,
         ref other_skybox_buf,
+        ref swarm_buf,
+        swarm_count,
         width,
         height,
         sky_width,
@@ -428,6 +451,27 @@ pub fn dispatch_geodesic(
         return;
     }
     let enabled = active_experiments(single_source, experiments.as_deref());
+    if swarm_count > 0 {
+        let mut builder = cuda.stream.launch_builder(&cuda.geodesic_swarm);
+        builder.arg(geodesic_buf);
+        builder.arg(camera_buf);
+        builder.arg(disk_buf);
+        builder.arg(objects_buf);
+        builder.arg(skybox_buf);
+        builder.arg(&width);
+        builder.arg(&height);
+        builder.arg(&sky_width);
+        builder.arg(&sky_height);
+        builder.arg(swarm_buf);
+        builder.arg(&swarm_count);
+        builder.arg(&enabled);
+        unsafe {
+            builder
+                .launch(cfg)
+                .expect("CUDA bh_geodesic_swarm kernel launch failed");
+        }
+        return;
+    }
     let kernel = match enabled {
         0 => &cuda.geodesic,
         1 => &cuda.geodesic_early_capture,
@@ -662,4 +706,257 @@ pub(super) fn check_relativity() {
         "intensity fast path changed the disk RGB, energy or opacity"
     );
     super::verification::check_convergence(&data);
+}
+
+#[cfg(test)]
+mod swarm_gpu {
+    use super::*;
+    use crate::{
+        simulation::{KERR_SPIN, default_binary_spins, scene_objects},
+        swarm::GpuSwarmBody,
+    };
+
+    const SPIN: f32 = KERR_SPIN;
+    const WIDTH: u32 = 400;
+    const HEIGHT: u32 = 300;
+
+    struct Scene {
+        camera: CudaSlice<u8>,
+        disk: CudaSlice<u8>,
+        objects: CudaSlice<u8>,
+        sky: CudaSlice<f32>,
+    }
+
+    /// The default single-hole view.
+    fn single_hole() -> Scene {
+        let cuda = shared_cuda();
+        let cam = crate::camera::OrbitalCamera::default();
+        let camera = GpuCameraUniform {
+            pos: cam.position().into(),
+            right: cam.right().into(),
+            up: cam.up().into(),
+            forward: cam.forward().into(),
+            tan_half_fov: cam.tan_half_fov(),
+            aspect: 4.0 / 3.0,
+            max_iter: cam.max_iter,
+            frequency_ghz: cam.frequency_ghz,
+            faraday_depth: cam.faraday_depth,
+            conversion_depth: cam.conversion_depth,
+            ..GpuCameraUniform::zeroed()
+        };
+        let mut objects = GpuObjectsUniform::zeroed();
+        let scene = scene_objects(SPIN, false, false, 0.0, default_binary_spins());
+        objects.num_objects = scene.len() as i32;
+        for (i, object) in scene.iter().enumerate() {
+            objects.pos_radius[i] = object.position.extend(object.radius).into();
+            objects.color[i] = object.color.into();
+            objects.mass[i][0] = object.mass;
+            objects.spin[i] = object.spin.extend(0.0).into();
+        }
+        let disk = build_disk_uniform(&DiskConfigUniform {
+            spin: SPIN,
+            binary_enabled: false,
+            ..DiskConfigUniform::default()
+        });
+        Scene {
+            camera: cuda.clone_htod(bytemuck::bytes_of(&camera)),
+            disk: cuda.clone_htod(bytemuck::bytes_of(&disk)),
+            objects: cuda.clone_htod(bytemuck::bytes_of(&objects)),
+            // A 2×1 sky, so the escape direction shows up in the image.
+            sky: cuda.clone_htod(&[0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0]),
+        }
+    }
+
+    /// Renders with `bh_geodesic`, or with `bh_geodesic_swarm` when bodies are given.
+    fn render(scene: &Scene, swarm: Option<(&CudaSlice<u8>, u32)>) -> (Vec<f32>, f64) {
+        let cuda = shared_cuda();
+        let mut output = cuda.alloc_zeros::<f32>((WIDTH * HEIGHT * 4) as usize);
+        let count = swarm.map_or(0, |(_, count)| count);
+        let kernel = if swarm.is_some() {
+            &cuda.geodesic_swarm
+        } else {
+            &cuda.geodesic
+        };
+        let mut builder = cuda.stream.launch_builder(kernel);
+        builder.arg(&mut output);
+        builder.arg(&scene.camera);
+        builder.arg(&scene.disk);
+        builder.arg(&scene.objects);
+        builder.arg(&scene.sky);
+        builder.arg(&WIDTH);
+        builder.arg(&HEIGHT);
+        builder.arg(&2u32);
+        builder.arg(&1u32);
+        if let Some((bodies, _)) = swarm {
+            builder.arg(bodies);
+            builder.arg(&count);
+            builder.arg(&0u32);
+        }
+        cuda.stream.synchronize().unwrap();
+        let start = std::time::Instant::now();
+        unsafe {
+            builder
+                .launch(ray_launch_config(WIDTH, HEIGHT, true))
+                .unwrap()
+        };
+        cuda.stream.synchronize().unwrap();
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        drop(builder);
+        (cuda.clone_dtoh(&output), elapsed)
+    }
+
+    fn upload(bodies: &[GpuSwarmBody]) -> CudaSlice<u8> {
+        shared_cuda().clone_htod(bytemuck::cast_slice(bodies))
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn an_empty_swarm_renders_the_ordinary_image() {
+        let scene = single_hole();
+        let empty = upload(&swarm_bodies(1, SPIN, 0.0));
+        let (ordinary, _) = render(&scene, None);
+        let (swarm, _) = render(&scene, Some((&empty, 0)));
+        assert!(
+            ordinary
+                .iter()
+                .map(|v| v.to_bits())
+                .eq(swarm.iter().map(|v| v.to_bits()))
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn swarm_hits_match_exact_circular_orbits() {
+        let cuda = shared_cuda();
+        let bodies = swarm_bodies(4096, SPIN, 1234.5);
+        let d_bodies = upload(&bodies);
+        // Deterministic segments: half start next to a body, half anywhere in the belt.
+        let mut seed = 0x2545_f491_u64;
+        let mut uniform = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut cases = Vec::new();
+        for i in 0..4000 {
+            let t0 = -400.0 * uniform();
+            let start: [f64; 3] = if i % 2 == 0 {
+                let c = bodies[(uniform() * 4096.0) as usize].center(t0);
+                std::array::from_fn(|k| c[k] + 1.2 * (uniform() - 0.5))
+            } else {
+                [
+                    90.0 * (uniform() - 0.5),
+                    16.0 * (uniform() - 0.5),
+                    90.0 * (uniform() - 0.5),
+                ]
+            };
+            let dir: [f64; 3] = std::array::from_fn(|_| uniform() - 0.5);
+            let norm = dir.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let length = 0.5 + 5.5 * uniform();
+            // Light moves backward in time at unit speed in the flat limit.
+            let end: [f64; 3] = std::array::from_fn(|k| start[k] + length * dir[k] / norm);
+            cases.push((start, end, t0, t0 - length));
+        }
+        let packed: Vec<[f32; 4]> = cases
+            .iter()
+            .flat_map(|(s, e, t0, t1)| {
+                [
+                    [s[0] as f32, s[1] as f32, s[2] as f32, *t0 as f32],
+                    [e[0] as f32, e[1] as f32, e[2] as f32, *t1 as f32],
+                ]
+            })
+            .collect();
+        let d_cases = cuda.clone_htod(&packed);
+        let count = cases.len() as u32;
+        let mut d_results = cuda.alloc_zeros::<f32>(cases.len() * 4);
+        let function = cuda.module.load_function("bh_test_swarm_segment").unwrap();
+        let mut builder = cuda.stream.launch_builder(&function);
+        builder.arg(&d_cases);
+        builder.arg(&d_bodies);
+        builder.arg(&4096u32);
+        builder.arg(&mut d_results);
+        builder.arg(&count);
+        unsafe { builder.launch(LaunchConfig::for_num_elems(count)).unwrap() };
+        drop(builder);
+        let results = cuda.clone_dtoh(&d_results);
+
+        let (mut hits, mut misses, mut ambiguous, mut wrong) = (0, 0, 0, Vec::new());
+        for (case, gpu) in cases.iter().zip(results.as_chunks::<4>().0) {
+            let (start, end, t0, t1) = *case;
+            let gpu_hit = gpu[3] > 0.0;
+            // Exact motion, sampled finely enough that the minimum is within 2e-3.
+            let mut certain_hit = false;
+            let mut near = false;
+            for body in &bodies {
+                let c = body.center(t0);
+                let mid = (0..3)
+                    .map(|k| (0.5 * (start[k] + end[k]) - c[k]).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                if mid > 12.0 {
+                    continue;
+                }
+                let radius = f64::from(body.axis_b[3]);
+                let turn = f64::from(body.orbit[1]) * (t1 - t0);
+                let pad = 0.125 * f64::from(body.axis_a[3]) * turn * turn;
+                let gap = (0..=4096)
+                    .map(|j| {
+                        let s = j as f64 / 4096.0;
+                        let c = body.center(t0 + s * (t1 - t0));
+                        (0..3)
+                            .map(|k| (start[k] + s * (end[k] - start[k]) - c[k]).powi(2))
+                            .sum::<f64>()
+                            .sqrt()
+                            - radius
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                certain_hit |= gap < -0.01;
+                near |= (-0.01..=pad + 0.01).contains(&gap);
+            }
+            if certain_hit {
+                hits += 1;
+                if !gpu_hit {
+                    wrong.push(("missed", start, t0));
+                }
+            } else if near {
+                ambiguous += 1;
+            } else {
+                misses += 1;
+                if gpu_hit {
+                    wrong.push(("false hit", start, t0));
+                }
+            }
+        }
+        println!(
+            "{hits} hits, {misses} misses, {ambiguous} within the padding; {} wrong",
+            wrong.len()
+        );
+        assert!(hits > 300 && misses > 500, "too few decisive cases");
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(5)]);
+    }
+
+    /// Brute-force baseline for space-time acceleration structures.
+    #[test]
+    #[ignore = "requires a CUDA GPU; benchmark, run with --release -- --ignored --nocapture"]
+    fn swarm_brute_force_cost() {
+        let scene = single_hole();
+        for count in crate::swarm::SWARM_COUNTS.into_iter().chain([16384]) {
+            let bodies = upload(&swarm_bodies(count.max(1), SPIN, 1000.0));
+            let swarm = Some((&bodies, count));
+            render(&scene, swarm);
+            let mut times: Vec<f64> = (0..5).map(|_| render(&scene, swarm).1).collect();
+            times.sort_by(f64::total_cmp);
+            let (image, _) = render(&scene, swarm);
+            std::fs::write(
+                format!("target/swarm-{count}.rgba32f"),
+                bytemuck::cast_slice(&image),
+            )
+            .unwrap();
+            println!(
+                "{count:>6} bodies: median {:7.1} ms over 5 launches",
+                times[2]
+            );
+        }
+    }
 }

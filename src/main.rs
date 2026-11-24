@@ -9,6 +9,7 @@ mod compute;
 mod controller;
 mod grid;
 mod simulation;
+mod swarm;
 mod ui;
 
 fn main() {
@@ -33,6 +34,7 @@ fn main() {
     .add_plugins(FrameTimeDiagnosticsPlugin::default())
     .add_plugins(camera::OrbitalCameraPlugin)
     .add_plugins(simulation::SimulationPlugin)
+    .add_plugins(swarm::SwarmPlugin)
     .add_plugins(bridge::BridgePlugin)
     .add_plugins(grid::GridPlugin)
     .add_plugins(compute::GeodesicComputePlugin)

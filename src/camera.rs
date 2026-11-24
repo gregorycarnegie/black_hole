@@ -3,6 +3,7 @@ use bevy::{
         InputSystems,
         mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
     },
+    picking::{hover::HoverMap, pointer::PointerId},
     prelude::*,
 };
 use std::f64::consts::PI;
@@ -143,6 +144,7 @@ fn setup_cameras(mut commands: Commands) {
     ));
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy system parameters
 pub(crate) fn update_orbital_camera(
     mut cam: ResMut<OrbitalCamera>,
     mouse_button: Res<ButtonInput<MouseButton>>,
@@ -151,8 +153,18 @@ pub(crate) fn update_orbital_camera(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     gamepads: Query<&Gamepad>,
+    hover_map: Option<Res<HoverMap>>,
+    ui_nodes: Query<(), With<Node>>,
+    mut drag_from_ui: Local<bool>,
 ) {
-    cam.dragging = mouse_button.pressed(MouseButton::Left);
+    if mouse_button.just_pressed(MouseButton::Left) {
+        // A click on a panel must not orbit the camera. The display sprite is always hovered, so only UI nodes count.
+        *drag_from_ui = hover_map
+            .as_ref()
+            .and_then(|map| map.get(&PointerId::Mouse))
+            .is_some_and(|hits| hits.keys().any(|&entity| ui_nodes.contains(entity)));
+    }
+    cam.dragging = mouse_button.pressed(MouseButton::Left) && !*drag_from_ui;
     cam.is_moving = false;
 
     if cam.dragging && mouse_motion.delta != Vec2::ZERO {
@@ -495,6 +507,47 @@ mod tests {
             let elevation = (start.elevation - dy as f64 * start.orbit_speed).clamp(0.01, PI - 0.01);
             prop_assert!((cam.elevation - elevation).abs() < 1e-9);
         }
+    }
+
+    #[rstest]
+    #[case::over_panel(true, false)]
+    #[case::over_scene(false, true)]
+    fn drags_that_start_on_the_ui_do_not_orbit(#[case] on_ui: bool, #[case] orbits: bool) {
+        let mut app = input_app();
+        // The display sprite is hovered everywhere; a panel node only where the UI is.
+        let mut hits = vec![app.world_mut().spawn_empty().id()];
+        if on_ui {
+            hits.push(app.world_mut().spawn(Node::default()).id());
+        }
+        let mut map = HoverMap::default();
+        map.insert(
+            PointerId::Mouse,
+            hits.into_iter()
+                .map(|entity| {
+                    (
+                        entity,
+                        bevy::picking::backend::HitData::new(entity, 0.0, None, None),
+                    )
+                })
+                .collect(),
+        );
+        app.insert_resource(map);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(5.0, 3.0);
+        app.update();
+        // Still held after the pointer leaves the panel.
+        app.world_mut().resource_mut::<HoverMap>().clear();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        app.update();
+        let cam = app.world().resource::<OrbitalCamera>();
+        assert_eq!(cam.dragging, orbits);
+        assert_eq!(cam.azimuth != OrbitalCamera::default().azimuth, orbits);
     }
 
     #[test]
