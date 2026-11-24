@@ -13,6 +13,8 @@ use bevy::{
 };
 
 pub use black_hole::cuda;
+#[cfg(feature = "optix")]
+mod optix;
 mod pipeline;
 pub(crate) mod profile;
 #[cfg(test)]

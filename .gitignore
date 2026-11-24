@@ -3,6 +3,8 @@
 /tools/cuda/oxide/target/
 /tools/cuda/oxide/*.ll
 /tools/cuda/oxide/*.ptx
+/tools/optix/target/
+/tools/optix/*.ll
 
 ##### Claude Code
 .claude/
