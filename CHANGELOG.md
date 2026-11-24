@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `--profile-renderer` runs a windowed close-up benchmark and reports the median and 95th-percentile frame intervals for a still and an orbiting camera. It then writes per-ray diagnostics (steps, rejections, exit reason, sky direction, Stokes values) to `target/renderer-rays*.csv` and checks that the diagnostic image matches the normal kernel.
+- Opt-in single-hole ray experiments: `--experiment-early-capture` ends inward rays once a binary64 check of the Kerr radial potential rules out a turning point before the horizon. The Lean lemmas in `verification/BlackHole/KerrCapture.lean` prove that check in exact arithmetic. `--experiment-far-field` takes larger outward steps outside a sphere enclosing the disk and the hole. Together they cut the polarized close-up from about 177 ms to 29–32 ms per frame on an RTX 4090. All exit classifications match the full trace, and sky directions shift by at most 0.72 microradians. `RENDERING_PERFORMANCE.md` records the measurements.
+- GPU regressions for early capture against the analytic equatorial Kerr potential at five spins, and for near-critical Schwarzschild classification with a disk inner edge.
+
+### Changed
+
+- The RK4 controller shares the initial derivative between the coarse step, the first half-step and every retry. It also returns the accepted endpoint metric to the renderer instead of recomputing it. Plasma samples and endpoint validity checks skip the metric derivatives they never read. Output is unchanged bit for bit.
+- Single-source Kerr scenes launch with 32×4 CUDA blocks, so that each warp traces one scanline. With the RK4 reuse, the single-hole thin-disk ray kernel dropped from 184 to 123 ms at 400×300.
+- Updated rstest to 0.29.0.
+
 ## 0.5.0 - 2026-11-08
 
 ### Added

@@ -7,8 +7,10 @@ use bytemuck::Zeroable;
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 use super::{
-    CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform, OtherSkyboxData, SkyboxData,
+    CameraUniform, DiskConfigUniform, GeodesicImage, ObjectsUniform, OtherSkyboxData,
+    RayExperiments, SkyboxData,
     cuda::shared_cuda,
+    profile::{RAY_FIELDS, RayProfile, write_ray_profile},
 };
 use crate::simulation::{
     BINARY_DISK_INNER_RS, SCHWARZSCHILD_RADIUS, kerr_horizon_radius, kerr_isco_radius,
@@ -357,6 +359,7 @@ pub fn dispatch_geodesic(
     pipeline: Option<ResMut<GeodesicPipeline>>,
     camera: Option<Res<CameraUniform>>,
     view: Option<Res<crate::bridge::BridgeView>>,
+    experiments: Option<Res<RayExperiments>>,
 ) {
     let Some(mut pipeline) = pipeline else {
         return;
@@ -372,6 +375,11 @@ pub fn dispatch_geodesic(
     let cuda = shared_cuda();
     cuda.bind_to_thread();
 
+    let wormhole = camera.is_some_and(|camera| camera.wormhole_radius > 0.0);
+    let single_source = pipeline
+        .last_objects
+        .as_ref()
+        .is_some_and(|objects| objects.num_objects == 1);
     let GeodesicPipeline {
         ref camera_buf,
         ref disk_buf,
@@ -388,12 +396,8 @@ pub fn dispatch_geodesic(
         ..
     } = *pipeline;
 
-    let cfg = LaunchConfig {
-        grid_dim: (width.div_ceil(16), height.div_ceil(16), 1),
-        block_dim: (16, 16, 1),
-        shared_mem_bytes: 0,
-    };
-    if camera.is_some_and(|camera| camera.wormhole_radius > 0.0) {
+    let cfg = ray_launch_config(width, height, !wormhole && single_source);
+    if wormhole {
         // Reuse the near sky until the second asynchronous asset has loaded.
         let (far_sky, far_w, far_h) = if other_sky_width > 0 && other_sky_height > 0 {
             (other_skybox_buf, other_sky_width, other_sky_height)
@@ -423,7 +427,13 @@ pub fn dispatch_geodesic(
         }
         return;
     }
-    let mut builder = cuda.stream.launch_builder(&cuda.geodesic);
+    let enabled = active_experiments(single_source, experiments.as_deref());
+    let kernel = match enabled {
+        0 => &cuda.geodesic,
+        1 => &cuda.geodesic_early_capture,
+        _ => &cuda.geodesic_far_field,
+    };
+    let mut builder = cuda.stream.launch_builder(kernel);
     builder.arg(geodesic_buf);
     builder.arg(camera_buf);
     builder.arg(disk_buf);
@@ -433,11 +443,92 @@ pub fn dispatch_geodesic(
     builder.arg(&height);
     builder.arg(&sky_width);
     builder.arg(&sky_height);
+    let early_capture = enabled & 1;
+    if enabled & 2 != 0 {
+        builder.arg(&early_capture);
+    }
     unsafe {
         builder
             .launch(cfg)
             .expect("CUDA bh_geodesic kernel launch failed");
     }
+}
+
+fn active_experiments(single_source: bool, experiments: Option<&RayExperiments>) -> u32 {
+    if let Some(experiments) = experiments.filter(|_| single_source) {
+        u32::from(experiments.early_capture) | (u32::from(experiments.far_field) << 1)
+    } else {
+        0
+    }
+}
+
+fn ray_launch_config(width: u32, height: u32, single_source_kerr: bool) -> LaunchConfig {
+    // Keep each warp on one scanline for the single-source Kerr kernel.
+    let (block_width, block_height) = if single_source_kerr {
+        (32, 4)
+    } else {
+        (16, 16)
+    };
+    LaunchConfig {
+        grid_dim: (
+            width.div_ceil(block_width),
+            height.div_ceil(block_height),
+            1,
+        ),
+        block_dim: (block_width, block_height, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+pub(super) fn capture_ray_profile(
+    request: Res<RayProfile>,
+    pipeline: Res<GeodesicPipeline>,
+    experiments: Option<Res<RayExperiments>>,
+) {
+    if !request.requested() || pipeline.width == 0 || pipeline.sky_width == 0 {
+        return;
+    }
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+    let pixels = pipeline.width as usize * pipeline.height as usize;
+    let mut image = cuda.alloc_zeros::<f32>(pixels * 4);
+    let mut diagnostics = cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);
+    let kernel = cuda
+        .module
+        .load_function("bh_geodesic_diagnostics")
+        .expect("load ray diagnostic kernel");
+    let single_source = pipeline
+        .last_objects
+        .as_ref()
+        .is_some_and(|objects| objects.num_objects == 1);
+    let cfg = ray_launch_config(pipeline.width, pipeline.height, single_source);
+    let enabled = active_experiments(single_source, experiments.as_deref());
+    let mut launch = cuda.stream.launch_builder(&kernel);
+    launch.arg(&mut image);
+    launch.arg(&pipeline.camera_buf);
+    launch.arg(&pipeline.disk_buf);
+    launch.arg(&pipeline.objects_buf);
+    launch.arg(&pipeline.skybox_buf);
+    launch.arg(&pipeline.width);
+    launch.arg(&pipeline.height);
+    launch.arg(&pipeline.sky_width);
+    launch.arg(&pipeline.sky_height);
+    launch.arg(&mut diagnostics);
+    launch.arg(&enabled);
+    unsafe { launch.launch(cfg).expect("launch ray diagnostic kernel") };
+    let data = cuda.clone_dtoh(&diagnostics);
+    write_ray_profile(pipeline.width, pipeline.height, &data, enabled)
+        .expect("write ray diagnostic CSV");
+
+    let reference = cuda.clone_dtoh(&pipeline.geodesic_buf);
+    let diagnostic_image = cuda.clone_dtoh(&image);
+    let largest_delta = reference
+        .iter()
+        .zip(diagnostic_image)
+        .map(|(normal, diagnostic)| (normal - diagnostic).abs())
+        .fold(0.0_f32, f32::max);
+    println!("Diagnostic image maximum channel difference {largest_delta:.3e}");
+    request.complete();
 }
 
 #[cfg(test)]

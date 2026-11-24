@@ -149,10 +149,10 @@ fn adaptive_controller_misses_trajectory_targets() {
 #[ignore = "requires a GPU; run with --release -- --ignored"]
 fn classification_against_the_critical_impact_parameter() {
     let critical = 27.0_f64.sqrt() * MASS;
-    let run = |impacts: &[f32]| {
+    let run = |impacts: &[f32], disk_inner: f32| {
         let mut input = Vec::new();
         for &impact in impacts {
-            for value in [impact, 0.0, 0.0, 0.0] {
+            for value in [impact, disk_inner, 0.0, 0.0] {
                 input.extend_from_slice(&value.to_le_bytes());
             }
         }
@@ -195,7 +195,7 @@ fn classification_against_the_critical_impact_parameter() {
     // Coarse pass to locate the critical impact, then every binary32 impact in
     // a window around it.
     let coarse: Vec<f32> = (0..64).map(|i| 5.0 + 0.4 * i as f32 / 63.0).collect();
-    let rays = run(&coarse);
+    let rays = run(&coarse, 0.0);
     let index = rays.iter().position(|r| r.3 < 0.0).unwrap();
     let centre = coarse[index - 1] + (coarse[index] - coarse[index - 1])
         * (rays[index - 1].3 / (rays[index - 1].3 - rays[index].3)) as f32;
@@ -206,28 +206,85 @@ fn classification_against_the_critical_impact_parameter() {
         impact = f32::from_bits(impact.to_bits() + 1);
     }
     let mut wrong = Vec::new();
-    let mut counts = [0; 4];
-    for (impact, (b, status, steps, margin)) in fine.iter().zip(run(&fine)) {
-        counts[status as usize] += 1;
-        // Positive margin: E² exceeds the potential barrier, so the ray is captured.
-        let exact = if margin > 0.0 { 1 } else { 2 };
-        if (status == 1 || status == 2) && status != exact {
-            wrong.push((*impact, b - critical, margin, status, steps));
+    for disk_inner in [0.0, 4.0] {
+        let mut counts = [0; 5];
+        for (impact, (b, status, steps, margin)) in fine.iter().zip(run(&fine, disk_inner)) {
+            counts[status as usize] += 1;
+            // Positive margin: E² exceeds the potential barrier, so the ray is captured.
+            let exact = if margin > 0.0 { 1 } else { 2 };
+            let result = if status == 4 { 1 } else { status };
+            if (result == 1 || result == 2) && result != exact {
+                wrong.push((*impact, b - critical, margin, status, steps));
+            }
         }
+        println!(
+            "critical b = {critical}; window {:?}..{:?}; statuses captured/escaped/unresolved/early: {}/{}/{}/{}",
+            fine[0], fine[255], counts[1], counts[2], counts[0] + counts[3], counts[4]
+        );
     }
-    println!(
-        "critical b = {critical}; window {:?}..{:?}; statuses captured/escaped/unresolved: {}/{}/{}",
-        fine[0], fine[255], counts[1], counts[2], counts[3]
-    );
     for (impact, offset, margin, status, steps) in wrong.iter().take(8) {
         println!(
             "misclassified impact {impact}: b - b_c = {offset:.3e}, (E² - V_max)/E² = {margin:.3e}, \
              status {status}, {steps} steps"
         );
     }
-    println!("{} of 256 rays misclassified", wrong.len());
+    println!("{} disagreements across the two 256-ray runs", wrong.len());
     assert!(
         wrong.is_empty(),
         "resolved near-critical rays must match the reference"
     );
+}
+
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn kerr_early_capture_matches_the_equatorial_radial_potential() {
+    const CASES: usize = 801;
+    for spin in [-0.99_f32, -0.82, 0.0, 0.82, 0.99] {
+        let a = f64::from(spin);
+        let horizon = 1.0 + (1.0 - a * a).sqrt();
+        let mut objects = vec![0u8; 1040];
+        objects[..4].copy_from_slice(&1i32.to_le_bytes());
+        objects[528..532].copy_from_slice(&1f32.to_le_bytes());
+        objects[788..792].copy_from_slice(&spin.to_le_bytes());
+        let run = |disk_inner: f32| {
+            let cases: Vec<f32> = (0..CASES)
+                .flat_map(|i| [-8.0 + 0.02 * i as f32, disk_inner, 0.0, 0.0])
+                .collect();
+            crate::gpu::controller_classify(&objects, bytemuck::cast_slice(&cases), CASES as u32)
+        };
+        let baseline = run(0.0);
+        if spin == 0.82 {
+            assert_eq!(
+                run(1.0),
+                baseline,
+                "a disk extending to the horizon must keep the full trace"
+            );
+        }
+        let optimized = run(4.0);
+        let mut early = 0;
+        let mut saved_steps = 0;
+        for (old, new) in baseline.as_chunks::<16>().0.iter().zip(optimized.as_chunks::<16>().0) {
+            let [x, z, pt, px, pz] = [new[0], new[2], new[4], new[5], new[7]].map(f64::from);
+            let lambda = (z * px - x * pz) / -pt;
+            // For equatorial null rays R(r)/r is a cubic with at most one exterior minimum.
+            let min_r = ((lambda * lambda - a * a).max(0.0) / 3.0)
+                .sqrt()
+                .max(horizon);
+            let minimum = min_r * (min_r * min_r + a * a - lambda * lambda)
+                + 2.0 * (lambda - a).powi(2);
+            if old[3] == 2.0 {
+                assert_eq!(new[3], 2.0, "baseline escape changed at spin {a}, λ {lambda}");
+            }
+            if new[3] == 4.0 {
+                assert!(
+                    minimum > 0.0,
+                    "early capture with an exterior radial turn at spin {a}, λ {lambda}, minimum {minimum}"
+                );
+                early += 1;
+                saved_steps += old[11] as u32 - new[11] as u32;
+            }
+        }
+        println!("spin {spin} early-captured {early}/{CASES}, saved {saved_steps} steps");
+        assert!(early > 0 && saved_steps > 0);
+    }
 }

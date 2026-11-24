@@ -23,6 +23,7 @@ public import BlackHole.PlasmaEmission
 public import BlackHole.PlasmaFluid
 public import BlackHole.Orbits
 public import BlackHole.KerrGeodesics
+public import BlackHole.KerrCapture
 public import BlackHole.KerrEquatorial
 public import BlackHole.SnapshotChart
 public import BlackHole.RayConditioning

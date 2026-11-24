@@ -14,6 +14,7 @@ use bevy::{
 
 pub use black_hole::cuda;
 mod pipeline;
+pub(crate) mod profile;
 #[cfg(test)]
 mod verification;
 use pipeline::{dispatch_geodesic, init_geodesic_pipeline, prepare_bind_group};
@@ -28,6 +29,19 @@ use crate::{
 };
 
 pub struct GeodesicComputePlugin;
+
+#[derive(Resource)]
+pub(super) struct RayExperiments {
+    early_capture: bool,
+    far_field: bool,
+}
+
+pub(crate) fn enable_ray_experiments(app: &mut App, early_capture: bool, far_field: bool) {
+    app.sub_app_mut(RenderApp).insert_resource(RayExperiments {
+        early_capture,
+        far_field,
+    });
+}
 
 // ── Resources extracted from main world → render world ──────────────────────
 

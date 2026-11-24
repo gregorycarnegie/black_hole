@@ -143,7 +143,7 @@ fn setup_cameras(mut commands: Commands) {
     ));
 }
 
-fn update_orbital_camera(
+pub(crate) fn update_orbital_camera(
     mut cam: ResMut<OrbitalCamera>,
     mouse_button: Res<ButtonInput<MouseButton>>,
     mouse_motion: Res<AccumulatedMouseMotion>,

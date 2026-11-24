@@ -1231,6 +1231,11 @@ fn flat_metric() -> Metric {
 
 #[cuda_device::device]
 fn add_kerr(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
+    add_kerr_fields::<true>(base, x, mass, spin)
+}
+
+#[inline(always)]
+fn add_kerr_fields<const DERIVATIVES: bool>(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
     let mut m = base;
     if mass <= 0.0 {
         return m;
@@ -1253,19 +1258,21 @@ fn add_kerr(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
     let numerator = r * x - a.cross(x) + (ax * inv_r) * a;
     let ell = vec4_f_v3(1.0, numerator * inv_r2_a2);
     let ll = outer(ell, ell);
-    let inv_dr = 1.0 / (2.0 * r2 - x.dot(x) + a2).max(1.0e-12);
-    let dr = (r * x + (ax * inv_r) * a) * inv_dr;
-    // Constant axes keep the derivative matrices in registers instead of local memory.
-    let derivative = |ej: Vec3, dr_j: f32, a_j: f32| {
-        let dh = h * (3.0 * dr_j * inv_r - (4.0 * r * r2 * dr_j + 2.0 * ax * a_j) * inv_den);
-        let dn = dr_j * x + r * ej - a.cross(ej) + (a_j * inv_r - ax * dr_j * inv_r2) * a;
-        let dl = vec4_f_v3(0.0, (dn - ell.yzw() * 2.0 * r * dr_j) * inv_r2_a2);
-        2.0 * dh * ll + 2.0 * h * (outer(dl, ell) + outer(ell, dl))
-    };
     m.g += 2.0 * h * ll;
-    m.dx += derivative(vec3(1.0, 0.0, 0.0), dr.x, a.x);
-    m.dy += derivative(vec3(0.0, 1.0, 0.0), dr.y, a.y);
-    m.dz += derivative(vec3(0.0, 0.0, 1.0), dr.z, a.z);
+    if DERIVATIVES {
+        let inv_dr = 1.0 / (2.0 * r2 - x.dot(x) + a2).max(1.0e-12);
+        let dr = (r * x + (ax * inv_r) * a) * inv_dr;
+        // Constant axes keep the derivative matrices in registers instead of local memory.
+        let derivative = |ej: Vec3, dr_j: f32, a_j: f32| {
+            let dh = h * (3.0 * dr_j * inv_r - (4.0 * r * r2 * dr_j + 2.0 * ax * a_j) * inv_den);
+            let dn = dr_j * x + r * ej - a.cross(ej) + (a_j * inv_r - ax * dr_j * inv_r2) * a;
+            let dl = vec4_f_v3(0.0, (dn - ell.yzw() * 2.0 * r * dr_j) * inv_r2_a2);
+            2.0 * dh * ll + 2.0 * h * (outer(dl, ell) + outer(ell, dl))
+        };
+        m.dx += derivative(vec3(1.0, 0.0, 0.0), dr.x, a.x);
+        m.dy += derivative(vec3(0.0, 1.0, 0.0), dr.y, a.y);
+        m.dz += derivative(vec3(0.0, 0.0, 1.0), dr.z, a.z);
+    }
     let raised = m.inv * ell;
     let divisor = 1.0 + 2.0 * h * ell.dot(raised);
     if divisor <= 1.0e-6 {
@@ -1279,19 +1286,32 @@ fn add_kerr(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
 
 #[cuda_device::device]
 fn scene_metric(pos: Vec3, objects: &Objects) -> Metric {
+    scene_metric_fields::<true>(pos, objects)
+}
+
+#[inline(always)]
+fn scene_metric_fields<const DERIVATIVES: bool>(pos: Vec3, objects: &Objects) -> Metric {
     let mut m = flat_metric();
     let mut i = 0i32;
     while i < objects.num_objects {
         let idx = i as usize;
-        m = add_kerr(
-            m,
-            pos - objects.pos_radius[idx].xyz(),
-            objects.mass[idx].x.max(0.0),
-            objects.spin[idx].xyz(),
-        );
+        let x = pos - objects.pos_radius[idx].xyz();
+        let mass = objects.mass[idx].x.max(0.0);
+        let spin = objects.spin[idx].xyz();
+        m = if DERIVATIVES {
+            add_kerr(m, x, mass, spin)
+        } else {
+            add_kerr_fields::<false>(m, x, mass, spin)
+        };
         i += 1;
     }
     m
+}
+
+#[cuda_device::device]
+fn plasma_metric(pos: Vec3, objects: &Objects) -> (Mat4, Mat4) {
+    let m = scene_metric_fields::<false>(pos, objects);
+    (m.g, m.inv)
 }
 
 #[inline(always)]
@@ -1397,6 +1417,11 @@ fn ray_valid(ray: Ray, m: Metric) -> bool {
         && ray.screen.abs().all_lt(1.0e8)
 }
 
+#[cuda_device::device]
+fn ray_endpoint_valid(ray: Ray, objects: &Objects) -> bool {
+    ray_valid(ray, scene_metric_fields::<false>(ray.pos, objects))
+}
+
 #[inline(always)]
 fn ray_rhs(ray: Ray, m: Metric, gauged: bool) -> Derivs {
     let mut result = geodesic_rhs(ray, m);
@@ -1411,30 +1436,26 @@ fn ray_rhs(ray: Ray, m: Metric, gauged: bool) -> Derivs {
 }
 
 #[cuda_device::device]
-fn step_ray_gauge(ray: Ray, h: f32, m: Metric, gauged: bool, objects: &Objects) -> RayStep {
-    if !ray_valid(ray, m) {
-        return RayStep { ray, valid: false };
-    }
-    let k1 = ray_rhs(ray, m, gauged);
+fn rk4_stages(ray: Ray, h: f32, k1: Derivs, gauged: bool, objects: &Objects) -> Option<Ray> {
     let r2 = rk_state(ray, k1, 0.5 * h);
     let m2 = scene_metric(r2.pos, objects);
     if !ray_valid(r2, m2) {
-        return RayStep { ray, valid: false };
+        return None;
     }
     let k2 = ray_rhs(r2, m2, gauged);
     let r3 = rk_state(ray, k2, 0.5 * h);
     let m3 = scene_metric(r3.pos, objects);
     if !ray_valid(r3, m3) {
-        return RayStep { ray, valid: false };
+        return None;
     }
     let k3 = ray_rhs(r3, m3, gauged);
     let r4 = rk_state(ray, k3, h);
     let m4 = scene_metric(r4.pos, objects);
     if !ray_valid(r4, m4) {
-        return RayStep { ray, valid: false };
+        return None;
     }
     let k4 = ray_rhs(r4, m4, gauged);
-    let next = rk_state(
+    Some(rk_state(
         ray,
         Derivs {
             pos: k1.pos + 2.0 * k2.pos + 2.0 * k3.pos + k4.pos,
@@ -1442,16 +1463,20 @@ fn step_ray_gauge(ray: Ray, h: f32, m: Metric, gauged: bool, objects: &Objects) 
             screen: k1.screen + 2.0 * k2.screen + 2.0 * k3.screen + k4.screen,
         },
         h / 6.0,
-    );
-    RayStep {
-        ray: next,
-        valid: ray_valid(next, scene_metric(next.pos, objects)),
-    }
+    ))
 }
 
 #[inline(always)]
 fn step_ray(ray: Ray, h: f32, m: Metric, objects: &Objects) -> RayStep {
-    step_ray_gauge(ray, h, m, false, objects)
+    if ray_valid(ray, m)
+        && let Some(next) = rk4_stages(ray, h, ray_rhs(ray, m, false), false, objects)
+    {
+        return RayStep {
+            ray: next,
+            valid: ray_endpoint_valid(next, objects),
+        };
+    }
+    RayStep { ray, valid: false }
 }
 
 #[inline(always)]
@@ -1472,11 +1497,23 @@ pub struct AdaptiveStep {
 fn advance_ray_gauge(
     ray: Ray,
     requested_h: f32,
-    m: Metric,
+    m: &mut Metric,
     gauged: bool,
     objects: &Objects,
 ) -> AdaptiveStep {
-    if !(requested_h > 0.0 && requested_h < 1.0e8) {
+    advance_ray_counting::<false>(ray, requested_h, m, gauged, objects, &mut 0)
+}
+
+#[inline(always)]
+fn advance_ray_counting<const DIAGNOSTICS: bool>(
+    ray: Ray,
+    requested_h: f32,
+    m: &mut Metric,
+    gauged: bool,
+    objects: &Objects,
+    rejected: &mut u32,
+) -> AdaptiveStep {
+    if !(requested_h > 0.0 && requested_h < 1.0e8 && ray_valid(ray, *m)) {
         return AdaptiveStep {
             ray,
             h: 0.0,
@@ -1484,50 +1521,58 @@ fn advance_ray_gauge(
             accepted: false,
         };
     }
-    let mut h = requested_h;
-    let mut retry = 0u32;
-    while retry < 12 {
-        let coarse = step_ray_gauge(ray, h, m, gauged, objects);
-        if coarse.valid {
-            let half = step_ray_gauge(ray, 0.5 * h, m, gauged, objects);
-            if half.valid {
-                let fine = step_ray_gauge(
-                    half.ray,
-                    0.5 * h,
-                    scene_metric(half.ray.pos, objects),
-                    gauged,
-                    objects,
-                );
-                if fine.valid {
-                    let error = relative_difference(
-                        vec4_v3_f(coarse.ray.pos, 0.0),
-                        vec4_v3_f(fine.ray.pos, 0.0),
-                    )
-                    .max(
-                        relative_difference(coarse.ray.p, fine.ray.p)
-                            .max(relative_difference(coarse.ray.screen, fine.ray.screen)),
-                    ) / 15.0;
-                    let metric = scene_metric(fine.ray.pos, objects);
-                    let null_error = fine.ray.p.dot(metric.inv * fine.ray.p).abs()
-                        / fine.ray.p.dot(fine.ray.p).max(1.0e-10);
-                    if error <= STEP_TOLERANCE
-                        && null_error < 2.0e-4
-                        && (fine.ray.pos.x != ray.pos.x
-                            || fine.ray.pos.y != ray.pos.y
-                            || fine.ray.pos.z != ray.pos.z)
-                    {
-                        return AdaptiveStep {
-                            ray: fine.ray,
-                            h,
-                            error,
-                            accepted: true,
-                        };
-                    }
-                }
-            }
+    // The coarse step, the first half step and every retry start from the same state.
+    let initial_rhs = ray_rhs(ray, *m, gauged);
+    let mut next_h = requested_h;
+    for retry in 0..12 {
+        let h = next_h;
+        next_h = 0.5 * h;
+        let Some(coarse) = rk4_stages(ray, h, initial_rhs, gauged, objects) else {
+            continue;
+        };
+        if !ray_endpoint_valid(coarse, objects) {
+            continue;
         }
-        h *= 0.5;
-        retry += 1;
+        let Some(half) = rk4_stages(ray, next_h, initial_rhs, gauged, objects) else {
+            continue;
+        };
+        let half_metric = scene_metric(half.pos, objects);
+        if !ray_valid(half, half_metric) {
+            continue;
+        }
+        let half_rhs = ray_rhs(half, half_metric, gauged);
+        let Some(fine) = rk4_stages(half, next_h, half_rhs, gauged, objects) else {
+            continue;
+        };
+        let metric = scene_metric(fine.pos, objects);
+        if !ray_valid(fine, metric) {
+            continue;
+        }
+        let error = relative_difference(vec4_v3_f(coarse.pos, 0.0), vec4_v3_f(fine.pos, 0.0))
+            .max(
+                relative_difference(coarse.p, fine.p)
+                    .max(relative_difference(coarse.screen, fine.screen)),
+            )
+            / 15.0;
+        let null_error = fine.p.dot(metric.inv * fine.p).abs() / fine.p.dot(fine.p).max(1.0e-10);
+        if error <= STEP_TOLERANCE
+            && null_error < 2.0e-4
+            && (fine.pos.x != ray.pos.x || fine.pos.y != ray.pos.y || fine.pos.z != ray.pos.z)
+        {
+            if DIAGNOSTICS {
+                *rejected += retry;
+            }
+            *m = metric;
+            return AdaptiveStep {
+                ray: fine,
+                h,
+                error,
+                accepted: true,
+            };
+        }
+    }
+    if DIAGNOSTICS {
+        *rejected += 12;
     }
     AdaptiveStep {
         ray,
@@ -1538,15 +1583,20 @@ fn advance_ray_gauge(
 }
 
 #[inline(always)]
-fn advance_ray(ray: Ray, requested_h: f32, m: Metric, objects: &Objects) -> AdaptiveStep {
-    advance_ray_gauge(ray, requested_h, m, false, objects)
+fn advance_ray(ray: Ray, requested_h: f32, mut m: Metric, objects: &Objects) -> AdaptiveStep {
+    advance_ray_gauge(ray, requested_h, &mut m, false, objects)
 }
 
 #[cuda_device::device]
 fn screen_frame(ray: Ray, m: Metric) -> Mat3 {
-    let k = m.inv * ray.p;
-    let shift = -m.inv[0].yzw() * (1.0 / m.inv[0][0]);
-    let gamma = spatial_metric(m);
+    screen_frame_at(ray, m.g, m.inv)
+}
+
+#[inline(always)]
+fn screen_frame_at(ray: Ray, g: Mat4, inv: Mat4) -> Mat3 {
+    let k = inv * ray.p;
+    let shift = -inv[0].yzw() * (1.0 / inv[0][0]);
+    let gamma = mat3(g[1].yzw(), g[2].yzw(), g[3].yzw());
     let n = spatial_unit(k.yzw() + shift * k.x, gamma);
     let f = ray.screen.yzw() - k.yzw() * (ray.screen.x / k.x);
     let e1 = spatial_unit(f - n * n.dot(gamma * f), gamma);
@@ -1900,18 +1950,18 @@ fn sample_plasma(ray: Ray, objects: &Objects, cam: &Camera, disk: &Disk) -> Plas
     if z.abs() >= 4.0 {
         return plasma;
     }
-    let m = scene_metric(ray.pos, objects);
+    let (g, inv) = plasma_metric(ray.pos, objects);
     let density = 0.4 * exp(-0.5 * z * z) * disk_edge_fade(r, disk) / height;
-    let k = m.inv * ray.p;
+    let k = inv * ray.p;
     let omega = sub_keplerian_factor(h_r) / (r * sqrt(r) + disk.spin).max(1.0e-3);
     let tangent = vec3(ray.pos.z, 0.0, -ray.pos.x);
     let mut fluid = vec4_f_v3(1.0, omega * tangent);
-    let norm = fluid.dot(m.g * fluid);
+    let norm = fluid.dot(g * fluid);
     if norm < -1.0e-4 {
         fluid *= inverse_sqrt(-norm);
     } else {
-        let lapse = inverse_sqrt(-m.inv[0][0]);
-        fluid = -lapse * m.inv[0];
+        let lapse = inverse_sqrt(-inv[0][0]);
+        fluid = -lapse * inv[0];
     }
     plasma.energy = ray.p.dot(fluid).max(1.0e-5);
     let redshift = clamp_f32(1.0 / plasma.energy, 0.01, 20.0);
@@ -1923,16 +1973,16 @@ fn sample_plasma(ray: Ray, objects: &Objects, cam: &Camera, disk: &Disk) -> Plas
         return plasma;
     }
     let freq_ratio = 230.0 / (cam.frequency_ghz / redshift).max(1.0);
-    let frame = screen_frame(ray, m);
+    let frame = screen_frame_at(ray, g, inv);
     let mut e1 = vec4_f_v3(0.0, frame[0]);
     let mut e2 = vec4_f_v3(0.0, frame[1]);
-    e1 -= k * (e1.dot(m.g * fluid) / plasma.energy);
-    e2 -= k * (e2.dot(m.g * fluid) / plasma.energy);
+    e1 -= k * (e1.dot(g * fluid) / plasma.energy);
+    e2 -= k * (e2.dot(g * fluid) / plasma.energy);
     let mut b = vec4_f_v3(0.0, tangent.normalize());
-    b += fluid * b.dot(m.g * fluid);
-    b *= inverse_sqrt(b.dot(m.g * b).max(1.0e-12));
-    let bx = b.dot(m.g * e1);
-    let by = b.dot(m.g * e2);
+    b += fluid * b.dot(g * fluid);
+    b *= inverse_sqrt(b.dot(g * b).max(1.0e-12));
+    let bx = b.dot(g * e1);
+    let by = b.dot(g * e2);
     let perpendicular2 = clamp_f32(bx * bx + by * by, 0.0, 1.0);
     let mut hot = 0.0;
     if disk.model == 1 {
@@ -1947,7 +1997,7 @@ fn sample_plasma(ray: Ray, objects: &Objects, cam: &Camera, disk: &Disk) -> Plas
         return plasma;
     }
     let evpa = projected_evpa(bx, by);
-    let bparallel = -b.dot(m.g * k) / plasma.energy;
+    let bparallel = -b.dot(g * k) / plasma.energy;
     let luma = vec3(0.2126, 0.7152, 0.0722);
     let intensity = plasma.rgb.dot(luma);
     let synch_i = density * boost * synch.dot(luma);
@@ -2010,6 +2060,104 @@ fn pack_rgba8(c: Vec4) -> u32 {
 }
 
 // -- Production Kernels ------------------------------------------------------
+
+const EARLY_CAPTURE_CLEARANCE: f32 = 0.5;
+
+#[inline(always)]
+fn vacuum_radius_sq(objects: &Objects, disk: &Disk) -> f32 {
+    let body = objects.pos_radius[0];
+    if objects.num_objects != 1 || disk.binary_enabled != 0 || objects.mass[0].x != 1.0
+        || body.x != 0.0 || body.y != 0.0 || body.z != 0.0
+    {
+        return f32::INFINITY;
+    }
+    // The projected Kerr disk radius obeys rho² <= r_disk² + spin².
+    let radius_sq = disk.r2 * disk.r2 + disk.spin * disk.spin;
+    let aspect = if disk.model == 1 || disk.model == 2 {
+        disk.h_thin.max(disk.h_hot)
+    } else {
+        disk.h_thin
+    };
+    let warp = if disk.model == 3 { 1.01 * disk.r2 } else { 0.0 };
+    let height = 4.0 * (aspect * disk.r2).max(1.0e-4) + warp;
+    (1.02 * (radius_sq + height * height)).max(body.w * body.w).max(64.0 * 64.0)
+}
+
+#[inline(always)]
+fn far_field_distance(pos: Vec3, velocity: Vec3, speed: f32, vacuum_sq: f32) -> f32 {
+    let radius_sq = pos.dot(pos);
+    if radius_sq <= vacuum_sq {
+        return 0.0;
+    }
+    let radius = sqrt(radius_sq);
+    if pos.dot(velocity) <= 0.95 * radius * speed {
+        return 0.0;
+    }
+    // Return to the ordinary cap before the sampling sphere.
+    (0.28 * radius).min(192.0).min((ESCAPE_R - 64.0 - radius).max(0.0))
+}
+
+#[inline(always)]
+fn supports_early_capture(objects: &Objects, disk: &Disk) -> bool {
+    let position = objects.pos_radius[0];
+    let spin = objects.spin[0];
+    let color = objects.color[0];
+    objects.num_objects == 1
+        && disk.binary_enabled == 0
+        && objects.mass[0].x == 1.0
+        && position.x == 0.0 && position.y == 0.0 && position.z == 0.0
+        && color.x == 0.0 && color.y == 0.0 && color.z == 0.0
+        && spin.x == 0.0 && spin.z == 0.0 && spin.y == disk.spin
+        && disk.spin.abs() <= 0.995
+}
+
+#[cuda_device::device]
+fn inward_kerr_capture(ray: Ray, velocity: Vec3, spin: f32, disk_inner: f32) -> bool {
+    // Use binary64 for the guard. The incoming integrated state is binary32.
+    let a = f64::from(spin);
+    let a2 = a * a;
+    let horizon = 1.0 + cuda_device::float::sqrt_rn_f64(1.0 - a2);
+    let x = f64::from(ray.pos.x);
+    let y = f64::from(ray.pos.y);
+    let z = f64::from(ray.pos.z);
+    let rho2 = x * x + z * z;
+    let q = rho2 + y * y - a2;
+    let r2 = 0.5 * (q + cuda_device::float::sqrt_rn_f64(q * q + 4.0 * a2 * y * y));
+    let r = cuda_device::float::sqrt_rn_f64(r2);
+    // The projected disk radius is at most the Kerr radius. Keep a gap from the emissivity cutoff.
+    if !(r > horizon && r + 0.05 < f64::from(disk_inner) && ray.p.x > 1.0e-5) {
+        return false;
+    }
+
+    let sine = cuda_device::float::sqrt_rn_f64(rho2 / (r2 + a2));
+    if !(sine > 0.1) {
+        return false;
+    }
+    let cosine = y / r;
+    let energy = -f64::from(ray.p.x);
+    let px = f64::from(ray.p.y);
+    let py = f64::from(ray.p.z);
+    let pz = f64::from(ray.p.w);
+    let lambda = (z * px - x * pz) / energy;
+    // At fixed Kerr radius, the Kerr-Schild to Boyer-Lindquist shifts are constant.
+    let polar = ((cosine / sine) * (x * px + z * pz) - r * sine * py) / energy;
+    let azimuthal = lambda / sine - a * sine;
+    let carter = polar * polar + azimuthal * azimuthal;
+    let sigma_dr = r
+        * (x * f64::from(velocity.x) + (1.0 + a2 / r2) * y * f64::from(velocity.y)
+            + z * f64::from(velocity.z)) / energy.abs();
+    let horizon_p = horizon * horizon + a2 - a * lambda;
+    let here_p = r2 + a2 - a * lambda;
+    let barrier = (r - horizon) * (r + horizon - 2.0) * carter;
+    let scale = 1.0 + here_p * here_p + barrier;
+    let radial = here_p * here_p - barrier;
+    // P(s) increases and Delta(s) <= Delta(r) for horizon <= s <= r.
+    // Require a positive lower bound on R throughout that interval and a consistent inward tangent.
+    horizon_p > 0.0
+        && horizon_p * horizon_p - barrier > 0.02 * scale
+        && sigma_dr < -0.05 * r2
+        && (sigma_dr * sigma_dr - radial).abs() < 0.004 * scale
+}
 
 #[cuda_device::kernel]
 pub unsafe fn bh_wormhole(
@@ -2099,6 +2247,136 @@ pub unsafe fn bh_geodesic(
     sky_w: u32,
     sky_h: u32,
 ) {
+    unsafe {
+        render_geodesic::<false>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+            core::ptr::null_mut(), false, false,
+        );
+    }
+}
+
+#[cuda_device::kernel]
+pub unsafe fn bh_geodesic_early_capture(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+) {
+    unsafe {
+        render_geodesic::<false>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+            core::ptr::null_mut(), true, false,
+        );
+    }
+}
+
+#[cuda_device::kernel]
+pub unsafe fn bh_geodesic_far_field(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+    early_capture: u32,
+) {
+    unsafe {
+        render_geodesic::<false>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+            core::ptr::null_mut(), early_capture != 0, true,
+        );
+    }
+}
+
+// The profile CSV uses the same field order.
+#[repr(C)]
+#[derive(Default)]
+pub struct RayDiagnostics {
+    iterations: u32,
+    steps: u32,
+    rejected_attempts: u32,
+    near_horizon_steps: u32,
+    far_field_steps: u32,
+    disk_limited_steps: u32,
+    controller_limited_steps: u32,
+    exit: u32,
+    wide_steps: u32,
+    sky_direction: [f32; 3],
+    plasma_steps: u32,
+    vacuum_disk_steps: u32,
+    stokes: [f32; 4],
+}
+
+#[repr(u32)]
+enum RayExit {
+    IterationLimit,
+    InvalidCamera,
+    InvalidMetric,
+    Horizon,
+    StepRejected,
+    AffineStagnation,
+    ObjectHit,
+    Escaped,
+    Opaque,
+    EarlyCapture,
+}
+
+#[cuda_device::kernel]
+pub unsafe fn bh_geodesic_diagnostics(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+    diagnostics: *mut RayDiagnostics,
+    experiments: u32,
+) {
+    unsafe {
+        render_geodesic::<true>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
+            experiments & 1 != 0, experiments & 2 != 0,
+        );
+    }
+}
+
+#[inline(always)]
+fn advance_render_ray<const DIAGNOSTICS: bool>(
+    ray: Ray, h: f32, metric: &mut Metric, objects: &Objects, stats: &mut RayDiagnostics,
+) -> AdaptiveStep {
+    if DIAGNOSTICS {
+        advance_ray_counting::<true>(ray, h, metric, false, objects, &mut stats.rejected_attempts)
+    } else {
+        advance_ray_gauge(ray, h, metric, false, objects)
+    }
+}
+
+#[inline(always)]
+unsafe fn render_geodesic<const DIAGNOSTICS: bool>(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+    diagnostics: *mut RayDiagnostics,
+    early_capture: bool,
+    far_field: bool,
+) {
     let pix_x = gid_x();
     let pix_y = gid_y();
     if pix_x >= width || pix_y >= height {
@@ -2115,7 +2393,13 @@ pub unsafe fn bh_geodesic(
     let v = (1.0 - 2.0 * (pix_y as f32 + 0.5 + cam.jitter_y) / height as f32) * cam.tan_half_fov;
     let dir = (u * cam.right - v * cam.up + cam.forward).normalize();
     let mut metric = scene_metric(cam.pos, objects);
+    let mut stats = RayDiagnostics::default();
+    let mut exit = RayExit::IterationLimit;
     if !metric.valid || metric.clearance <= 0.0 {
+        if DIAGNOSTICS {
+            stats.exit = RayExit::InvalidCamera as u32;
+            unsafe { *diagnostics.add(idx) = stats };
+        }
         unsafe { *out_image.add(idx) = vec4(0.0, 0.0, 0.0, 1.0) };
         return;
     }
@@ -2127,14 +2411,34 @@ pub unsafe fn bh_geodesic(
     let mut iterations = 0u32;
     let mut affine = 0.0_f32;
     let mut next_h = 1.0e8_f32;
+    let mut capture_clearance = if early_capture && supports_early_capture(objects, disk) {
+        EARLY_CAPTURE_CLEARANCE
+    } else {
+        0.0
+    };
+    let vacuum_sq = if far_field { vacuum_radius_sq(objects, disk) } else { f32::INFINITY };
     let mut i = 0u32;
     while i < cam.max_iter {
         iterations = i + 1;
         if metric.clearance < 0.002 || !metric.valid {
+            if DIAGNOSTICS {
+                exit = if metric.valid { RayExit::Horizon } else { RayExit::InvalidMetric };
+            }
             break;
         }
         let velocity = (metric.inv * ray.p).yzw();
+        if early_capture && metric.clearance < capture_clearance {
+            // A tighter interval may rule out a turn even if the first check could not.
+            capture_clearance = 0.5 * metric.clearance;
+            if inward_kerr_capture(ray, velocity, disk.spin, disk.r1) {
+                if DIAGNOSTICS {
+                    exit = RayExit::EarlyCapture;
+                }
+                break;
+            }
+        }
         let mut distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
+        let clearance_limited_distance = distance;
         let radius = disk_radius(ray.pos, disk.spin, disk.binary_enabled != 0);
         if radius > disk.r1 - distance && radius < disk.r2 + distance {
             let r_clamped = radius.max(disk.r1);
@@ -2143,26 +2447,55 @@ pub unsafe fn bh_geodesic(
             let to_disk = ((ray.pos.y - mid).abs() - 4.0 * height_d).max(0.0);
             distance = distance.min((0.25 * height_d).max(0.5 * to_disk));
         }
-        let step = advance_ray(
-            ray,
-            (distance / velocity.length().max(1.0e-6)).min(next_h),
-            metric,
-            objects,
-        );
+        let near_horizon = DIAGNOSTICS && metric.clearance < 1.0;
+        let speed = velocity.length().max(1.0e-6);
+        let geometric_h = distance / speed;
+        let ordinary_h = geometric_h.min(next_h);
+        let proposed_h = if far_field {
+            let far_distance = far_field_distance(ray.pos, velocity, speed, vacuum_sq);
+            ordinary_h.max((far_distance / speed).min(next_h))
+        } else {
+            ordinary_h
+        };
+        let mut step = advance_render_ray::<DIAGNOSTICS>(ray, proposed_h, &mut metric, objects, &mut stats);
+        if far_field && proposed_h > ordinary_h
+            && (!step.accepted || ray.pos.dot(step.ray.pos - ray.pos) < 0.0)
+        {
+            // An outward chord stays outside the sphere, including its transfer midpoint.
+            if step.accepted {
+                metric = scene_metric(ray.pos, objects);
+            }
+            step = advance_render_ray::<DIAGNOSTICS>(ray, ordinary_h, &mut metric, objects, &mut stats);
+        }
         // Stop when the affine parameter can no longer advance in binary32.
         if !step.accepted || affine + step.h == affine {
+            if DIAGNOSTICS {
+                exit = if step.accepted { RayExit::AffineStagnation } else { RayExit::StepRejected };
+            }
             break;
+        }
+        let disk_limited = DIAGNOSTICS && geometric_h <= next_h
+            && distance < clearance_limited_distance && step.h <= ordinary_h;
+        if DIAGNOSTICS {
+            stats.steps += 1;
+            stats.near_horizon_steps += near_horizon as u32;
+            stats.far_field_steps += (ray.pos.dot(ray.pos) >= 64.0 * 64.0) as u32;
+            stats.disk_limited_steps += disk_limited as u32;
+            stats.controller_limited_steps += (next_h < geometric_h) as u32;
+            stats.wide_steps += (step.h > ordinary_h) as u32;
         }
         affine += step.h;
         let h = step.h;
         let next = step.ray;
-        let next_metric = scene_metric(next.pos, objects);
         next_h = h * clamp_f32(0.9 * pow(STEP_TOLERANCE / step.error.max(1.0e-20), 0.2), 0.5, 2.0);
         let hit = intersect_objects_segment(ray.pos, next.pos, objects);
         if hit.hit {
             let intensity = hit.color.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
             rgb += transmission * hit.color.xyz();
             stokes.x += transmission * intensity;
+            if DIAGNOSTICS {
+                exit = RayExit::ObjectHit;
+            }
             break;
         }
         let middle = Ray {
@@ -2172,6 +2505,10 @@ pub unsafe fn bh_geodesic(
         };
         let plasma = sample_plasma(middle, objects, cam, disk);
         let ds = h * plasma.energy;
+        if DIAGNOSTICS {
+            stats.plasma_steps += (ds > 0.0) as u32;
+            stats.vacuum_disk_steps += (disk_limited && ds <= 0.0) as u32;
+        }
         if ds > 0.0 {
             if cam.polarization_view != 0 {
                 let cell = polarized_cell(plasma.j, plasma.alpha, plasma.rho, ds);
@@ -2182,13 +2519,13 @@ pub unsafe fn bh_geodesic(
             transmission *= exp(-plasma.alpha * ds);
         }
         ray = next;
-        metric = next_metric;
         let frame = screen_frame(ray, metric);
         ray.screen = vec4_f_v3(0.0, frame[0]);
         if ray.pos.length() > ESCAPE_R {
+            let direction = (metric.inv * ray.p).yzw().normalize();
             let sky = unsafe {
                 sample_skybox(
-                    (metric.inv * ray.p).yzw().normalize(),
+                    direction,
                     skybox,
                     sky_w as i32,
                     sky_h as i32,
@@ -2196,9 +2533,16 @@ pub unsafe fn bh_geodesic(
             };
             rgb += transmission * sky;
             stokes.x += transmission * sky.dot(vec3(0.2126, 0.7152, 0.0722));
+            if DIAGNOSTICS {
+                exit = RayExit::Escaped;
+                stats.sky_direction = [direction.x, direction.y, direction.z];
+            }
             break;
         }
         if transmission < 0.001 {
+            if DIAGNOSTICS {
+                exit = RayExit::Opaque;
+            }
             break;
         }
         i += 1;
@@ -2209,6 +2553,12 @@ pub unsafe fn bh_geodesic(
     }
     if cam.debug_heatmap != 0 {
         output = heatmap_color(iterations as f32 / cam.max_iter.max(1) as f32);
+    }
+    if DIAGNOSTICS {
+        stats.iterations = iterations;
+        stats.exit = exit as u32;
+        stats.stokes = [stokes.x, stokes.y, stokes.z, stokes.w];
+        unsafe { *diagnostics.add(idx) = stats };
     }
     unsafe {
         *out_image.add(idx) = vec4_v3_f(output, 1.0);
@@ -2939,6 +3289,7 @@ pub unsafe fn bh_test_controller_classify(
     let mut ray = controller_initial_ray(c.x, objects);
     let start = ray;
     let mut metric = scene_metric(ray.pos, objects);
+    let mut capture_clearance = if c.y != 0.0 { EARLY_CAPTURE_CLEARANCE } else { 0.0 };
     let mut next_h = 1.0e8_f32;
     let mut status = 0.0_f32;
     let mut steps = 0u32;
@@ -2949,6 +3300,13 @@ pub unsafe fn bh_test_controller_classify(
             break;
         }
         let velocity = (metric.inv * ray.p).yzw();
+        if metric.clearance < capture_clearance {
+            capture_clearance = 0.5 * metric.clearance;
+            if inward_kerr_capture(ray, velocity, objects.spin[0].y, c.y) {
+                status = 4.0;
+                break;
+            }
+        }
         let distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
         let step = advance_ray(
             ray,
@@ -3219,7 +3577,7 @@ pub unsafe fn bh_test_image(
     let mut iteration = 0u32;
     while iteration < max_iterations {
         steps = iteration;
-        let m = scene_metric(ray.pos, objects);
+        let mut m = scene_metric(ray.pos, objects);
         let k = m.inv * ray.p;
         let r = kerr_radius(ray.pos, vec3(0.0, 0.9375, 0.0));
         let dr = radius_rate(ray.pos, k.yzw(), r);
@@ -3244,7 +3602,7 @@ pub unsafe fn bh_test_image(
             h = h.min(0.5_f32.max((r - 100.0) / dr.abs().max(1.0e-8)));
         }
         last_h = h;
-        let step = advance_ray_gauge(ray, h, m, true, objects);
+        let step = advance_ray_gauge(ray, h, &mut m, true, objects);
         last_actual = step.h;
         last_error = step.error;
         if !step.accepted {
@@ -3314,8 +3672,7 @@ pub unsafe fn bh_test_image(
         }
         affine += step.h * ray.p.x / seed.momentum.x;
         ray = step.ray;
-        let endpoint_metric = scene_metric(ray.pos, objects);
-        ray.screen = vec4_f_v3(0.0, screen_frame(ray, endpoint_metric)[0]);
+        ray.screen = vec4_f_v3(0.0, screen_frame(ray, m)[0]);
         let momentum_scale = ray
             .p
             .x
@@ -3323,9 +3680,8 @@ pub unsafe fn bh_test_image(
             .max(ray.p.y.abs())
             .max(ray.p.z.abs().max(ray.p.w.abs()));
         ray.p /= momentum_scale;
-        let metric = scene_metric(ray.pos, objects);
         max_null = max_null
-            .max(ray.p.dot(metric.inv * ray.p).abs() / ray.p.dot(ray.p).max(1.0e-10));
+            .max(ray.p.dot(m.inv * ray.p).abs() / ray.p.dot(ray.p).max(1.0e-10));
         next_h = momentum_scale
             * step.h
             * clamp_f32(0.9 * pow(5.0e-8 / step.error.max(1.0e-20), 0.2), 0.5, 2.0);

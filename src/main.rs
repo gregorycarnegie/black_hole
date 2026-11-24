@@ -12,25 +12,40 @@ mod simulation;
 mod ui;
 
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Black Hole".into(),
-                resolution: (800u32, 600u32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
-        .add_plugins(FrameTimeDiagnosticsPlugin::default())
-        .add_plugins(camera::OrbitalCameraPlugin)
-        .add_plugins(simulation::SimulationPlugin)
-        .add_plugins(bridge::BridgePlugin)
-        .add_plugins(grid::GridPlugin)
-        .add_plugins(compute::GeodesicComputePlugin)
-        .add_plugins(ui::UiPlugin)
-        .add_systems(Startup, setup_fps_ui)
-        .add_systems(Update, update_fps_text)
-        .run();
+    let profiling = std::env::args_os().any(|arg| arg == "--profile-renderer");
+    let early_capture = std::env::args_os().any(|arg| arg == "--experiment-early-capture");
+    let far_field = std::env::args_os().any(|arg| arg == "--experiment-far-field");
+    let mut window = Window {
+        title: "Black Hole".into(),
+        resolution: (800u32, 600u32).into(),
+        ..default()
+    };
+    if profiling {
+        window.present_mode = bevy::window::PresentMode::AutoNoVsync;
+        window.resolution = window.resolution.with_scale_factor_override(1.0);
+        window.resizable = false;
+    }
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(window),
+        ..default()
+    }))
+    .add_plugins(FrameTimeDiagnosticsPlugin::default())
+    .add_plugins(camera::OrbitalCameraPlugin)
+    .add_plugins(simulation::SimulationPlugin)
+    .add_plugins(bridge::BridgePlugin)
+    .add_plugins(grid::GridPlugin)
+    .add_plugins(compute::GeodesicComputePlugin)
+    .add_plugins(ui::UiPlugin)
+    .add_systems(Startup, setup_fps_ui)
+    .add_systems(Update, update_fps_text);
+    if profiling {
+        compute::profile::install(&mut app);
+    }
+    if early_capture || far_field {
+        compute::enable_ray_experiments(&mut app, early_capture, far_field);
+    }
+    app.run();
 }
 
 /// Marker for the on-screen FPS counter.
