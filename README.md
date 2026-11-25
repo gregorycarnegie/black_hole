@@ -102,7 +102,7 @@ Pass options after `--`, for example `cargo run --release -- --experiment-far-fi
 
 | Option | Effect |
 |---|---|
-| `--experiment-early-capture` | Single hole only: ends rays early once a proved Kerr test shows they will fall into the horizon. Faster, with the same exit classification. |
+| `--full-trace` | Turns off early capture, which by default ends single-hole rays once a proved Kerr test shows they will fall into the horizon. The image is the same; the full trace is about five times slower in the close-up. |
 | `--experiment-far-field` | Single hole only: takes larger steps far from the hole and disk. |
 | `--rk4-controller` | All scenes: uses the earlier step-doubling RK4 controller instead of the default Dormand–Prince 5(4) one. About twice as slow; kept for one release. |
 | `--profile-renderer` | Runs a fixed benchmark and writes per-ray diagnostics to `target/renderer-rays*.csv`, then exits. |

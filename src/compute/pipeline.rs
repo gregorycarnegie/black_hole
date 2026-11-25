@@ -1201,6 +1201,34 @@ mod swarm_gpu {
         assert_eq!(differing, 0, "{differing} channels differ");
     }
 
+    /// Early capture (checklist P0.3) must not change swarm images: bodies orbit
+    /// outside the capture radius. Brute force, the BVH and, with `--features optix`,
+    /// OptiX against the full trace (bit 1).
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn swarm_early_capture_matches_the_full_trace() {
+        let scene = single_hole();
+        #[cfg(feature = "optix")]
+        let mut optix = crate::compute::optix::OptixRender::new().unwrap();
+        let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        for count in [256, 1024, 4096] {
+            let bodies = swarm_bodies(count, SPIN, 1000.0);
+            for brute_force in [true, false] {
+                let swarm = device(&bodies, brute_force);
+                let early = render_with(&scene, Some(&swarm), 0).0;
+                let full = render_with(&scene, Some(&swarm), 1).0;
+                assert!(same(&early, &full), "{count} bodies, brute force {brute_force}");
+            }
+            #[cfg(feature = "optix")]
+            {
+                render_optix(&mut optix, &scene, &bodies, 0);
+                let early = render_optix(&mut optix, &scene, &bodies, 0).0;
+                let full = render_optix(&mut optix, &scene, &bodies, 1).0;
+                assert!(same(&early, &full), "{count} bodies, OptiX");
+            }
+        }
+    }
+
     /// The swarm with the legacy RK4 controller (bit 2) and the default Dormand–Prince
     /// one, BVH and, with `--features optix`, OptiX; alternating launches, medians of
     /// five. The accelerated images must still match brute force under DP45.
@@ -1675,10 +1703,12 @@ fn early_capture_matches_the_full_trace() {
                 let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
                 for elevation in elevations {
                     for polarization_view in [0u32, 2, 5] {
-                        let mut cam = crate::camera::OrbitalCamera::default();
-                        cam.radius = 24.0;
-                        cam.elevation = elevation;
-                        cam.azimuth = 0.7;
+                        let cam = crate::camera::OrbitalCamera {
+                            radius: 24.0,
+                            elevation,
+                            azimuth: 0.7,
+                            ..Default::default()
+                        };
                         let camera = GpuCameraUniform {
                             pos: cam.position().into(),
                             right: cam.right().into(),

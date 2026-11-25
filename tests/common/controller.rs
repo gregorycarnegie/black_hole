@@ -268,7 +268,8 @@ fn classification_against_the_critical_impact_parameter() {
 #[ignore = "requires a CUDA GPU"]
 fn kerr_early_capture_matches_the_equatorial_radial_potential() {
     const CASES: usize = 801;
-    for spin in [-0.99_f32, -0.82, 0.0, 0.82, 0.99] {
+    // ±0.995 is the guard's edge.
+    for spin in [-0.995_f32, -0.99, -0.82, 0.0, 0.82, 0.99, 0.995] {
         let a = f64::from(spin);
         let horizon = 1.0 + (1.0 - a * a).sqrt();
         let mut objects = vec![0u8; 1040];
