@@ -230,6 +230,24 @@ The close-up (`--profile-renderer`) uses polarization view 2 and the hot flow, s
 
 `specialised_kernels_match_bh_geodesic` renders 4 spins (0, 0.82, -0.99, 0.999), all 4 disk models, polarization views 0, 2 and 5, and 2 camera elevations. It requires `bh_geodesic_single` to match `bh_geodesic` bit for bit everywhere, and `bh_geodesic_scalar` to stay within 1/255 in every channel in each thermal-only mode. Binaries, the swarm, the wormhole, diagnostics and the `--full-trace`, `--experiment-far-field` and `--rk4-controller` options still use the generic kernels.
 
+## Separated Kerr reference (checklist P1.7)
+
+`black_hole::separated` solves a single-hole null geodesic in binary64 from E, L and Q. It finds the radial roots with Ferrari's resolvent and Newton polishing, classifies the ray as captured, escaped or unresolved, and returns the state where the ray first reaches a target radius going outward. Unresolved covers critical double roots (relative root gap below 1e-7), bound orbits, rays exactly on the spin axis, and escaping rays with Q <= 0. The state at the target radius is computed two independent ways:
+- **Elliptic:** Gralla–Lupsasca closed forms, using Carlson R_F/R_J and AGM Jacobi functions written for this module.
+- **Quadrature:** tanh–sinh quadrature of the same Mino-time integrals, with the polar motion inverted by bisection.
+
+On a ray grid from equatorial and polar cameras at 4 spins, every ray resolves and the two methods agree to 1e-9 rad. Both match a binary64 RK4 integration of the Cartesian Kerr–Schild geodesic to 1e-8 rad. 1 - u₊ is computed from its own quadratic, so rays that pass within 1e-7 rad of the axis keep their azimuth.
+
+`gpu_escapes_match_the_separated_solution` traces every pixel of a 160×120 thin-disk frame from the GPU's own initial state. It runs 4 spins (0, 0.5, -0.9, 0.99) and 2 camera elevations (1.47 and 0.40 rad). Results:
+- **Classification:** no pixel escapes on the GPU but is captured in the reference, or the reverse. The exceptions are the GPU's near-critical band (up to 26 pixels per frame) and rays the opaque disk stops (675–942 per near-equatorial frame).
+- **Escape direction:** median error 1.4–2.3e-7 rad, 99th percentile 2.5–7.9e-6 rad, and maximum 1.6e-4 to 6.1e-3 rad. Between 483 and 1,299 of each frame's 17,000–18,000 escapes miss the P0.2 target of 1e-6 rad.
+- **Gates:** zero classification disagreements, median below 1e-6 rad and 99th percentile below 2e-5 rad.
+
+Not covered:
+- Closed forms for outgoing rays with no turning point outside the horizon. The quadrature covers them, and no GPU camera ray in these frames needed them.
+- Escaping vortical rays (Q <= 0).
+- A Carlson-integral formulation separate from the elliptic one. The second method is quadrature instead.
+
 ## Experiment order
 
 1. **Measure the interactive frame.** Fix the camera, spin, disk preset, pixel dimensions, and render mode for each comparison. Start with single-hole thermal intensity, then compare polarized or synchrotron-heavy rendering and the binary scene. Include a view with a prominent photon ring and measure the Ellis kernel separately if the wormhole view is slow. Record median and 95th-percentile frame times after warm-up. Time the geodesic and accumulation kernels with CUDA events. Measure the host wait/readback, Bevy texture upload, and total frame time separately. Use the `H` heatmap to locate long rays and count rejected attempts separately from outer iterations. If a few long-running rays dominate, check warp divergence, register pressure, and spills before changing block size or splitting up the ray work. [Existing CUDA-event example](tests/common/gpu.rs#L229) · [Kernel dispatch](src/compute/pipeline.rs#L356) · [Display path](src/compute/accumulate.rs#L156)

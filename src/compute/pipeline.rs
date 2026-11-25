@@ -1810,6 +1810,166 @@ fn specialised_kernel_benchmark() {
     }
 }
 
+/// Checklist P1.7: every pixel of a single-hole frame, traced from the GPU's own
+/// initial state by the separated binary64 solution (`black_hole::separated`), against
+/// the diagnostics kernel's exit and sky direction. No pixel may escape on one side
+/// and be captured on the other, except in the GPU's near-critical band and where the
+/// opaque disk stops the GPU ray. The median direction error must stay below 1e-6 rad
+/// and the 99th percentile below 2e-5 rad (measured: at most 2.3e-7 and 7.9e-6); the
+/// maximum is printed, not gated.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn gpu_escapes_match_the_separated_solution() {
+    use crate::simulation::{DiskConfig, DiskModel, default_binary_spins, scene_objects};
+    use black_hole::separated::{Method, Outcome, Unresolved, direction, propagate};
+    const ESCAPED: u32 = 7;
+    const OPAQUE: u32 = 8;
+    const NEAR_CRITICAL: u32 = 10;
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+    let (width, height) = (160u32, 120u32);
+    let pixels = (width * height) as usize;
+    let sky: CudaSlice<u8> = cuda.clone_htod(bytemuck::cast_slice(&[
+        0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0,
+    ]));
+    let diagnostics_kernel = cuda.module.load_function("bh_geodesic_diagnostics").unwrap();
+    let pixel_kernel = cuda.module.load_function("bh_test_pixel_ray").unwrap();
+    for spin in [0.0_f32, 0.5, -0.9, 0.99] {
+        for elevation in [std::f64::consts::FRAC_PI_2 - 0.1, 0.4] {
+            let scene = scene_objects(spin, false, false, 0.0, default_binary_spins());
+            let mut objects = GpuObjectsUniform::zeroed();
+            objects.num_objects = scene.len() as i32;
+            for (i, object) in scene.iter().enumerate() {
+                objects.pos_radius[i] = object.position.extend(object.radius).into();
+                objects.color[i] = object.color.into();
+                objects.mass[i][0] = object.mass;
+                objects.spin[i] = object.spin.extend(0.0).into();
+            }
+            let config = DiskConfig::for_model(DiskModel::ThinNt, spin);
+            let disk = build_disk_uniform(&DiskConfigUniform {
+                spin: config.spin,
+                binary_enabled: false,
+                ..DiskConfigUniform::default()
+            });
+            let cam = crate::camera::OrbitalCamera {
+                radius: 24.0,
+                elevation,
+                azimuth: 0.7,
+                ..Default::default()
+            };
+            let camera = GpuCameraUniform {
+                pos: cam.position().into(),
+                right: cam.right().into(),
+                up: cam.up().into(),
+                forward: cam.forward().into(),
+                tan_half_fov: cam.tan_half_fov(),
+                aspect: width as f32 / height as f32,
+                max_iter: cam.max_iter,
+                frequency_ghz: cam.frequency_ghz,
+                faraday_depth: cam.faraday_depth,
+                conversion_depth: cam.conversion_depth,
+                ..GpuCameraUniform::zeroed()
+            };
+            let d_objects = cuda.clone_htod(bytemuck::bytes_of(&objects));
+            let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
+            let d_camera = cuda.clone_htod(bytemuck::bytes_of(&camera));
+            let mut image = cuda.alloc_zeros::<f32>(pixels * 4);
+            let mut diagnostics = cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);
+            let mut launch = cuda.stream.launch_builder(&diagnostics_kernel);
+            launch.arg(&mut image);
+            launch.arg(&d_camera);
+            launch.arg(&d_disk);
+            launch.arg(&d_objects);
+            launch.arg(&sky);
+            launch.arg(&width);
+            launch.arg(&height);
+            launch.arg(&2u32);
+            launch.arg(&1u32);
+            launch.arg(&mut diagnostics);
+            launch.arg(&0u32);
+            unsafe { launch.launch(ray_launch_config(width, height, true)).unwrap() };
+            drop(launch);
+            let rays = cuda.clone_dtoh(&diagnostics);
+            let input: Vec<f32> = (0..pixels as u32)
+                .flat_map(|i| [(i % width) as f32, (i / width) as f32, width as f32, height as f32])
+                .collect();
+            let d_pixels = cuda.clone_htod(&input);
+            let mut d_states = cuda.alloc_zeros::<f32>(pixels * 12);
+            let count = pixels as u32;
+            let mut launch = cuda.stream.launch_builder(&pixel_kernel);
+            launch.arg(&d_camera);
+            launch.arg(&d_objects);
+            launch.arg(&d_pixels);
+            launch.arg(&mut d_states);
+            launch.arg(&count);
+            let cfg = LaunchConfig {
+                grid_dim: (count.div_ceil(64), 1, 1),
+                block_dim: (64, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { launch.launch(cfg).unwrap() };
+            drop(launch);
+            let states = cuda.clone_dtoh(&d_states);
+            let a = f64::from(spin);
+            let mut errors = Vec::new();
+            let (mut gpu_only, mut reference_only, mut unresolved) = (0, 0, 0);
+            let (mut opaque, mut near_critical) = (0, 0);
+            for (i, ray) in rays.as_chunks::<RAY_FIELDS>().0.iter().enumerate() {
+                let v: Vec<f64> = states[12 * i..12 * i + 12]
+                    .iter()
+                    .map(|&x| f64::from(x))
+                    .collect();
+                let (pos, p) = ([v[0], v[1], v[2]], [v[4], v[5], v[6], v[7]]);
+                let reference = match propagate(a, pos, p, 1600.0, Method::Elliptic) {
+                    Err(Unresolved::Unsupported) => propagate(a, pos, p, 1600.0, Method::Quadrature),
+                    other => other,
+                };
+                let escaped = ray[7] == ESCAPED;
+                near_critical += usize::from(ray[7] == NEAR_CRITICAL);
+                opaque += usize::from(ray[7] == OPAQUE);
+                match reference {
+                    Ok(Outcome::Arrived { position, momentum }) if escaped => {
+                        let gpu = [ray[9], ray[10], ray[11]].map(|b| f64::from(f32::from_bits(b)));
+                        let length = gpu.iter().map(|x| x * x).sum::<f64>().sqrt();
+                        let exact = direction(a, position, momentum);
+                        let dot: f64 = (0..3).map(|k| gpu[k] / length * exact[k]).sum();
+                        let cross = [
+                            gpu[1] * exact[2] - gpu[2] * exact[1],
+                            gpu[2] * exact[0] - gpu[0] * exact[2],
+                            gpu[0] * exact[1] - gpu[1] * exact[0],
+                        ];
+                        let sine = cross.iter().map(|x| x * x).sum::<f64>().sqrt() / length;
+                        errors.push(sine.atan2(dot));
+                    }
+                    Ok(Outcome::Arrived { .. }) if ray[7] != NEAR_CRITICAL && ray[7] != OPAQUE => {
+                        reference_only += 1;
+                    }
+                    Ok(Outcome::Captured) if escaped => gpu_only += 1,
+                    Err(_) => unresolved += 1,
+                    _ => {}
+                }
+            }
+            errors.sort_unstable_by(f64::total_cmp);
+            let at = |q: f64| errors[((errors.len() as f64 * q) as usize).min(errors.len() - 1)];
+            println!(
+                "spin {spin} elevation {elevation:.2}: {} escapes, direction error median {:.2e} \
+                 p99 {:.2e} max {:.2e} rad, {} above 1e-6; escaped only on the GPU {gpu_only}, \
+                 only in the reference {reference_only}; GPU opaque {opaque}, near-critical \
+                 {near_critical}; reference unresolved {unresolved}",
+                errors.len(),
+                at(0.5),
+                at(0.99),
+                errors[errors.len() - 1],
+                errors.iter().filter(|&&e| e > 1.0e-6).count(),
+            );
+            let scene = format!("spin {spin} elevation {elevation}");
+            assert_eq!((gpu_only, reference_only, unresolved), (0, 0, 0), "{scene}");
+            assert!(at(0.5) < 1.0e-6 && at(0.99) < 2.0e-5, "{scene}");
+        }
+    }
+}
+
 /// Escape directions of the pixels where the RK4 and Dormand–Prince controllers
 /// disagree most in the `--profile-renderer` close-up, against a binary64 RK4
 /// reference of the CPU Kerr field (`certified::Kerr`) started from the GPU's own
