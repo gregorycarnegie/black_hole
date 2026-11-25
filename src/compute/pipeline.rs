@@ -1827,3 +1827,84 @@ fn early_capture_matches_the_full_trace() {
     }
     println!("{checked} early-captured pixels confirmed captured in binary64");
 }
+
+/// Every state the GPU early-capture guard accepts must pass the CPU certificate,
+/// which evaluates the same bound with exact-dyadic-checked intervals. Null states at
+/// random Kerr radii between the horizon and 3.9, polar angles with sine above 0.12
+/// and random momentum directions, at seven spins up to the guard edge.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU"]
+fn the_capture_guard_is_certified_on_the_cpu() {
+    const CASES: usize = 20_000;
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+    let kernel = cuda.module.load_function("bh_test_capture_guard").unwrap();
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut uniform = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    for spin in [0.0_f32, 0.5, -0.5, 0.9, -0.9, 0.995, -0.995] {
+        let a = f64::from(spin);
+        let horizon = 1.0 + (1.0 - a * a).sqrt();
+        let mut states = Vec::with_capacity(CASES);
+        while states.len() < CASES {
+            // Oblate spheroidal coordinates about +y have Kerr radius r.
+            let r = horizon + 0.01 + (3.9 - horizon) * uniform();
+            let cos = (2.0 * uniform() - 1.0) * (1.0 - 0.12_f64 * 0.12).sqrt();
+            let sin = (1.0 - cos * cos).sqrt();
+            let phi = std::f64::consts::TAU * uniform();
+            let w = (r * r + a * a).sqrt() * sin;
+            let (x, y, z) = (w * phi.cos(), r * cos, w * phi.sin());
+            // Null p for g^-1 = eta - 2h l#l#^T, with the backward-ray root p_t > 0.
+            let h = r * r * r / (r.powi(4) + a * a * y * y);
+            let l = [(r * x - a * z) / (r * r + a * a), y / r, (r * z + a * x) / (r * r + a * a)];
+            // A random direction plus an inward pull, so that many states are captured.
+            let norm = (x * x + y * y + z * z).sqrt();
+            let pull = 6.0 * uniform();
+            let p: [f64; 3] =
+                std::array::from_fn(|i| 2.0 * uniform() - 1.0 - pull * [x, y, z][i] / norm);
+            let s = p.iter().map(|v| v * v).sum::<f64>();
+            let u = (0..3).map(|i| l[i] * p[i]).sum::<f64>();
+            let pt = (2.0 * h * u + (s + 2.0 * h * (s - u * u)).sqrt()) / (1.0 + 2.0 * h);
+            if pt > 1.0e-3 {
+                states.push([[x, y, z, a], [pt, p[0], p[1], p[2]]].map(|v| v.map(|c| c as f32)));
+            }
+        }
+        let flat: Vec<f32> = states.iter().flatten().flatten().copied().collect();
+        let d_cases = cuda.clone_htod(&flat);
+        let mut d_results = cuda.alloc_zeros::<u32>(CASES);
+        let count = CASES as u32;
+        let mut launch = cuda.stream.launch_builder(&kernel);
+        launch.arg(&d_cases);
+        launch.arg(&4.0_f32);
+        launch.arg(&mut d_results);
+        launch.arg(&count);
+        let cfg = LaunchConfig {
+            grid_dim: (count.div_ceil(128), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { launch.launch(cfg).unwrap() };
+        drop(launch);
+        let gpu = cuda.clone_dtoh(&d_results);
+        let (mut captured, mut cpu_only) = (0, 0);
+        for (state, &accepted) in states.iter().zip(&gpu) {
+            let [[x, y, z, _], p] = *state;
+            let certified = black_hole::certified::capture_certified(spin, 4.0, [x, y, z], p);
+            if accepted == 1 {
+                assert!(certified, "spin {spin}: GPU capture of {state:?} is not certified");
+                captured += 1;
+            } else if certified {
+                cpu_only += 1;
+            }
+        }
+        println!(
+            "spin {spin}: GPU captures {captured}/{CASES}, all certified; {cpu_only} more certified only on the CPU (GPU margins)"
+        );
+        assert!(captured > CASES / 20, "too few captures at spin {spin}");
+    }
+}

@@ -310,6 +310,16 @@ fn kerr_early_capture_matches_the_equatorial_radial_potential() {
                     minimum > 0.0,
                     "early capture with an exterior radial turn at spin {a}, λ {lambda}, minimum {minimum}"
                 );
+                // The capture state: position, conserved p_t and spatial momentum.
+                assert!(
+                    black_hole::certified::capture_certified(
+                        spin,
+                        4.0,
+                        [new[8], new[9], new[10]],
+                        [new[4], new[12], new[13], new[14]],
+                    ),
+                    "GPU early capture not certified on the CPU at spin {a}, λ {lambda}"
+                );
                 early += 1;
                 saved_steps += old[11] as u32 - new[11] as u32;
             }

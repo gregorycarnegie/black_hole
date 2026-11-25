@@ -2531,9 +2531,109 @@ fn supports_early_capture(objects: &Objects, disk: &Disk) -> bool {
         && disk.spin.abs() <= 0.995
 }
 
+/// The next binary64 value above `x`; NaN and +inf are returned unchanged.
+#[inline(always)]
+fn ulp_up(x: f64) -> f64 {
+    if !(x < f64::INFINITY) {
+        x
+    } else if x == 0.0 {
+        f64::from_bits(1)
+    } else if x > 0.0 {
+        f64::from_bits(x.to_bits() + 1)
+    } else {
+        f64::from_bits(x.to_bits() - 1)
+    }
+}
+
+#[inline(always)]
+fn ulp_down(x: f64) -> f64 {
+    -ulp_up(-x)
+}
+
+/// Closed binary64 interval for the early-capture guard. Each operation rounds to
+/// nearest with an explicit `_rn` intrinsic, so nothing is contracted into an FMA,
+/// then steps one ulp outward. IEEE 754 round-to-nearest is within half an ulp, so
+/// the result encloses the exact real value. `src/certified/capture.rs` repeats the
+/// guard with exact-dyadic-checked intervals on the CPU.
+#[derive(Clone, Copy)]
+struct Bound {
+    lo: f64,
+    hi: f64,
+}
+
+impl Bound {
+    #[inline(always)]
+    fn point(x: f64) -> Self {
+        Bound { lo: x, hi: x }
+    }
+
+    #[inline(always)]
+    fn add(self, o: Self) -> Self {
+        Bound {
+            lo: ulp_down(cuda_device::float::add_rn_f64(self.lo, o.lo)),
+            hi: ulp_up(cuda_device::float::add_rn_f64(self.hi, o.hi)),
+        }
+    }
+
+    #[inline(always)]
+    fn sub(self, o: Self) -> Self {
+        self.add(Bound { lo: -o.hi, hi: -o.lo })
+    }
+
+    #[inline(always)]
+    fn hull(p: [f64; 4]) -> Self {
+        Bound {
+            lo: ulp_down(p[0].min(p[1]).min(p[2].min(p[3]))),
+            hi: ulp_up(p[0].max(p[1]).max(p[2].max(p[3]))),
+        }
+    }
+
+    #[inline(always)]
+    fn mul(self, o: Self) -> Self {
+        use cuda_device::float::mul_rn_f64 as m;
+        Self::hull([m(self.lo, o.lo), m(self.lo, o.hi), m(self.hi, o.lo), m(self.hi, o.hi)])
+    }
+
+    /// Requires a divisor that excludes zero; the guard checks that first.
+    #[inline(always)]
+    fn div(self, o: Self) -> Self {
+        use cuda_device::float::div_rn_f64 as d;
+        // n / d = (-n) / (-d), so take a positive divisor; then two quotients suffice.
+        let (n, o) = if o.lo > 0.0 { (self, o) } else { (Bound { lo: -self.hi, hi: -self.lo }, Bound { lo: -o.hi, hi: -o.lo }) };
+        let lo = if n.lo >= 0.0 { d(n.lo, o.hi) } else { d(n.lo, o.lo) };
+        let hi = if n.hi >= 0.0 { d(n.hi, o.lo) } else { d(n.hi, o.hi) };
+        Bound { lo: ulp_down(lo), hi: ulp_up(hi) }
+    }
+
+    #[inline(always)]
+    fn sq(self) -> Self {
+        let a = cuda_device::float::mul_rn_f64(self.lo, self.lo);
+        let b = cuda_device::float::mul_rn_f64(self.hi, self.hi);
+        if self.lo >= 0.0 {
+            Bound { lo: ulp_down(a).max(0.0), hi: ulp_up(b) }
+        } else if self.hi <= 0.0 {
+            Bound { lo: ulp_down(b).max(0.0), hi: ulp_up(a) }
+        } else {
+            Bound { lo: 0.0, hi: ulp_up(a.max(b)) }
+        }
+    }
+
+    /// For an argument whose exact value is nonnegative.
+    #[inline(always)]
+    fn sqrt(self) -> Self {
+        Bound {
+            lo: ulp_down(cuda_device::float::sqrt_rn_f64(self.lo.max(0.0))).max(0.0),
+            hi: ulp_up(cuda_device::float::sqrt_rn_f64(self.hi.max(0.0))),
+        }
+    }
+}
+
+// Kept out of line: inlined into the render loop it costs about 0.8 ms per frame.
 #[cuda_device::device]
+#[inline(never)]
 fn inward_kerr_capture(ray: Ray, velocity: Vec3, spin: f32, disk_inner: f32) -> bool {
-    // Use binary64 for the guard. The incoming integrated state is binary32.
+    // Fast binary64 estimate with margins; a ray it accepts must then pass the interval
+    // certificate, which runs once per captured ray (f64 is slow on consumer GPUs).
     let a = f64::from(spin);
     let a2 = a * a;
     let horizon = 1.0 + cuda_device::float::sqrt_rn_f64(1.0 - a2);
@@ -2577,6 +2677,65 @@ fn inward_kerr_capture(ray: Ray, velocity: Vec3, spin: f32, disk_inner: f32) -> 
         && horizon_p * horizon_p - barrier > 0.02 * scale
         && sigma_dr < -0.05 * r2
         && (sigma_dr * sigma_dr - radial).abs() < 0.004 * scale
+        && kerr_capture_certified(ray, spin, disk_inner)
+}
+
+/// The capture guard's hypotheses for the exact real values of the stored binary32
+/// state, in interval binary64: r between the horizon and `disk_inner`, P(h) > 0,
+/// P(h)^2 - Delta(r) K > 0 (`null_radial_positive_below` in KerrCapture.lean) and an
+/// inward tangent computed from the state's own momentum. Mirrors
+/// `black_hole::certified::capture_certified`. Finite f32 inputs, with p_t > 1e-5,
+/// sine > 0.1 and r > 1 before their divisions, keep every intermediate below 1e300,
+/// so no endpoint overflows.
+#[cuda_device::device]
+fn kerr_capture_certified(ray: Ray, spin: f32, disk_inner: f32) -> bool {
+    let finite = |v: f32| v.abs() < f32::INFINITY;
+    if !(finite(ray.pos.x) && finite(ray.pos.y) && finite(ray.pos.z)
+        && finite(ray.p.y) && finite(ray.p.z) && finite(ray.p.w) && finite(disk_inner)
+        && ray.p.x < f32::INFINITY && ray.p.x > 1.0e-5)
+    {
+        return false;
+    }
+    let point = |v: f32| Bound::point(f64::from(v));
+    let one = Bound::point(1.0);
+    let a = point(spin);
+    let a2 = a.sq();
+    let horizon = one.add(one.sub(a2).sqrt());
+    let (x, y, z) = (point(ray.pos.x), point(ray.pos.y), point(ray.pos.z));
+    let rho2 = x.sq().add(z.sq());
+    let y2 = y.sq();
+    let q = rho2.add(y2).sub(a2);
+    let r2 = q.add(q.sq().add(Bound::point(4.0).mul(a2).mul(y2)).sqrt()).mul(Bound::point(0.5));
+    let r = r2.sqrt();
+    if !(r.lo > horizon.hi && r.hi < f64::from(disk_inner)) {
+        return false;
+    }
+    let r2a2 = r2.add(a2);
+    let sine = rho2.div(r2a2).sqrt();
+    if !(sine.lo > 0.1) {
+        return false;
+    }
+    // E = -p_t < 0 for the backward ray, and |E| = p_t.
+    let pt = point(ray.p.x);
+    let energy = Bound::point(-f64::from(ray.p.x));
+    let (px, py, pz) = (point(ray.p.y), point(ray.p.z), point(ray.p.w));
+    let lambda = z.mul(px).sub(x.mul(pz)).div(energy);
+    let polar = y.div(r).div(sine).mul(x.mul(px).add(z.mul(pz))).sub(r.mul(sine).mul(py)).div(energy);
+    let azimuthal = lambda.div(sine).sub(a.mul(sine));
+    let carter = polar.sq().add(azimuthal.sq());
+    let horizon_p = horizon.sq().add(a2).sub(a.mul(lambda));
+    let barrier = r.sub(horizon).mul(r.add(horizon).sub(Bound::point(2.0))).mul(carter);
+    // Sigma dr/dlambda: g^-1 = eta - 2h l#l#^T with l# = (-1, l), exact for the null l of
+    // add_kerr_fields with spin along +y.
+    let h = r.mul(r2).div(r2.sq().add(a.mul(y).sq()));
+    let lx = r.mul(x).sub(a.mul(z)).div(r2a2);
+    let ly = y.div(r);
+    let lz = r.mul(z).add(a.mul(x)).div(r2a2);
+    let k = Bound::point(2.0).mul(h).mul(lx.mul(px).add(ly.mul(py)).add(lz.mul(pz)).sub(pt));
+    let (vx, vy, vz) = (px.sub(k.mul(lx)), py.sub(k.mul(ly)), pz.sub(k.mul(lz)));
+    let sigma_dr =
+        r.mul(x.mul(vx).add(one.add(a2.div(r2)).mul(y).mul(vy)).add(z.mul(vz))).div(pt);
+    horizon_p.lo > 0.0 && horizon_p.sq().sub(barrier).lo > 0.0 && sigma_dr.hi < 0.0
 }
 
 #[cuda_device::kernel]
@@ -3037,6 +3196,30 @@ pub unsafe fn bh_test_pixel_ray(
         *results.add(base) = vec4_v3_f(ray.pos, 0.0);
         *results.add(base + 1) = ray.p;
         *results.add(base + 2) = ray.screen;
+    }
+}
+
+/// Runs `inward_kerr_capture` on arbitrary states around a unit-mass Kerr hole at the
+/// origin, two `Vec4` per case: (position, spin) and p. Writes 1 where it captures.
+#[cuda_device::kernel]
+pub unsafe fn bh_test_capture_guard(
+    cases: *const Vec4,
+    disk_inner: f32,
+    results: *mut u32,
+    count: u32,
+) {
+    let id = gid_x();
+    if id >= count {
+        return;
+    }
+    let base = (2 * id) as usize;
+    let (head, p) = unsafe { (*cases.add(base), *cases.add(base + 1)) };
+    let ray = Ray { pos: head.xyz(), p, screen: vec4(0.0, 0.0, 0.0, 0.0) };
+    let metric = add_kerr_fields::<false>(flat_metric(), ray.pos, 1.0, vec3(0.0, head.w, 0.0));
+    let velocity = (metric.inv * ray.p).yzw();
+    unsafe {
+        *results.add(id as usize) =
+            if inward_kerr_capture(ray, velocity, head.w, disk_inner) { 1 } else { 0 };
     }
 }
 
