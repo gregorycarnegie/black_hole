@@ -2800,7 +2800,8 @@ fn pack_rgba8(c: Vec4) -> u32 {
 const EARLY_CAPTURE_CLEARANCE: f32 = 0.5;
 
 #[inline(always)]
-fn vacuum_radius_sq(objects: &Objects, disk: &Disk) -> f32 {
+/// Squared radius of a sphere enclosing the disk and the hole, at least `floor`.
+fn vacuum_radius_sq(objects: &Objects, disk: &Disk, floor: f32) -> f32 {
     let body = objects.pos_radius[0];
     if objects.num_objects != 1 || disk.binary_enabled != 0 || objects.mass[0].x != 1.0
         || body.x != 0.0 || body.y != 0.0 || body.z != 0.0
@@ -2816,7 +2817,7 @@ fn vacuum_radius_sq(objects: &Objects, disk: &Disk) -> f32 {
     };
     let warp = if disk.model == 3 { 1.01 * disk.r2 } else { 0.0 };
     let height = 4.0 * (aspect * disk.r2).max(1.0e-4) + warp;
-    (1.02 * (radius_sq + height * height)).max(body.w * body.w).max(64.0 * 64.0)
+    (1.02 * (radius_sq + height * height)).max(body.w * body.w).max(floor * floor)
 }
 
 #[inline(always)]
@@ -2996,6 +2997,220 @@ fn inward_kerr_capture(ray: Ray, velocity: Vec3, spin: f32, disk_inner: f32) -> 
         && kerr_capture_certified(ray, spin, disk_inner)
 }
 
+/// Gauss–Legendre nodes and weights on [-1, 1], positive half, for the analytic escape.
+const ESCAPE_GL_NODES: [f64; 4] = [
+    0.183_434_642_495_649_8,
+    0.525_532_409_916_329,
+    0.796_666_477_413_626_7,
+    0.960_289_856_497_536_3,
+];
+const ESCAPE_GL_WEIGHTS: [f64; 4] = [
+    0.362_683_783_378_362,
+    0.313_706_645_877_887_3,
+    0.222_381_034_453_374_5,
+    0.101_228_536_290_376_3,
+];
+const ESCAPE_POLAR_STEPS: u32 = 8;
+const ESCAPE_RADIAL_FLOOR: f64 = 0.5;
+const ESCAPE_POLAR_FLOOR: f64 = 1.0e-6;
+
+/// sin x and cos x in binary64 for |x| up to about 1e9 (`separated::sin_cos`).
+#[inline(always)]
+fn sin_cos_f64(x: f64) -> (f64, f64) {
+    const PIO2_LO: f64 = 6.123_233_995_736_766e-17;
+    let k = (x * core::f64::consts::FRAC_2_PI + if x >= 0.0 { 0.5 } else { -0.5 }) as i64;
+    let kf = k as f64;
+    let r = (x - kf * core::f64::consts::FRAC_PI_2) - kf * PIO2_LO;
+    let r2 = r * r;
+    let s = r
+        * (1.0
+            + r2 * (-1.0 / 6.0
+                + r2 * (1.0 / 120.0
+                    + r2 * (-1.0 / 5040.0
+                        + r2 * (1.0 / 362_880.0
+                            + r2 * (-1.0 / 39_916_800.0
+                                + r2 * (1.0 / 6_227_020_800.0
+                                    + r2 * (-1.0 / 1_307_674_368_000.0
+                                        + r2 / 355_687_428_096_000.0))))))));
+    let c = 1.0
+        + r2 * (-0.5
+            + r2 * (1.0 / 24.0
+                + r2 * (-1.0 / 720.0
+                    + r2 * (1.0 / 40_320.0
+                        + r2 * (-1.0 / 3_628_800.0
+                            + r2 * (1.0 / 479_001_600.0
+                                + r2 * (-1.0 / 87_178_291_200.0
+                                    + r2 / 20_922_789_888_000.0)))))));
+    match k & 3 {
+        0 => (s, c),
+        1 => (c, -s),
+        2 => (-s, -c),
+        _ => (-c, s),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EscapeEnd {
+    ok: bool,
+    pos: Vec3,
+    p: Vec4,
+}
+
+#[inline(always)]
+fn escape_polar_accel(n: [f32; 3], dn: [f32; 3], a2: f32) -> [f32; 3] {
+    let speed2 = dn[0] * dn[0] + dn[1] * dn[1] + dn[2] * dn[2];
+    let pull = a2 * n[2];
+    let radial = speed2 + pull * n[2];
+    [-radial * n[0], -radial * n[1], pull - radial * n[2]]
+}
+
+#[inline(always)]
+fn det3_f64(m: [[f64; 3]; 3]) -> f64 {
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+}
+
+/// Analytic escape leg (checklist P1.8): the state at Kerr–Schild radius `ESCAPE_R` of
+/// an outgoing single-hole ray past its radial turning points, from the separated
+/// solution with only square roots. A line-for-line twin of `separated::far_escape`,
+/// which is tested against the binary64 reference; `ok` is false where its guards fail.
+/// Kept out of line: it runs once per escaping ray.
+#[cuda_device::device]
+#[inline(never)]
+fn analytic_escape(ray: Ray, spin: f32) -> EscapeEnd {
+    use cuda_device::float::sqrt_rn_f64 as sqrt64;
+    let fail = EscapeEnd { ok: false, pos: ray.pos, p: ray.p };
+    let target = ESCAPE_R as f64;
+    let a = f64::from(spin);
+    let a2 = a * a;
+    let (x, y, z) = (f64::from(ray.pos.x), f64::from(ray.pos.y), f64::from(ray.pos.z));
+    let (big_x, big_y, big_z) = (z, x, y);
+    let (p_x, p_y, p_z) = (f64::from(ray.p.w), f64::from(ray.p.y), f64::from(ray.p.z));
+    let rho2 = big_x * big_x + big_y * big_y;
+    let q = rho2 + big_z * big_z - a2;
+    let r2 = 0.5 * (q + sqrt64(q * q + 4.0 * a2 * big_z * big_z));
+    let r = sqrt64(r2);
+    let cos = big_z / r;
+    let sin2 = rho2 / (r2 + a2);
+    if !(r < target && sin2 > ESCAPE_POLAR_FLOOR && a2 < 1.0) {
+        return fail;
+    }
+    let sin = sqrt64(sin2);
+    let norm = 1.0 / ((r2 + a2) * sin);
+    let (cp, sp) = ((big_x * r + big_y * a) * norm, (big_y * r - big_x * a) * norm);
+    let p_r = sin * (cp * p_x + sp * p_y) + cos * p_z;
+    let p_theta = cos / sin * (big_x * p_x + big_y * p_y) - r * sin * p_z;
+    let energy = -f64::from(ray.p.x);
+    let angular = z * f64::from(ray.p.y) - x * f64::from(ray.p.w);
+    let carter = p_theta * p_theta + cos * cos * (angular * angular / sin2 - a2 * energy * energy);
+    let lambda = angular / energy;
+    let eta = carter / (energy * energy);
+    let e_abs = energy.abs();
+    let delta = r2 - 2.0 * r + a2;
+    if !(p_r - (2.0 * r * energy - a * angular) / delta > 0.0) {
+        return fail;
+    }
+
+    let (fa, fb, fc) = (a2 - eta - lambda * lambda, 2.0 * (eta + (lambda - a) * (lambda - a)), -a2 * eta);
+    let (u_end, u_start) = (1.0 / target, 1.0 / r);
+    let (mid, half) = (0.5 * (u_start + u_end), 0.5 * (u_start - u_end));
+    let f_start = 1.0 + u_start * u_start * (fa + u_start * (fb + u_start * fc));
+    let f_end = 1.0 + u_end * u_end * (fa + u_end * (fb + u_end * fc));
+    let mut floor = f_start.min(f_end);
+    // Sums and polar stages in binary32, as in the CPU twin.
+    let (fa32, fb32, fc32, a32, lambda32) = (fa as f32, fb as f32, fc as f32, a as f32, lambda as f32);
+    let (mid32, half32) = (mid as f32, half as f32);
+    let (mut mino, mut phi_radial, mut ks_shift) = (0.0_f32, 0.0_f32, 0.0_f32);
+    let mut i = 0;
+    while i < 8 {
+        let node = ESCAPE_GL_NODES[i / 2] as f32;
+        let weight = ESCAPE_GL_WEIGHTS[i / 2] as f32;
+        let u = mid32 + if i % 2 == 0 { -1.0 } else { 1.0 } * half32 * node;
+        let fu = 1.0 + u * u * (fa32 + u * (fb32 + u * fc32));
+        floor = floor.min(f64::from(fu));
+        let w = weight / sqrt(fu);
+        let delta_u = 1.0 - 2.0 * u + a32 * a32 * u * u;
+        mino += w;
+        phi_radial += w * a32 * u * (2.0 - a32 * lambda32 * u) / delta_u;
+        ks_shift += weight * a32 / delta_u;
+        i += 1;
+    }
+    if !(floor > ESCAPE_RADIAL_FLOOR) {
+        return fail;
+    }
+    let (mino, phi_radial, ks_shift) = (f64::from(mino) * half, f64::from(phi_radial) * half, f64::from(ks_shift) * half);
+
+    let theta_rate = p_theta / e_abs;
+    let mut n = [sin, 0.0, cos];
+    let mut dn = [cos * theta_rate, angular / (e_abs * sin), -sin * theta_rate];
+    let a2_32 = a2 as f32;
+    let h = (mino / ESCAPE_POLAR_STEPS as f64) as f32;
+    let mut step = 0;
+    while step < ESCAPE_POLAR_STEPS {
+        let n1 = [n[0] as f32, n[1] as f32, n[2] as f32];
+        let d1 = [dn[0] as f32, dn[1] as f32, dn[2] as f32];
+        let k1 = escape_polar_accel(n1, d1, a2_32);
+        let n2 = [n1[0] + 0.5 * h * d1[0], n1[1] + 0.5 * h * d1[1], n1[2] + 0.5 * h * d1[2]];
+        let d2 = [d1[0] + 0.5 * h * k1[0], d1[1] + 0.5 * h * k1[1], d1[2] + 0.5 * h * k1[2]];
+        let k2 = escape_polar_accel(n2, d2, a2_32);
+        let n3 = [n1[0] + 0.5 * h * d2[0], n1[1] + 0.5 * h * d2[1], n1[2] + 0.5 * h * d2[2]];
+        let d3 = [d1[0] + 0.5 * h * k2[0], d1[1] + 0.5 * h * k2[1], d1[2] + 0.5 * h * k2[2]];
+        let k3 = escape_polar_accel(n3, d3, a2_32);
+        let n4 = [n1[0] + h * d3[0], n1[1] + h * d3[1], n1[2] + h * d3[2]];
+        let d4 = [d1[0] + h * k3[0], d1[1] + h * k3[1], d1[2] + h * k3[2]];
+        let k4 = escape_polar_accel(n4, d4, a2_32);
+        let mut j = 0;
+        while j < 3 {
+            n[j] += f64::from(h / 6.0 * (d1[j] + 2.0 * d2[j] + 2.0 * d3[j] + d4[j]));
+            dn[j] += f64::from(h / 6.0 * (k1[j] + 2.0 * k2[j] + 2.0 * k3[j] + k4[j]));
+            j += 1;
+        }
+        step += 1;
+    }
+    let length = sqrt64(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    let c = n[2] / length;
+    let rho = sqrt64(n[0] * n[0] + n[1] * n[1]);
+    let sin = rho / length;
+    if !(sin * sin > ESCAPE_POLAR_FLOOR) {
+        return fail;
+    }
+    let sign_e = if energy < 0.0 { -1.0 } else { 1.0 };
+    let (sd, cd) = sin_cos_f64(sign_e * phi_radial + ks_shift);
+    let (cp, sp) = (cp * cd - sp * sd, sp * cd + cp * sd);
+    let (cpsi, spsi) = (n[0] / rho, n[1] / rho);
+    let (cp, sp) = (cp * cpsi - sp * spsi, sp * cpsi + cp * spsi);
+
+    let r = target;
+    let v = dn[2] / length;
+    let delta = r * r - 2.0 * r + a2;
+    let radial = r * r * r * r * f_end;
+    let p_theta = -e_abs * v / sin;
+    let p_r = (e_abs * sqrt64(radial) + 2.0 * r * energy - a * angular) / delta;
+    let big_x = (r * cp - a * sp) * sin;
+    let big_y = (r * sp + a * cp) * sin;
+    let big_z = r * c;
+    let j = [
+        [cp * sin, sp * sin, c],
+        [(r * cp - a * sp) * c, (r * sp + a * cp) * c, -r * sin],
+        [-(r * sp + a * cp) * sin, (r * cp - a * sp) * sin, 0.0],
+    ];
+    let inv_det = 1.0 / det3_f64(j);
+    let solve = |col: usize| {
+        let mut m = j;
+        m[0][col] = p_r;
+        m[1][col] = p_theta;
+        m[2][col] = angular;
+        det3_f64(m) * inv_det
+    };
+    let (p_x, p_y, p_z) = (solve(0), solve(1), solve(2));
+    EscapeEnd {
+        ok: true,
+        pos: vec3(big_y as f32, big_z as f32, big_x as f32),
+        p: vec4(-energy as f32, p_y as f32, p_z as f32, p_x as f32),
+    }
+}
+
 /// The capture guard's hypotheses for the exact real values of the stored binary32
 /// state, in interval binary64: r between the horizon and `disk_inner`, P(h) > 0,
 /// P(h)^2 - Delta(r) K > 0 (`null_radial_positive_below` in KerrCapture.lean) and an
@@ -3145,7 +3360,7 @@ pub unsafe fn bh_geodesic(
     unsafe {
         render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, true, true, true, 0,
+            core::ptr::null_mut(), true, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3166,7 +3381,7 @@ pub unsafe fn bh_geodesic_full_trace(
     unsafe {
         render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), false, true, true, true, 0,
+            core::ptr::null_mut(), false, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3188,7 +3403,7 @@ pub unsafe fn bh_geodesic_single(
     unsafe {
         render_geodesic::<false, false, SINGLE, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, true, true, true, 0,
+            core::ptr::null_mut(), true, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3211,18 +3426,19 @@ pub unsafe fn bh_geodesic_scalar(
     unsafe {
         render_geodesic::<false, false, SINGLE_SCALAR, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, true, true, true, 0,
+            core::ptr::null_mut(), true, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
 }
 
 /// Any combination of the ray options: bit 0 the full trace instead of guarded early
-/// capture, bit 1 capped steps instead of far-field steps (checklist P1.8), bit 2 the
-/// legacy step-doubling RK4 controller
+/// capture, bit 1 capped steps instead of far-field steps and the analytic escape
+/// (checklist P1.8), bit 2 the legacy step-doubling RK4 controller
 /// instead of Dormand–Prince, bit 3 the legacy coupled transfer (one midpoint cell per
 /// geodesic step, the step limited by the disk) instead of decoupled transfer (checklist
-/// P1.9), bits 4-7 a shift that divides the disk transfer cell length by 2^shift.
+/// P1.9), bits 4-7 a shift that divides the disk transfer cell length by 2^shift, bit 8
+/// numerical steps to the sky sphere instead of the analytic escape (checklist P1.8).
 #[cuda_device::kernel]
 pub unsafe fn bh_geodesic_experiments(
     out_image: *mut Vec4,
@@ -3240,7 +3456,7 @@ pub unsafe fn bh_geodesic_experiments(
         render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
-            experiments & 8 == 0, (experiments >> 4) & 15,
+            experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3272,7 +3488,7 @@ pub unsafe fn bh_geodesic_swarm(
     unsafe {
         render_geodesic::<false, true, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, false, 0,
             gid_x(), gid_y(),
             |start, end, t0, t1, _| swarm_bvh_hit(
                 start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
@@ -3334,7 +3550,7 @@ pub unsafe fn bh_geodesic_swarm_record(
     unsafe {
         render_geodesic::<false, true, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, false, 0,
             x, y,
             |start, end, t0, t1, state| {
                 if beyond_belt(swarm_query(start, end, t0, t1), belt_inner, belt_outer, belt_spread) {
@@ -3480,7 +3696,7 @@ pub unsafe fn bh_geodesic_diagnostics(
         render_geodesic::<true, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
             experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
-            experiments & 8 == 0, (experiments >> 4) & 15,
+            experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3612,6 +3828,7 @@ unsafe fn render_geodesic<
     far_field: bool,
     dormand_prince: bool,
     decoupled: bool,
+    analytic_leg: bool,
     refine: u32,
     pix_x: u32,
     pix_y: u32,
@@ -3652,207 +3869,253 @@ unsafe fn render_geodesic<
     } else {
         0.0
     };
-    let vacuum_sq = if far_field { vacuum_radius_sq(objects, disk) } else { f32::INFINITY };
+    let vacuum_sq = if far_field { vacuum_radius_sq(objects, disk, 64.0) } else { f32::INFINITY };
+    // The analytic escape needs an isolated Kerr hole with spin along +y, and no swarm.
+    // Past r = 4 an outgoing ray has no radial turning point left; the CPU twin is
+    // tested from r = 12.
+    let escape_sq = if far_field { vacuum_radius_sq(objects, disk, 16.0) } else { f32::INFINITY };
+    let hole_spin = objects.spin[0];
+    let mut analytic = analytic_leg && !SWARM && escape_sq < f32::INFINITY && hole_spin.x == 0.0 && hole_spin.z == 0.0;
     // Coordinate time relative to the camera; it decreases along the backward ray.
     let mut ray_time = 0.0_f32;
     let mut winding = 0.0_f32;
     let mut i = 0u32;
-    while i < cam.max_iter {
-        iterations = i + 1;
-        if metric.clearance < 0.002 || !metric.valid {
-            if DIAGNOSTICS {
-                exit = if !metric.valid {
-                    RayExit::InvalidMetric
-                } else if winding > UNRESOLVED_WINDING {
-                    RayExit::NearCritical
-                } else {
-                    RayExit::Horizon
-                };
-            }
-            break;
-        }
-        let velocity = (metric.inv * ray.p).yzw();
-        let start_dt = if SWARM { (metric.inv * ray.p).x } else { 0.0 };
-        if early_capture && metric.clearance < capture_clearance {
-            // A tighter interval may rule out a turn even if the first check could not.
-            capture_clearance = 0.5 * metric.clearance;
-            if inward_kerr_capture(ray, velocity, disk.spin, disk.r1) {
+    let mut sky = false;
+    loop {
+        let mut pending = false;
+        while i < cam.max_iter {
+            iterations = i + 1;
+            if metric.clearance < 0.002 || !metric.valid {
                 if DIAGNOSTICS {
-                    exit = if winding > UNRESOLVED_WINDING {
+                    exit = if !metric.valid {
+                        RayExit::InvalidMetric
+                    } else if winding > UNRESOLVED_WINDING {
                         RayExit::NearCritical
                     } else {
-                        RayExit::EarlyCapture
+                        RayExit::Horizon
                     };
                 }
                 break;
             }
-        }
-        let mut distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
-        let clearance_limited_distance = distance;
-        let radius = disk_radius(ray.pos, disk.spin, disk.binary_enabled != 0);
-        // Decoupled transfer: the length of the constant cells this step's plasma is
-        // split into, or zero for one midpoint cell.
-        let mut cell_length = 0.0_f32;
-        if radius > disk.r1 - distance && radius < disk.r2 + distance {
-            let r_clamped = radius.max(disk.r1);
-            let height_d = (get_h_over_r(r_clamped, disk) * r_clamped).max(0.001);
-            let mid = disk_midplane_y(radius.max(0.001), ray.pos.xz(), disk);
-            let to_disk = ((ray.pos.y - mid).abs() - 4.0 * height_d).max(0.0);
-            let refinement = 1.0 / (1u32 << refine) as f32;
-            let cell = 0.25 * height_d * refinement;
-            if !decoupled {
-                distance = distance.min(cell.max(0.5 * to_disk));
-            } else if 0.5 * to_disk < distance {
-                // The coupled scheme's margin: a chord shorter than half the vertical
-                // distance `to_disk` does not reach the emitting slab, tilted or not.
-                let length = cell.min(ORBIT_CELL * r_clamped * refinement);
-                distance = distance.min((MAX_TRANSFER_CELLS as f32 * length).max(0.5 * to_disk));
-                if distance > 0.5 * to_disk {
-                    cell_length = length;
+            let velocity = (metric.inv * ray.p).yzw();
+            let start_dt = if SWARM { (metric.inv * ray.p).x } else { 0.0 };
+            if early_capture && metric.clearance < capture_clearance {
+                // A tighter interval may rule out a turn even if the first check could not.
+                capture_clearance = 0.5 * metric.clearance;
+                if inward_kerr_capture(ray, velocity, disk.spin, disk.r1) {
+                    if DIAGNOSTICS {
+                        exit = if winding > UNRESOLVED_WINDING {
+                            RayExit::NearCritical
+                        } else {
+                            RayExit::EarlyCapture
+                        };
+                    }
+                    break;
                 }
             }
-        }
-        let near_horizon = DIAGNOSTICS && metric.clearance < 1.0;
-        let speed = velocity.length().max(1.0e-6);
-        let geometric_h = distance / speed;
-        let ordinary_h = geometric_h.min(next_h);
-        let proposed_h = if far_field {
-            let far_distance = far_field_distance(ray.pos, velocity, speed, vacuum_sq);
-            ordinary_h.max((far_distance / speed).min(next_h))
-        } else {
-            ordinary_h
-        };
-        let mut step = advance_render_ray::<DIAGNOSTICS, PATH>(ray, proposed_h, &mut metric, objects, &mut stats, dormand_prince);
-        if far_field && proposed_h > ordinary_h
-            && (!step.accepted || ray.pos.dot(step.ray.pos - ray.pos) < 0.0)
-        {
-            // An outward chord stays outside the sphere, including its transfer midpoint.
-            if step.accepted {
-                metric = scene_metric(ray.pos, objects);
+            let mut distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
+            let clearance_limited_distance = distance;
+            let radius = disk_radius(ray.pos, disk.spin, disk.binary_enabled != 0);
+            // Decoupled transfer: the length of the constant cells this step's plasma is
+            // split into, or zero for one midpoint cell.
+            let mut cell_length = 0.0_f32;
+            if radius > disk.r1 - distance && radius < disk.r2 + distance {
+                let r_clamped = radius.max(disk.r1);
+                let height_d = (get_h_over_r(r_clamped, disk) * r_clamped).max(0.001);
+                let mid = disk_midplane_y(radius.max(0.001), ray.pos.xz(), disk);
+                let to_disk = ((ray.pos.y - mid).abs() - 4.0 * height_d).max(0.0);
+                let refinement = 1.0 / (1u32 << refine) as f32;
+                let cell = 0.25 * height_d * refinement;
+                if !decoupled {
+                    distance = distance.min(cell.max(0.5 * to_disk));
+                } else if 0.5 * to_disk < distance {
+                    // The coupled scheme's margin: a chord shorter than half the vertical
+                    // distance `to_disk` does not reach the emitting slab, tilted or not.
+                    let length = cell.min(ORBIT_CELL * r_clamped * refinement);
+                    distance = distance.min((MAX_TRANSFER_CELLS as f32 * length).max(0.5 * to_disk));
+                    if distance > 0.5 * to_disk {
+                        cell_length = length;
+                    }
+                }
             }
-            step = advance_render_ray::<DIAGNOSTICS, PATH>(ray, ordinary_h, &mut metric, objects, &mut stats, dormand_prince);
-        }
-        // Stop when the affine parameter can no longer advance in binary32.
-        if !step.accepted || affine + step.h == affine {
+            let near_horizon = DIAGNOSTICS && metric.clearance < 1.0;
+            let speed = velocity.length().max(1.0e-6);
+            let geometric_h = distance / speed;
+            let ordinary_h = geometric_h.min(next_h);
+            let proposed_h = if far_field {
+                let far_distance = far_field_distance(ray.pos, velocity, speed, vacuum_sq);
+                ordinary_h.max((far_distance / speed).min(next_h))
+            } else {
+                ordinary_h
+            };
+            let mut step = advance_render_ray::<DIAGNOSTICS, PATH>(ray, proposed_h, &mut metric, objects, &mut stats, dormand_prince);
+            if far_field && proposed_h > ordinary_h
+                && (!step.accepted || ray.pos.dot(step.ray.pos - ray.pos) < 0.0)
+            {
+                // An outward chord stays outside the sphere, including its transfer midpoint.
+                if step.accepted {
+                    metric = scene_metric(ray.pos, objects);
+                }
+                step = advance_render_ray::<DIAGNOSTICS, PATH>(ray, ordinary_h, &mut metric, objects, &mut stats, dormand_prince);
+            }
+            // Stop when the affine parameter can no longer advance in binary32.
+            if !step.accepted || affine + step.h == affine {
+                if DIAGNOSTICS {
+                    exit = if step.accepted { RayExit::AffineStagnation } else { RayExit::StepRejected };
+                }
+                break;
+            }
+            let disk_limited = DIAGNOSTICS && geometric_h <= next_h
+                && distance < clearance_limited_distance && step.h <= ordinary_h;
             if DIAGNOSTICS {
-                exit = if step.accepted { RayExit::AffineStagnation } else { RayExit::StepRejected };
+                stats.steps += 1;
+                stats.near_horizon_steps += near_horizon as u32;
+                stats.far_field_steps += (ray.pos.dot(ray.pos) >= 64.0 * 64.0) as u32;
+                stats.disk_limited_steps += disk_limited as u32;
+                stats.controller_limited_steps += (next_h < geometric_h) as u32;
+                stats.wide_steps += (step.h > ordinary_h) as u32;
             }
-            break;
-        }
-        let disk_limited = DIAGNOSTICS && geometric_h <= next_h
-            && distance < clearance_limited_distance && step.h <= ordinary_h;
-        if DIAGNOSTICS {
-            stats.steps += 1;
-            stats.near_horizon_steps += near_horizon as u32;
-            stats.far_field_steps += (ray.pos.dot(ray.pos) >= 64.0 * 64.0) as u32;
-            stats.disk_limited_steps += disk_limited as u32;
-            stats.controller_limited_steps += (next_h < geometric_h) as u32;
-            stats.wide_steps += (step.h > ordinary_h) as u32;
-        }
-        affine += step.h;
-        let h = step.h;
-        let next = step.ray;
-        next_h = h * clamp_f32(0.9 * pow(STEP_TOLERANCE / step.error.max(1.0e-20), 0.2), 0.5, 2.0);
-        let hit = intersect_objects_segment(ray.pos, next.pos, objects);
-        if hit.hit {
-            let intensity = hit.color.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
-            rgb += transmission * hit.color.xyz();
-            stokes.x += transmission * intensity;
-            if DIAGNOSTICS {
-                exit = RayExit::ObjectHit;
-            }
-            break;
-        }
-        if SWARM {
-            // Trapezoidal dt/dλ; `metric` now holds the accepted endpoint's metric.
-            let end_time = ray_time + 0.5 * h * (start_dt + (metric.inv * next.p).x);
-            let state = PixelState { rgb, transmission, stokes, iterations };
-            let body = swarm_hit(ray.pos, next.pos, ray_time, end_time, state);
-            ray_time = end_time;
-            if body.w > 0.0 {
-                rgb += transmission * body.xyz();
-                stokes.x += transmission * body.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
+            affine += step.h;
+            let h = step.h;
+            let next = step.ray;
+            next_h = h * clamp_f32(0.9 * pow(STEP_TOLERANCE / step.error.max(1.0e-20), 0.2), 0.5, 2.0);
+            let hit = intersect_objects_segment(ray.pos, next.pos, objects);
+            if hit.hit {
+                let intensity = hit.color.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
+                rgb += transmission * hit.color.xyz();
+                stokes.x += transmission * intensity;
                 if DIAGNOSTICS {
                     exit = RayExit::ObjectHit;
                 }
                 break;
             }
-        }
-        let cells = if cell_length > 0.0 {
-            clamp_f32(-floor_f32(-h * speed / cell_length), 1.0, MAX_TRANSFER_CELLS as f32) as u32
-        } else {
-            1
-        };
-        let mut sampled = false;
-        let mut cell = 0u32;
-        while cell < cells {
-            let middle = if decoupled {
-                hermite_ray(ray, next, step.rates, h, (cell as f32 + 0.5) / cells as f32)
-            } else {
-                Ray {
-                    pos: 0.5 * (ray.pos + next.pos),
-                    p: 0.5 * (ray.p + next.p),
-                    screen: 0.5 * (ray.screen + next.screen),
+            if SWARM {
+                // Trapezoidal dt/dλ; `metric` now holds the accepted endpoint's metric.
+                let end_time = ray_time + 0.5 * h * (start_dt + (metric.inv * next.p).x);
+                let state = PixelState { rgb, transmission, stokes, iterations };
+                let body = swarm_hit(ray.pos, next.pos, ray_time, end_time, state);
+                ray_time = end_time;
+                if body.w > 0.0 {
+                    rgb += transmission * body.xyz();
+                    stokes.x += transmission * body.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
+                    if DIAGNOSTICS {
+                        exit = RayExit::ObjectHit;
+                    }
+                    break;
                 }
-            };
-            let plasma = sample_plasma(middle, objects, cam, disk);
-            let ds = h / cells as f32 * plasma.energy;
-            if ds > 0.0 {
-                sampled = true;
-                composite_plasma(
-                    &plasma,
-                    ds,
-                    cam.polarization_view != 0,
-                    &mut rgb,
-                    &mut stokes,
-                    &mut transmission,
-                    &mut foreground,
-                );
             }
-            cell += 1;
+            let cells = if cell_length > 0.0 {
+                clamp_f32(-floor_f32(-h * speed / cell_length), 1.0, MAX_TRANSFER_CELLS as f32) as u32
+            } else {
+                1
+            };
+            let mut sampled = false;
+            let mut cell = 0u32;
+            while cell < cells {
+                let middle = if decoupled {
+                    hermite_ray(ray, next, step.rates, h, (cell as f32 + 0.5) / cells as f32)
+                } else {
+                    Ray {
+                        pos: 0.5 * (ray.pos + next.pos),
+                        p: 0.5 * (ray.p + next.p),
+                        screen: 0.5 * (ray.screen + next.screen),
+                    }
+                };
+                let plasma = sample_plasma(middle, objects, cam, disk);
+                let ds = h / cells as f32 * plasma.energy;
+                if ds > 0.0 {
+                    sampled = true;
+                    composite_plasma(
+                        &plasma,
+                        ds,
+                        cam.polarization_view != 0,
+                        &mut rgb,
+                        &mut stokes,
+                        &mut transmission,
+                        &mut foreground,
+                    );
+                }
+                cell += 1;
+            }
+            if DIAGNOSTICS {
+                stats.plasma_steps += sampled as u32;
+                stats.vacuum_disk_steps += (disk_limited && !sampled) as u32;
+            }
+            winding += swept_angle(ray.pos, next.pos);
+            ray = next;
+            if PATH != SINGLE_SCALAR {
+                let frame = screen_frame(ray, metric);
+                ray.screen = vec4_f_v3(0.0, frame[0]);
+            }
+            if analytic {
+                let radius_sq = ray.pos.dot(ray.pos);
+                if radius_sq > escape_sq && radius_sq < ESCAPE_R * ESCAPE_R {
+                    // The far-field guard: an outward ray within 18 degrees of radial.
+                    let v = (metric.inv * ray.p).yzw();
+                    if ray.pos.dot(v) > 0.95 * sqrt(radius_sq) * v.length() {
+                        // Leave the loop so the warp's escaping lanes run the f64 leg together.
+                        pending = true;
+                        break;
+                    }
+                }
+            }
+            if ray.pos.length() > ESCAPE_R && winding > UNRESOLVED_WINDING {
+                // Unresolved: no sky, as for the iteration limit; captures already add none.
+                if DIAGNOSTICS {
+                    exit = RayExit::NearCritical;
+                }
+                break;
+            }
+            if ray.pos.length() > ESCAPE_R {
+                sky = true;
+                break;
+            }
+            if transmission < 0.001 {
+                if DIAGNOSTICS {
+                    exit = RayExit::Opaque;
+                }
+                break;
+            }
+            i += 1;
         }
+        if pending {
+            let end = analytic_escape(ray, hole_spin.y);
+            if !end.ok {
+                // Resume the numerical trace; the guards rarely fail.
+                analytic = false;
+                i += 1;
+                continue;
+            }
+            winding += swept_angle(ray.pos, end.pos);
+            ray.pos = end.pos;
+            ray.p = end.p;
+            metric = scene_metric(ray.pos, objects);
+            if winding > UNRESOLVED_WINDING {
+                if DIAGNOSTICS {
+                    exit = RayExit::NearCritical;
+                }
+            } else {
+                sky = true;
+            }
+        }
+        break;
+    }
+    if sky {
+        let direction = (metric.inv * ray.p).yzw().normalize();
+        let sample = unsafe {
+            sample_skybox(
+                direction,
+                skybox,
+                sky_w as i32,
+                sky_h as i32,
+            )
+        };
+        rgb += transmission * sample;
+        stokes.x += transmission * sample.dot(vec3(0.2126, 0.7152, 0.0722));
         if DIAGNOSTICS {
-            stats.plasma_steps += sampled as u32;
-            stats.vacuum_disk_steps += (disk_limited && !sampled) as u32;
+            exit = RayExit::Escaped;
+            stats.sky_direction = [direction.x, direction.y, direction.z];
         }
-        winding += swept_angle(ray.pos, next.pos);
-        ray = next;
-        if PATH != SINGLE_SCALAR {
-            let frame = screen_frame(ray, metric);
-            ray.screen = vec4_f_v3(0.0, frame[0]);
-        }
-        if ray.pos.length() > ESCAPE_R && winding > UNRESOLVED_WINDING {
-            // Unresolved: no sky, as for the iteration limit; captures already add none.
-            if DIAGNOSTICS {
-                exit = RayExit::NearCritical;
-            }
-            break;
-        }
-        if ray.pos.length() > ESCAPE_R {
-            let direction = (metric.inv * ray.p).yzw().normalize();
-            let sky = unsafe {
-                sample_skybox(
-                    direction,
-                    skybox,
-                    sky_w as i32,
-                    sky_h as i32,
-                )
-            };
-            rgb += transmission * sky;
-            stokes.x += transmission * sky.dot(vec3(0.2126, 0.7152, 0.0722));
-            if DIAGNOSTICS {
-                exit = RayExit::Escaped;
-                stats.sky_direction = [direction.x, direction.y, direction.z];
-            }
-            break;
-        }
-        if transmission < 0.001 {
-            if DIAGNOSTICS {
-                exit = RayExit::Opaque;
-            }
-            break;
-        }
-        i += 1;
     }
     let output = pixel_output(rgb, stokes, iterations, cam);
     if DIAGNOSTICS {

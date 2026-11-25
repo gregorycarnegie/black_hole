@@ -664,10 +664,13 @@ fn active_experiments(single_source: bool, experiments: Option<&RayExperiments>)
     let Some(experiments) = experiments else {
         return 0;
     };
-    // Early capture and far-field steps are on by default and their kernel guards
-    // reject other scenes; bit 0 asks for the full trace, bit 1 for capped steps.
+    // Early capture, far-field steps and the analytic escape are on by default and their
+    // kernel guards reject other scenes; bit 0 asks for the full trace, bit 1 for capped
+    // steps (and no analytic escape), bit 8 for no analytic escape.
     let single = if single_source {
-        u32::from(experiments.full_trace) | (u32::from(experiments.no_far_field) << 1)
+        u32::from(experiments.full_trace)
+            | (u32::from(experiments.no_far_field) << 1)
+            | (u32::from(experiments.no_analytic_escape) << 8)
     } else {
         0
     };
@@ -1000,7 +1003,9 @@ mod swarm_gpu {
     #[ignore = "requires a CUDA GPU"]
     fn an_empty_swarm_renders_the_ordinary_image() {
         let scene = single_hole();
-        let (ordinary, _) = render(&scene, None);
+        // The swarm kernels trace numerically to the sky sphere: compare with the ordinary
+        // image without the analytic escape (experiment bit 8, checklist P1.8).
+        let (ordinary, _) = render_with(&scene, None, 256);
         let (swarm, _) = render(&scene, Some(&device(&[], true)));
         assert!(
             ordinary

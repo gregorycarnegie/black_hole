@@ -24,6 +24,9 @@ fn main() {
     // One midpoint transfer cell per geodesic step, kept for one release after decoupled
     // transfer became the default (checklist P1.9).
     let coupled_transfer = std::env::args_os().any(|arg| arg == "--coupled-transfer");
+    // Numerical steps to the sky sphere, kept for one release after the analytic escape
+    // became the default (checklist P1.8).
+    let no_analytic_escape = std::env::args_os().any(|arg| arg == "--no-analytic-escape");
     let mut window = Window {
         title: "Black Hole".into(),
         resolution: (800u32, 600u32).into(),
@@ -52,8 +55,15 @@ fn main() {
     if profiling {
         compute::profile::install(&mut app);
     }
-    if full_trace || no_far_field || rk4 || coupled_transfer {
-        compute::enable_ray_experiments(&mut app, full_trace, no_far_field, rk4, coupled_transfer);
+    if full_trace || no_far_field || rk4 || coupled_transfer || no_analytic_escape {
+        compute::enable_ray_experiments(
+            &mut app,
+            full_trace,
+            no_far_field,
+            rk4,
+            coupled_transfer,
+            no_analytic_escape,
+        );
     }
     app.run();
 }

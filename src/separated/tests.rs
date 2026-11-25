@@ -26,7 +26,7 @@ fn null_ray(spin: f64, pos: [f64; 3], spatial: [f64; 3], backward: bool) -> [f64
 
 /// A camera-like ray: position at `radius` in direction (θ, φ), momentum aimed at the
 /// hole and turned by `offset` radians about a random axis.
-fn camera_ray(
+pub(super) fn camera_ray(
     spin: f64,
     radius: f64,
     (theta, phi): (f64, f64),
@@ -97,7 +97,7 @@ fn integrate(spin: f64, pos: [f64; 3], p: [f64; 4]) -> Option<[f64; 11]> {
     None
 }
 
-fn angle(u: [f64; 3], v: [f64; 3]) -> f64 {
+pub(super) fn angle(u: [f64; 3], v: [f64; 3]) -> f64 {
     let dot: f64 = (0..3).map(|i| u[i] * v[i]).sum();
     let cross = [
         u[1] * v[2] - u[2] * v[1],

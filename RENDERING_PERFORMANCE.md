@@ -228,7 +228,7 @@ Single-hole scenes run their own builds of the production renderer, chosen on th
 
 The close-up (`--profile-renderer`) uses polarization view 2 and the hot flow, so it runs `bh_geodesic_single`. Two rounds each, alternating, still / orbit medians: 18.35 / 16.92 and 18.25 / 16.98 ms with `bh_geodesic`, against 16.47 / 15.01 and 16.22 / 15.09 ms with `bh_geodesic_single` (about 11%).
 
-`specialised_kernels_match_bh_geodesic` renders 4 spins (0, 0.82, -0.99, 0.999), all 4 disk models, polarization views 0, 2 and 5, and 2 camera elevations. It requires `bh_geodesic_single` to match `bh_geodesic` bit for bit everywhere, and `bh_geodesic_scalar` to stay within 1/255 in every channel in each thermal-only mode. Binaries, the swarm, the wormhole, diagnostics and the `--full-trace`, `--no-far-field` and `--rk4-controller` options still use the generic kernels.
+`specialised_kernels_match_bh_geodesic` renders 4 spins (0, 0.82, -0.99, 0.999), all 4 disk models, polarization views 0, 2 and 5, and 2 camera elevations. It requires `bh_geodesic_single` to match `bh_geodesic` bit for bit everywhere, and `bh_geodesic_scalar` to stay within 1/255 in every channel in each thermal-only mode. Binaries, the swarm, the wormhole, diagnostics and the `--full-trace`, `--no-far-field`, `--no-analytic-escape` and `--rk4-controller` options still use the generic kernels.
 
 ## Far-field steps by default (checklist P1.8)
 
@@ -255,7 +255,40 @@ At 400×300 the changes run from −4.6% to +2.5%, close to the noise. The gain 
 
 Shift check over six views (thin disk at two elevations, warped disk at spin −0.9, the hot-flow close-up, the warped disk from radius 160, and the thin disk at spin 0.99), 400×300: steps fell by 34–42% (for example 11.19M → 6.96M on the thin disk, 8.98M → 5.25M from radius 160). No ray changed its exit and Stokes I was unchanged bit for bit. The sampled sky direction moved by at most 5.8e-7 rad and the largest image change was 2.7e-7.
 
-So a full analytic escape can add at most the difference between the oracle and the far-field default: about 5–13 points at 960×540, minus its own cost. That is the next P1.8 measurement.
+So a full analytic escape can add at most the difference between the oracle and the far-field default: about 5–13 points at 960×540, minus its own cost. The next section measures it.
+
+## Analytic escape (default, checklist P1.8)
+
+An escaping single-hole ray now leaves the numerical loop once it is outside the sphere enclosing the disk and the hole (radius at least 16) and moving outward within 18 degrees of radial, the far-field guard. From there `analytic_escape` in `tools/cuda/kernels.rs` carries it to Kerr–Schild radius 1600 with the separated solution and samples the sky. Swarm scenes keep the numerical trace, because the leg would skip their per-step intersection tests. `--no-analytic-escape` (experiment bit 8) turns the leg off; `--no-far-field` turns off both.
+
+**Method.** Beyond r = 4 an outgoing ray has no radial turning point left, so the elliptic case analysis of P1.7 is not needed:
+- *Radial integrals.* With u = 1/r, R(r) = r⁴ f(u) and f(u) = 1 + (a² − η − λ²)u² + 2(η + (λ − a)²)u³ − a²η u⁴. Under the guard f stays near the squared radial cosine (above 0.5 is required), so Mino time ∫du/√f, the Boyer–Lindquist azimuth term and the Kerr–Schild shift ∫a du/(1 − 2u + a²u²) are smooth on [1/1600, 1/r]. An 8-node Gauss–Legendre sum evaluates them.
+- *Polar motion.* In Mino time the polar direction n = (sin θ cos ψ, sin θ sin ψ, cos θ) moves on the unit sphere under the potential −a² n_z²/2, with ψ the polar part of the azimuth: n'' = −|n'|² n + a² n_z (ẑ − n_z n). This equation is regular at the pole, unlike ∫dτ/sin²θ: a first version that integrated cos θ and ∫dτ/sin²θ had errors up to 2.7e-6 rad near the pole and had to reject 9% of rays. Eight RK4 steps integrate n; the azimuth comes from its final direction.
+- *Precision.* The conserved quantities, the start point and the rebuild of the Cartesian state run in binary64, where they cancel. The Gauss–Legendre sums and the RK4 stages run in binary32 (64 times faster on this GPU), with the polar state accumulated in binary64. Only `sqrt` and a hand-written binary64 `sin_cos` are needed.
+- *Divergence.* The first device version called the leg inside the loop, so a warp ran it once for each escaping lane, one lane at a time. It was 3–15% slower than the far-field default. Lanes now leave the loop and run the leg together after it, once per warp. If a guard fails (not seen in testing), the ray resumes the numerical trace.
+
+**Accuracy.** `separated::far_escape` is the leg's CPU twin, line for line. `far_escape_matches_the_separated_solution` checks it against the binary64 quadrature reference on random outgoing rays from r = 12 to 800 at spins up to ±0.99, including rays over the pole, and requires 2e-7 rad. Over 20,000 rays per radius band the error has median 4–8e-9 rad, 99th percentile 3–6e-8 rad and maximum 1.3e-7 rad (at r = 12–16; 7e-8 rad from r = 24). On the GPU, `gpu_escapes_match_the_separated_solution` is unchanged: median 1.3–1.7e-7 rad, 99th percentile 2.5–4.0e-6 rad, and no pixel changes classification.
+
+**Steps.** In the 400×300 thin-disk view, accepted steps fall from 6.96 million to 4.84 million, and steps starting at r ≥ 64 from 2.23 million to 0.22 million. Every exit is unchanged (117,840 escapes in both).
+
+**Time.** Same-process A/B against the far-field default PTX, 30 alternating samples after warm-up, medians:
+
+| Kernel | Scene | 400×300 | 960×540 |
+|---|---|---:|---:|
+| `bh_geodesic` | thin disk | 13.20 → 13.23 ms | 18.50 → 17.60 ms (−4.9%) |
+| `bh_geodesic` | thin disk, view 2 | 14.46 → 14.64 ms | 20.15 → 19.35 ms (−4.0%) |
+| `bh_geodesic` | hot flow, view 5 | 8.58 → 8.60 ms | 17.77 → 16.40 ms (−7.7%) |
+| `bh_geodesic` | thin disk, elevation 0.2 | 7.91 → 7.91 ms | 15.48 → 14.60 ms (−5.7%) |
+| `bh_geodesic_single` | thin disk | 11.26 → 11.21 ms | 15.83 → 14.97 ms (−5.4%) |
+| `bh_geodesic_single` | thin disk, view 2 | 12.64 → 12.61 ms | 17.30 → 16.51 ms (−4.6%) |
+| `bh_geodesic_single` | hot flow, view 5 | 7.49 → 7.27 ms | 15.24 → 13.79 ms (−9.5%) |
+| `bh_geodesic_single` | thin disk, elevation 0.2 | 6.71 → 6.51 ms | 12.90 → 12.00 ms (−7.0%) |
+| `bh_geodesic_scalar` | thin disk | 9.28 → 9.41 ms | 12.80 → 12.68 ms (−0.9%) |
+| `bh_geodesic_scalar` | thin disk, elevation 0.2 | 5.62 → 5.63 ms | 10.48 → 9.96 ms (−4.9%) |
+
+No image channel changed by more than 4e-4, and none by 1/255. Against a stub that moves the ray to r = 1600 for free, the leg costs 0–4% (mostly 1–3%), so most of the remaining gap to the oracle is not its arithmetic. Repeat runs moved individual rows by about ±1.5 points.
+
+**Not covered.** Only the escape leg is analytic. Vacuum intervals between disk crossings and inward legs to the horizon (where early capture already ends most rays) still use the numerical trace.
 
 ## Separated Kerr reference (checklist P1.7)
 

@@ -103,7 +103,8 @@ Pass options after `--`, for example `cargo run --release -- --full-trace`.
 | Option | Effect |
 |---|---|
 | `--full-trace` | Turns off early capture, which by default ends single-hole rays once a proved Kerr test shows they will fall into the horizon. The image is the same; the full trace is about five times slower in the close-up. |
-| `--no-far-field` | Single hole only: turns off the larger steps the renderer takes far from the hole and disk, and caps steps everywhere as before. Sky directions differ by at most 6e-7 rad, and it is slower. Kept for one release. |
+| `--no-far-field` | Single hole only: turns off the larger steps the renderer takes far from the hole and disk, and caps steps everywhere as before. It also turns off the analytic escape. Sky directions differ by at most 6e-7 rad, and it is slower. Kept for one release. |
+| `--no-analytic-escape` | Single hole only: traces escaping rays step by step to the sky sphere instead of finishing them with the separated Kerr solution. Sky directions differ by about 1e-7 rad, and it is slower. Kept for one release. |
 | `--rk4-controller` | All scenes: uses the earlier step-doubling RK4 controller instead of the default Dormand–Prince 5(4) one. About twice as slow; kept for one release. |
 | `--profile-renderer` | Runs a fixed benchmark and writes per-ray diagnostics to `target/renderer-rays*.csv`, then exits. |
 | `--optix` | In an RTX build (below), starts with the RTX button on. |

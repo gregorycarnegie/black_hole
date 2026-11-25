@@ -151,7 +151,12 @@ pub(super) fn write_ray_profile(
     // Field order matches RayDiagnostics in the CUDA kernel.
     create_dir_all("target")?;
     let mut path = String::from("target/renderer-rays");
-    for (bit, name) in [(1, "-full-trace"), (2, "-no-far-field"), (4, "-rk4")] {
+    for (bit, name) in [
+        (1, "-full-trace"),
+        (2, "-no-far-field"),
+        (4, "-rk4"),
+        (256, "-no-analytic-escape"),
+    ] {
         if experiments & bit != 0 {
             path.push_str(name);
         }

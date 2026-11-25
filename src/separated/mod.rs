@@ -10,10 +10,12 @@
 //! R = (r² + a² - aλ)² - Δ(η + (λ - a)²), Θ = η + a² cos²θ - λ² cot²θ, λ = L/E, η = Q/E².
 
 mod elliptic;
+mod escape;
 mod quadrature;
 
 use crate::certified::Kerr;
 use elliptic::{amplitude, legendre_f, legendre_pi, legendre_pi_near_one};
+pub use escape::{far_escape, sin_cos};
 use quadrature::tanh_sinh;
 
 /// Why a ray has no reference answer.
