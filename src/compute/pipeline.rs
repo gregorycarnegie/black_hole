@@ -664,10 +664,10 @@ fn active_experiments(single_source: bool, experiments: Option<&RayExperiments>)
     let Some(experiments) = experiments else {
         return 0;
     };
-    // Far field assumes a single source. Early capture is on by default and its kernel
-    // guard rejects other scenes; bit 0 asks for the full trace.
+    // Early capture and far-field steps are on by default and their kernel guards
+    // reject other scenes; bit 0 asks for the full trace, bit 1 for capped steps.
     let single = if single_source {
-        u32::from(experiments.full_trace) | (u32::from(experiments.far_field) << 1)
+        u32::from(experiments.full_trace) | (u32::from(experiments.no_far_field) << 1)
     } else {
         0
     };
@@ -1853,7 +1853,7 @@ fn decoupled_transfer_against_a_refined_reference() {
 }
 
 /// Checklist P1.9: frame time of the decoupled and the legacy coupled transfer in the
-/// same experiments kernel, with and without far-field steps.
+/// same experiments kernel, with and without far-field steps (bit 1 turns them off).
 #[cfg(test)]
 #[test]
 #[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
@@ -1863,10 +1863,10 @@ fn decoupled_transfer_benchmark() {
     let kernel = &cuda.geodesic_experiments;
     let default = crate::camera::OrbitalCamera::default().elevation;
     let variants = [
-        ("coupled", 8u32),
+        ("coupled, capped steps", 10u32),
+        ("decoupled, capped steps", 2),
+        ("coupled", 8),
         ("decoupled", 0),
-        ("far field, coupled", 10),
-        ("far field, decoupled", 2),
     ];
     for (mode, elevation) in [
         ((KERR_SPIN, DiskModel::ThinNt, 0u32), default),

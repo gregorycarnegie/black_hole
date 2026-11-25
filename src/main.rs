@@ -16,7 +16,9 @@ fn main() {
     let profiling = std::env::args_os().any(|arg| arg == "--profile-renderer");
     // Turns off guarded single-Kerr early capture, which is on by default.
     let full_trace = std::env::args_os().any(|arg| arg == "--full-trace");
-    let far_field = std::env::args_os().any(|arg| arg == "--experiment-far-field");
+    // Capped steps far from the hole, kept for one release after far-field steps became
+    // the default (checklist P1.8).
+    let no_far_field = std::env::args_os().any(|arg| arg == "--no-far-field");
     // The step-doubling RK4 controller, kept for one release after Dormand–Prince became the default.
     let rk4 = std::env::args_os().any(|arg| arg == "--rk4-controller");
     // One midpoint transfer cell per geodesic step, kept for one release after decoupled
@@ -50,8 +52,8 @@ fn main() {
     if profiling {
         compute::profile::install(&mut app);
     }
-    if full_trace || far_field || rk4 || coupled_transfer {
-        compute::enable_ray_experiments(&mut app, full_trace, far_field, rk4, coupled_transfer);
+    if full_trace || no_far_field || rk4 || coupled_transfer {
+        compute::enable_ray_experiments(&mut app, full_trace, no_far_field, rk4, coupled_transfer);
     }
     app.run();
 }

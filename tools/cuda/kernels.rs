@@ -3145,7 +3145,7 @@ pub unsafe fn bh_geodesic(
     unsafe {
         render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false, true, true, 0,
+            core::ptr::null_mut(), true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3166,7 +3166,7 @@ pub unsafe fn bh_geodesic_full_trace(
     unsafe {
         render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), false, false, true, true, 0,
+            core::ptr::null_mut(), false, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3188,7 +3188,7 @@ pub unsafe fn bh_geodesic_single(
     unsafe {
         render_geodesic::<false, false, SINGLE, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false, true, true, 0,
+            core::ptr::null_mut(), true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3211,14 +3211,15 @@ pub unsafe fn bh_geodesic_scalar(
     unsafe {
         render_geodesic::<false, false, SINGLE_SCALAR, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false, true, true, 0,
+            core::ptr::null_mut(), true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
 }
 
 /// Any combination of the ray options: bit 0 the full trace instead of guarded early
-/// capture, bit 1 far-field steps, bit 2 the legacy step-doubling RK4 controller
+/// capture, bit 1 capped steps instead of far-field steps (checklist P1.8), bit 2 the
+/// legacy step-doubling RK4 controller
 /// instead of Dormand–Prince, bit 3 the legacy coupled transfer (one midpoint cell per
 /// geodesic step, the step limited by the disk) instead of decoupled transfer (checklist
 /// P1.9), bits 4-7 a shift that divides the disk transfer cell length by 2^shift.
@@ -3238,7 +3239,7 @@ pub unsafe fn bh_geodesic_experiments(
     unsafe {
         render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
             experiments & 8 == 0, (experiments >> 4) & 15,
             gid_x(), gid_y(), no_swarm,
         );
@@ -3271,7 +3272,7 @@ pub unsafe fn bh_geodesic_swarm(
     unsafe {
         render_geodesic::<false, true, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0, experiments & 8 == 0, 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, 0,
             gid_x(), gid_y(),
             |start, end, t0, t1, _| swarm_bvh_hit(
                 start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
@@ -3333,7 +3334,7 @@ pub unsafe fn bh_geodesic_swarm_record(
     unsafe {
         render_geodesic::<false, true, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0, experiments & 8 == 0, 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, 0,
             x, y,
             |start, end, t0, t1, state| {
                 if beyond_belt(swarm_query(start, end, t0, t1), belt_inner, belt_outer, belt_spread) {
@@ -3478,7 +3479,7 @@ pub unsafe fn bh_geodesic_diagnostics(
     unsafe {
         render_geodesic::<true, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
-            experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
+            experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
             experiments & 8 == 0, (experiments >> 4) & 15,
             gid_x(), gid_y(), no_swarm,
         );

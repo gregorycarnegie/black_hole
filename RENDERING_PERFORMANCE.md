@@ -87,9 +87,9 @@ The windowed A/B used the same RTX 4090, close-up, 400×300 internal render, and
 
 All seven fixed-camera image pairs matched in both floating-point and RGBA8 output. These included spins ±0.82 and 0.99, thin-disk intensity, hot-flow EVPA, warped-disk circular polarization, and the binary and spin-0.999 fallback cases. The GPU regression also exercised 4,005 equatorial Kerr rays at five spins, checked early captures against the exterior minimum of the analytic equatorial potential, and checked 256 near-critical Schwarzschild rays with each mode. [GPU trajectory tests](tests/common/controller.rs#L150)
 
-## Experimental far-field steps
+## Far-field steps (first experiment)
 
-`cargo run --offline -- --experiment-far-field` enables far-field steps on top of the default early capture. For the benchmark, add `--profile-renderer` and run once with and once without `--experiment-far-field`. Compare `target/renderer-rays-far-field.csv` and `target/renderer-rays.csv`. (The measurements below predate the default and used `--experiment-early-capture`.) Each per-pixel row now includes the number of enlarged steps and the direction used to sample the sky on an escape.
+Far-field steps are now the default; see "Far-field steps by default (checklist P1.8)" below. `--no-far-field` turns them off. For the benchmark, run `--profile-renderer` once with and once without `--no-far-field` and compare `target/renderer-rays.csv` with `target/renderer-rays-no-far-field.csv`. (The measurements in this section predate both defaults and used `--experiment-early-capture` and `--experiment-far-field`.) Each per-pixel row now includes the number of enlarged steps and the direction used to sample the sky on an escape.
 
 The larger steps start outside a padded sphere enclosing the disk's radial and vertical support and the central object. The ray must point outward with radial cosine above 0.95. The proposal is capped at 28% of the current radius and 192 gravitational radii, with the ordinary cap restored near the 1,600-gravitational-radius sky sampling sphere. The existing RK4 checks still control acceptance. If the proposal fails or its accepted chord heads inward, the renderer retries with the ordinary proposal. Lean proves that an exact chord with a nonnegative radial dot product remains outside its starting sphere. [CUDA guard](tools/cuda/kernels.rs#L2037) · [Outward-chord proof](verification/BlackHole/KerrCapture.lean)
 
@@ -228,7 +228,34 @@ Single-hole scenes run their own builds of the production renderer, chosen on th
 
 The close-up (`--profile-renderer`) uses polarization view 2 and the hot flow, so it runs `bh_geodesic_single`. Two rounds each, alternating, still / orbit medians: 18.35 / 16.92 and 18.25 / 16.98 ms with `bh_geodesic`, against 16.47 / 15.01 and 16.22 / 15.09 ms with `bh_geodesic_single` (about 11%).
 
-`specialised_kernels_match_bh_geodesic` renders 4 spins (0, 0.82, -0.99, 0.999), all 4 disk models, polarization views 0, 2 and 5, and 2 camera elevations. It requires `bh_geodesic_single` to match `bh_geodesic` bit for bit everywhere, and `bh_geodesic_scalar` to stay within 1/255 in every channel in each thermal-only mode. Binaries, the swarm, the wormhole, diagnostics and the `--full-trace`, `--experiment-far-field` and `--rk4-controller` options still use the generic kernels.
+`specialised_kernels_match_bh_geodesic` renders 4 spins (0, 0.82, -0.99, 0.999), all 4 disk models, polarization views 0, 2 and 5, and 2 camera elevations. It requires `bh_geodesic_single` to match `bh_geodesic` bit for bit everywhere, and `bh_geodesic_scalar` to stay within 1/255 in every channel in each thermal-only mode. Binaries, the swarm, the wormhole, diagnostics and the `--full-trace`, `--no-far-field` and `--rk4-controller` options still use the generic kernels.
+
+## Far-field steps by default (checklist P1.8)
+
+P1.8 asks for an analytic vacuum propagator. Before building one, a step census measured how much there is to gain. With capped steps, steps starting at r ≥ 64 were 52–59% of all steps in the tested single-hole frames: an escaping ray took about 55 of its roughly 92 steps there, crossing empty space to the sky sphere at r = 1600. An oracle that ended escaping rays at r = 64 for free, as a perfect analytic escape would, cut the kernel time by 18–33% at 960×540 and 4.5–11% at 400×300. (It sampled the sky at the wrong place, so it bounds the gain and says nothing about accuracy.)
+
+The far-field steps from the first experiment already take much of that gain, so they are now the default for single-hole scenes. Against the separated reference (`gpu_escapes_match_the_separated_solution`, 4 spins and 2 elevations), they leave the escape-direction error unchanged: the median stays 1.2–1.7e-7 rad, the 99th percentile 2.5–4.1e-6 rad, and no ray changes classification.
+
+Same-process A/B against the previous PTX, 30 alternating samples after warm-up, medians:
+
+| Kernel | Scene | 400×300 | 960×540 |
+|---|---|---:|---:|
+| `bh_geodesic` | thin disk | 13.12 → 13.03 ms | 20.55 → 18.20 ms (−11.4%) |
+| `bh_geodesic` | thin disk, view 2 | 14.46 → 14.45 ms | 22.15 → 19.89 ms (−10.2%) |
+| `bh_geodesic` | hot flow, view 5 | 8.89 → 8.48 ms | 22.21 → 17.55 ms (−21.0%) |
+| `bh_geodesic` | thin disk, elevation 0.2 | 8.00 → 7.80 ms | 17.71 → 15.27 ms (−13.8%) |
+| `bh_geodesic_single` | thin disk | 11.01 → 11.14 ms | 17.54 → 15.66 ms (−10.7%) |
+| `bh_geodesic_single` | thin disk, view 2 | 12.39 → 12.47 ms | 18.81 → 17.12 ms (−9.0%) |
+| `bh_geodesic_single` | hot flow, view 5 | 7.61 → 7.44 ms | 18.51 → 15.06 ms (−18.6%) |
+| `bh_geodesic_single` | thin disk, elevation 0.2 | 6.85 → 6.90 ms | 15.02 → 13.05 ms (−13.1%) |
+| `bh_geodesic_scalar` | thin disk | 9.08 → 9.31 ms | 14.19 → 12.99 ms (−8.4%) |
+| `bh_geodesic_scalar` | thin disk, elevation 0.2 | 5.69 → 5.66 ms | 11.90 → 10.55 ms (−11.4%) |
+
+At 400×300 the changes run from −4.6% to +2.5%, close to the noise. The gain is larger at 960×540, where more rays escape to the sky and the per-ray saving outweighs the frame's tail.
+
+Shift check over six views (thin disk at two elevations, warped disk at spin −0.9, the hot-flow close-up, the warped disk from radius 160, and the thin disk at spin 0.99), 400×300: steps fell by 34–42% (for example 11.19M → 6.96M on the thin disk, 8.98M → 5.25M from radius 160). No ray changed its exit and Stokes I was unchanged bit for bit. The sampled sky direction moved by at most 5.8e-7 rad and the largest image change was 2.7e-7.
+
+So a full analytic escape can add at most the difference between the oracle and the far-field default: about 5–13 points at 960×540, minus its own cost. That is the next P1.8 measurement.
 
 ## Separated Kerr reference (checklist P1.7)
 
