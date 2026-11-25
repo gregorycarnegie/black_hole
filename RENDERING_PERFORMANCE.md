@@ -292,7 +292,7 @@ Not covered:
 - **The |z| = 4H truncation:** the density jumps from exp(−8) of its midplane value to zero there, and that jump is not resolved.
 - **The EHT snapshot path:** it keeps its own transfer loop (`transfer_cell` and `grid_step`). Its status counts are unchanged (990 captured, 24,610 escaped), and it was not decoupled.
 
-## Baseline profile (checklist P0.1, in progress)
+## Baseline profile (checklist P0.1)
 
 `baseline_profile` times the production kernels on a fixed scene set, with the kernel and launch shape `dispatch_geodesic` picks for each scene. In the same rounds it times `bh_geodesic` from the checklist's pinned revision (e9ce1b95), loaded from `PINNED_PTX`. That kernel was the pinned app's default: the RK4 controller, full trace, 16×16 blocks for the binary. The camera, disk, frame index and sub-pixel sample are fixed, and the sky is a two-texel test texture. Each launch is timed with CUDA events: 10 warm-up rounds, then 30 timed rounds. Within a round the scenes run in turn, and the current and pinned kernels alternate which goes first. Per-launch times go to `target/baseline-profile.csv`. Step and exit counts come from a separate pass of the diagnostics kernel, so timing runs without instrumentation.
 
@@ -331,11 +331,48 @@ What this says about the next steps:
 - **Time goes into each step.** The scenes take 86–90 attempts per median ray, yet the polarized hot flow takes 1.8 times as long as the thermal thin disk at 960×540. The difference is per-step work: polarized transport and plasma sampling.
 - **The binary stagnates.** 5,123 binary rays (1.0%) end in affine stagnation, against at most 1 per single-hole frame.
 
-Not yet done for P0.1:
-- **Nsight Systems and Nsight Compute.** Neither is installed, so there is no timeline, occupancy, stall, branch-efficiency, memory-traffic or instruction-mix data yet.
-- **The rest of the benchmark matrix:** spins ±0.99 and ±0.999, Schwarzschild, the distant view at radius 160, and near-horizon views.
-- **The EHT snapshot**, which is timed separately and not part of this harness.
-- **The app's sky texture.** The test sky has two texels, so sky lookups are cheaper than in the app.
+**Nsight Systems timeline.** Nsight Systems 2026.6.1 traced CUDA and D3D12 in the real app on the `--profile-renderer` close-up (`bh_geodesic_single`):
+
+```
+nsys profile --trace=cuda,dx12 --sample=none --cpuctxsw=none -o target/nsys/profile-renderer target/release/black_hole.exe --profile-renderer
+```
+
+After the first 12 frames, the geodesic kernel takes 15.06 ms at the median (p95 17.80 ms). Kernels start 17.66 ms apart (p95 21.80 ms). Between one geodesic kernel ending and the next starting, CUDA is idle for 2.60 ms at the median (p95 3.97 ms). Accumulation takes 2 µs per frame and the device-to-host copy 20 µs; the 15 ms that the readback call spends is the host waiting for the kernel. So the geodesic kernel is 85% of the frame. Overlapping or sharing the display handoff (P2.6) could recover at most the 2.6 ms idle gap, about 15% of this frame.
+
+**Nsight Compute.** Nsight Compute 2026.4 profiled one launch at 960×540 with `--set full`, after warm-up (round 10 of `baseline_profile`). Each kernel was replayed 47 times, so its duration is a little longer than in the timed runs.
+
+| Metric | Thin disk (`scalar`) | Hot flow close-up (`single`) | Binary (`bh_geodesic`) |
+|---|---:|---:|---:|
+| Duration | 16.57 ms | 29.12 ms | 29.75 ms |
+| Registers per thread | 218 | 236 | 255 |
+| Theoretical / achieved occupancy | 16.7% / 16.1% | 16.7% / 16.1% | 16.7% / 15.4% |
+| Active / eligible warps per scheduler | 1.95 / 0.61 | 1.95 / 0.63 | 1.90 / 0.72 |
+| Cycles with no eligible warp | 54.8% | 53.6% | 50.1% |
+| Warp cycles per issued instruction | 4.31 | 4.20 | 3.80 |
+| Compute (SM) throughput | 34.5% | 40.3% | 43.9% |
+| FP32 share of peak | 13% | 16% | 20% |
+| FP32 fused / unfused instructions | 2.08G / 1.62G | 5.10G / 3.78G | 5.64G / 4.73G |
+| DRAM throughput | 1.2% | 1.3% | 1.3% |
+| L1 / L2 hit rate | 99.2% / 83.9% | 99.8% / 90.7% | 99.2% / 98.8% |
+| Local-memory (spill) requests | 0 | 0 | 325M (85% of L1 sectors) |
+| Branch efficiency | 99.7% | 99.6% | 99.9% |
+| Active threads per warp | 28.9 | 27.2 | 30.1 |
+| SM workload imbalance (busiest SM above mean) | 22.5% | 11.8% | 9.1% |
+
+What it shows:
+- **The kernels are latency-bound by register-limited occupancy.** Registers allow 2 warps per scheduler out of 12. On average only 0.6–0.7 of them are ready to issue, so a scheduler issues on fewer than half its cycles. The largest named stall is waiting on fixed-latency results (1.1–1.5 of the 3.8–4.3 cycles per instruction). Memory bandwidth is not a factor: DRAM runs at about 1% and L1 serves over 99% of loads.
+- **Divergence is small.** Branch efficiency is above 99.6% and 27–30 of 32 threads are active per warp. This agrees with the 84–96% warp lane efficiency from the diagnostics pass.
+- **43–46% of FP32 instructions are unfused multiplies and adds.** Rust code does not contract `a * b + c` into an FMA. Nsight estimates that fusing the pairs would raise FP32 throughput by up to 21–23%, a 4–6% kernel speedup. It would change results in the last bit, so it needs the same image and reference checks as any numerical change.
+- **SMs finish unevenly.** The busiest SM runs 9–22% longer than the average SM. This is the frame's tail: the last blocks to start hold the GPU while other SMs sit idle. It is the one long-tail cost these measurements show. It points to finer-grained work distribution at the end of the frame, rather than to regrouping rays within warps (P1.5).
+- **The binary spills.** `bh_geodesic` at 255 registers puts 85% of its L1 traffic into local memory. The traffic stays in L1 (99.2% hit rate), but the spill instructions still have to be issued.
+- **No source-line attribution.** cuda-oxide emits no line information, so Nsight cannot map stalls to source lines.
+
+The reports are in `target/ncu/*.ncu-repz`. Profiling counters on Windows need administrator rights, so `ncu` was run elevated.
+
+Not covered:
+- **The rest of the benchmark matrix** (acceptance checklist): spins ±0.99 and ±0.999, Schwarzschild, the distant view at radius 160, and near-horizon views.
+- **The EHT snapshot**, which is timed separately and is not part of this harness.
+- **The app's sky texture.** The test sky has two texels, so sky lookups are cheaper than in the app. The Nsight Systems timeline does use the app's sky.
 
 ## Experiment order
 
