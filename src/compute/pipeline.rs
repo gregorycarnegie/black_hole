@@ -671,7 +671,7 @@ fn active_experiments(single_source: bool, experiments: Option<&RayExperiments>)
     } else {
         0
     };
-    single | (u32::from(experiments.rk4) << 2)
+    single | (u32::from(experiments.rk4) << 2) | (u32::from(experiments.coupled_transfer) << 3)
 }
 
 fn ray_launch_config(width: u32, height: u32, single_source_kerr: bool) -> LaunchConfig {
@@ -1614,15 +1614,97 @@ fn launch_tuning_sweep() {
     }
 }
 
-/// Renders one single-hole frame with `kernel` (the `bh_geodesic` signature) and returns
-/// the image and the launch time in milliseconds.
+/// Renders one single-hole frame with `kernel` (the `bh_geodesic` signature, followed by
+/// the experiment bits when given) and returns the image and the launch time in
+/// milliseconds.
 #[cfg(test)]
 fn render_single_hole(
     kernel: &cudarc::driver::CudaFunction,
-    (spin, model, polarization_view): (f32, crate::simulation::DiskModel, u32),
+    mode: (f32, crate::simulation::DiskModel, u32),
     elevation: f64,
     (width, height): (u32, u32),
+    experiments: Option<u32>,
 ) -> (Vec<f32>, f32) {
+    let cuda = shared_cuda();
+    let cam = crate::camera::OrbitalCamera {
+        elevation,
+        ..Default::default()
+    };
+    let [d_camera, d_disk, d_objects, sky] = single_hole_buffers(mode, &cam, (width, height));
+    let mut output = cuda.alloc_zeros::<f32>((width * height * 4) as usize);
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let start = cuda.stream.record_event(timing).unwrap();
+    let mut builder = cuda.stream.launch_builder(kernel);
+    builder.arg(&mut output);
+    builder.arg(&d_camera);
+    builder.arg(&d_disk);
+    builder.arg(&d_objects);
+    builder.arg(&sky);
+    builder.arg(&width);
+    builder.arg(&height);
+    builder.arg(&2u32);
+    builder.arg(&1u32);
+    if let Some(experiments) = &experiments {
+        builder.arg(experiments);
+    }
+    unsafe {
+        builder
+            .launch(ray_launch_config(width, height, true))
+            .unwrap()
+    };
+    drop(builder);
+    let end = cuda.stream.record_event(timing).unwrap();
+    end.synchronize().unwrap();
+    (cuda.clone_dtoh(&output), start.elapsed_ms(&end).unwrap())
+}
+
+/// Renders one single-hole frame with `bh_geodesic_diagnostics` and the given experiment
+/// bits; returns the image and the per-ray diagnostics.
+#[cfg(test)]
+fn diagnose_single_hole(
+    experiments: u32,
+    mode: (f32, crate::simulation::DiskModel, u32),
+    cam: &crate::camera::OrbitalCamera,
+    (width, height): (u32, u32),
+) -> (Vec<f32>, Vec<u32>) {
+    let cuda = shared_cuda();
+    let kernel = cuda
+        .module
+        .load_function("bh_geodesic_diagnostics")
+        .unwrap();
+    let [d_camera, d_disk, d_objects, sky] = single_hole_buffers(mode, cam, (width, height));
+    let pixels = (width * height) as usize;
+    let mut output = cuda.alloc_zeros::<f32>(pixels * 4);
+    let mut diagnostics = cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);
+    let mut builder = cuda.stream.launch_builder(&kernel);
+    builder.arg(&mut output);
+    builder.arg(&d_camera);
+    builder.arg(&d_disk);
+    builder.arg(&d_objects);
+    builder.arg(&sky);
+    builder.arg(&width);
+    builder.arg(&height);
+    builder.arg(&2u32);
+    builder.arg(&1u32);
+    builder.arg(&mut diagnostics);
+    builder.arg(&experiments);
+    unsafe {
+        builder
+            .launch(ray_launch_config(width, height, true))
+            .unwrap()
+    };
+    drop(builder);
+    (cuda.clone_dtoh(&output), cuda.clone_dtoh(&diagnostics))
+}
+
+/// Camera, disk, objects and a two-texel sky for a single-hole frame at the default
+/// camera distance.
+#[cfg(test)]
+fn single_hole_buffers(
+    (spin, model, polarization_view): (f32, crate::simulation::DiskModel, u32),
+    cam: &crate::camera::OrbitalCamera,
+    (width, height): (u32, u32),
+) -> [CudaSlice<u8>; 4] {
     use crate::simulation::{DiskConfig, default_binary_spins, scene_objects};
     let cuda = shared_cuda();
     cuda.bind_to_thread();
@@ -1648,10 +1730,6 @@ fn render_single_hole(
         twist_deg: config.twist_deg,
         binary_enabled: false,
     });
-    let cam = crate::camera::OrbitalCamera {
-        elevation,
-        ..Default::default()
-    };
     let camera = GpuCameraUniform {
         pos: cam.position().into(),
         right: cam.right().into(),
@@ -1669,31 +1747,175 @@ fn render_single_hole(
     let sky: CudaSlice<u8> = cuda.clone_htod(bytemuck::cast_slice(&[
         0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0,
     ]));
-    let d_objects = cuda.clone_htod(bytemuck::bytes_of(&objects));
-    let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
-    let d_camera = cuda.clone_htod(bytemuck::bytes_of(&camera));
-    let mut output = cuda.alloc_zeros::<f32>((width * height * 4) as usize);
-    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
-    let start = cuda.stream.record_event(timing).unwrap();
-    let mut builder = cuda.stream.launch_builder(kernel);
-    builder.arg(&mut output);
-    builder.arg(&d_camera);
-    builder.arg(&d_disk);
-    builder.arg(&d_objects);
-    builder.arg(&sky);
-    builder.arg(&width);
-    builder.arg(&height);
-    builder.arg(&2u32);
-    builder.arg(&1u32);
-    unsafe {
-        builder
-            .launch(ray_launch_config(width, height, true))
-            .unwrap()
+    [
+        cuda.clone_htod(bytemuck::bytes_of(&camera)),
+        cuda.clone_htod(bytemuck::bytes_of(&disk)),
+        cuda.clone_htod(bytemuck::bytes_of(&objects)),
+        sky,
+    ]
+}
+
+/// Checklist P1.9: the default decoupled transfer (Hermite dense output, the step's
+/// plasma split into constant cells, the geodesic step free of the disk limit) and the
+/// legacy coupled stepping (experiment bit 3), each against a coupled reference whose
+/// cells are 16 times shorter. A coupled run with cells 8 times shorter and a decoupled
+/// run at the reference's refinement check that the reference has converged.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn decoupled_transfer_against_a_refined_reference() {
+    use crate::simulation::{DiskModel, KERR_SPIN};
+    const COUPLED: u32 = 8;
+    const REFINED: u32 = 4 << 4;
+    let size = (160u32, 120u32);
+    let default = crate::camera::OrbitalCamera::default().elevation;
+    let scenes = [
+        ((KERR_SPIN, DiskModel::ThinNt, 2u32), default),
+        ((KERR_SPIN, DiskModel::ThinNt, 0), 0.2),
+        ((0.5, DiskModel::TruncatedHotFlow, 5), default),
+        ((-0.9, DiskModel::WarpedThin, 0), 0.4),
+    ];
+    let stokes = |ray: &[u32]| -> [f64; 4] {
+        std::array::from_fn(|k| f64::from(f32::from_bits(ray[14 + k])))
     };
-    drop(builder);
-    let end = cuda.stream.record_event(timing).unwrap();
-    end.synchronize().unwrap();
-    (cuda.clone_dtoh(&output), start.elapsed_ms(&end).unwrap())
+    for (mode, elevation) in scenes {
+        let cam = crate::camera::OrbitalCamera {
+            elevation,
+            max_iter: 200_000,
+            ..Default::default()
+        };
+        let run = |experiments| diagnose_single_hole(experiments, mode.clone(), &cam, size);
+        let reference = run(COUPLED | REFINED);
+        let peak = reference
+            .1
+            .as_chunks::<RAY_FIELDS>()
+            .0
+            .iter()
+            .map(|ray| stokes(ray)[0])
+            .fold(0.0, f64::max);
+        println!("{mode:?} elevation {elevation:.2}: reference peak intensity {peak:.3e}");
+        for (name, experiments) in [
+            ("decoupled", 0),
+            ("coupled", COUPLED),
+            ("coupled, cells / 8", COUPLED | 3 << 4),
+            ("decoupled, cells / 16", REFINED),
+        ] {
+            let (image, rays) = run(experiments);
+            let rays = rays.as_chunks::<RAY_FIELDS>().0;
+            let reference_rays = reference.1.as_chunks::<RAY_FIELDS>().0;
+            let (mut steps, mut plasma, mut exits, mut limited) = (0u64, 0u64, 0, 0);
+            let (mut absolute, mut relative) = (Vec::new(), Vec::new());
+            for (ray, exact) in rays.iter().zip(reference_rays) {
+                steps += u64::from(ray[1]);
+                plasma += u64::from(ray[12]);
+                limited += usize::from(ray[7] == 0);
+                if ray[7] != exact[7] {
+                    exits += 1;
+                    continue;
+                }
+                let (s, e) = (stokes(ray), stokes(exact));
+                absolute.push((0..4).map(|k| (s[k] - e[k]).abs()).fold(0.0, f64::max) / peak);
+                if e[0] > 1.0e-3 * peak {
+                    relative.push((s[0] - e[0]).abs() / e[0]);
+                }
+            }
+            let tail = |mut v: Vec<f64>| {
+                v.sort_unstable_by(f64::total_cmp);
+                let at = |q: f64| v.get(((v.len() as f64 * q) as usize).min(v.len().max(1) - 1));
+                (
+                    at(0.99).copied().unwrap_or(0.0),
+                    v.last().copied().unwrap_or(0.0),
+                )
+            };
+            let (a99, amax) = tail(absolute);
+            let (r99, rmax) = tail(relative);
+            let differences: Vec<f32> = image
+                .iter()
+                .zip(&reference.0)
+                .map(|(a, b)| (a - b).abs())
+                .collect();
+            let pixels = differences
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|d| d.iter().any(|&x| x > 1.0 / 255.0))
+                .count();
+            let largest = differences.iter().copied().fold(0.0, f32::max);
+            println!(
+                "  {name}: {steps} steps, {plasma} plasma steps, {limited} at the iteration \
+                 limit, {exits} exits differ; Stokes error / peak p99 {a99:.2e} max {amax:.2e}; \
+                 relative intensity error p99 {r99:.2e} max {rmax:.2e}; {pixels} pixels differ \
+                 by more than 1/255, largest channel {largest:.4}"
+            );
+        }
+    }
+}
+
+/// Checklist P1.9: frame time of the decoupled and the legacy coupled transfer in the
+/// same experiments kernel, with and without far-field steps.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn decoupled_transfer_benchmark() {
+    use crate::simulation::{DiskModel, KERR_SPIN};
+    let cuda = shared_cuda();
+    let kernel = &cuda.geodesic_experiments;
+    let default = crate::camera::OrbitalCamera::default().elevation;
+    let variants = [
+        ("coupled", 8u32),
+        ("decoupled", 0),
+        ("far field, coupled", 10),
+        ("far field, decoupled", 2),
+    ];
+    for (mode, elevation) in [
+        ((KERR_SPIN, DiskModel::ThinNt, 0u32), default),
+        ((KERR_SPIN, DiskModel::ThinNt, 2), default),
+        ((0.5, DiskModel::TruncatedHotFlow, 5), default),
+        ((KERR_SPIN, DiskModel::ThinNt, 0), 0.2),
+    ] {
+        for size in [(400u32, 300u32), (960, 540)] {
+            let mut times = vec![Vec::new(); variants.len()];
+            let mut images = vec![Vec::new(); variants.len()];
+            for round in 0..20 {
+                for (n, (_, experiments)) in variants.iter().enumerate() {
+                    let (image, t) = render_single_hole(
+                        kernel,
+                        mode.clone(),
+                        elevation,
+                        size,
+                        Some(*experiments),
+                    );
+                    if round >= 3 {
+                        times[n].push(t);
+                    }
+                    images[n] = image;
+                }
+            }
+            let medians: Vec<String> = variants
+                .iter()
+                .zip(times)
+                .zip(&images)
+                .map(|(((name, _), mut t), image)| {
+                    t.sort_unstable_by(f32::total_cmp);
+                    let largest = image
+                        .iter()
+                        .zip(&images[0])
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0_f32, f32::max);
+                    format!(
+                        "{name} {:.2} ms (largest channel change {largest:.4})",
+                        t[t.len() / 2]
+                    )
+                })
+                .collect();
+            println!(
+                "{mode:?} elevation {elevation:.2} {}×{}: {}",
+                size.0,
+                size.1,
+                medians.join("; ")
+            );
+        }
+    }
 }
 
 /// Checklist P1.2: across spins, disk models (hot flow and warped disk included),
@@ -1719,9 +1941,14 @@ fn specialised_kernels_match_bh_geodesic() {
                     let mode = (spin, model.clone(), polarization_view);
                     let size = (160, 120);
                     let (generic, _) =
-                        render_single_hole(&cuda.geodesic, mode.clone(), elevation, size);
-                    let (single, _) =
-                        render_single_hole(&cuda.geodesic_single, mode.clone(), elevation, size);
+                        render_single_hole(&cuda.geodesic, mode.clone(), elevation, size, None);
+                    let (single, _) = render_single_hole(
+                        &cuda.geodesic_single,
+                        mode.clone(),
+                        elevation,
+                        size,
+                        None,
+                    );
                     assert!(
                         generic
                             .iter()
@@ -1733,7 +1960,7 @@ fn specialised_kernels_match_bh_geodesic() {
                         continue;
                     }
                     let (scalar, _) =
-                        render_single_hole(&cuda.geodesic_scalar, mode, elevation, size);
+                        render_single_hole(&cuda.geodesic_scalar, mode, elevation, size, None);
                     let largest = generic
                         .iter()
                         .zip(&scalar)
@@ -1778,7 +2005,7 @@ fn specialised_kernel_benchmark() {
         let mut images = vec![Vec::new(); kernels.len()];
         for round in 0..20 {
             for (n, (_, f)) in kernels.iter().enumerate() {
-                let (image, t) = render_single_hole(f, mode.clone(), elevation, size);
+                let (image, t) = render_single_hole(f, mode.clone(), elevation, size, None);
                 if round >= 3 {
                     times[n].push(t);
                 }
@@ -1835,7 +2062,12 @@ fn gpu_escapes_match_the_separated_solution() {
     ]));
     let diagnostics_kernel = cuda.module.load_function("bh_geodesic_diagnostics").unwrap();
     let pixel_kernel = cuda.module.load_function("bh_test_pixel_ray").unwrap();
-    for spin in [0.0_f32, 0.5, -0.9, 0.99] {
+    // Experiment bit 3 restores the coupled transfer, whose disk limit shortens the
+    // geodesic step (checklist P1.9).
+    let runs = [0.0_f32, 0.5, -0.9, 0.99]
+        .into_iter()
+        .flat_map(|s| [(s, 0u32), (s, 8)]);
+    for (spin, experiments) in runs {
         for elevation in [std::f64::consts::FRAC_PI_2 - 0.1, 0.4] {
             let scene = scene_objects(spin, false, false, 0.0, default_binary_spins());
             let mut objects = GpuObjectsUniform::zeroed();
@@ -1887,7 +2119,7 @@ fn gpu_escapes_match_the_separated_solution() {
             launch.arg(&2u32);
             launch.arg(&1u32);
             launch.arg(&mut diagnostics);
-            launch.arg(&0u32);
+            launch.arg(&experiments);
             unsafe { launch.launch(ray_launch_config(width, height, true)).unwrap() };
             drop(launch);
             let rays = cuda.clone_dtoh(&diagnostics);
@@ -1953,7 +2185,8 @@ fn gpu_escapes_match_the_separated_solution() {
             errors.sort_unstable_by(f64::total_cmp);
             let at = |q: f64| errors[((errors.len() as f64 * q) as usize).min(errors.len() - 1)];
             println!(
-                "spin {spin} elevation {elevation:.2}: {} escapes, direction error median {:.2e} \
+                "spin {spin} elevation {elevation:.2} experiments {experiments}: {} escapes, \
+                 direction error median {:.2e} \
                  p99 {:.2e} max {:.2e} rad, {} above 1e-6; escaped only on the GPU {gpu_only}, \
                  only in the reference {reference_only}; GPU opaque {opaque}, near-critical \
                  {near_critical}; reference unresolved {unresolved}",

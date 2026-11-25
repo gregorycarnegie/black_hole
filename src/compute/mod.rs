@@ -37,6 +37,7 @@ pub(super) struct RayExperiments {
     full_trace: bool,
     far_field: bool,
     rk4: bool,
+    coupled_transfer: bool,
 }
 
 pub(crate) fn enable_ray_experiments(
@@ -44,11 +45,13 @@ pub(crate) fn enable_ray_experiments(
     full_trace: bool,
     far_field: bool,
     rk4: bool,
+    coupled_transfer: bool,
 ) {
     app.sub_app_mut(RenderApp).insert_resource(RayExperiments {
         full_trace,
         far_field,
         rk4,
+        coupled_transfer,
     });
 }
 

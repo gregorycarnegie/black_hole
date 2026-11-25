@@ -1646,6 +1646,9 @@ pub struct AdaptiveStep {
     pub h: f32,
     pub error: f32,
     pub accepted: bool,
+    /// d/dλ of the state at the start and end of an accepted Dormand–Prince step, for
+    /// Hermite dense output; zero from the other controllers.
+    pub rates: [Derivs; 2],
 }
 
 #[cuda_device::device]
@@ -1674,6 +1677,7 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
             h: 0.0,
             error: 1.0e30,
             accepted: false,
+            rates: [Derivs::default(); 2],
         };
     }
     // The coarse step, the first half step and every retry start from the same state.
@@ -1723,6 +1727,7 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
                 h,
                 error,
                 accepted: true,
+                rates: [Derivs::default(); 2],
             };
         }
     }
@@ -1734,6 +1739,7 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
         h: 0.0,
         error: 1.0e30,
         accepted: false,
+        rates: [Derivs::default(); 2],
     }
 }
 
@@ -1928,6 +1934,7 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool, const PATH: u8>(
             h: 0.0,
             error: 1.0e30,
             accepted: false,
+            rates: [Derivs::default(); 2],
         };
     }
     let k1 = first_stage::<PATH>(ray, *m, gauged, objects);
@@ -2034,6 +2041,7 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool, const PATH: u8>(
                 h,
                 error,
                 accepted: true,
+                rates: [k1, k7],
             };
         }
     }
@@ -2045,6 +2053,7 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool, const PATH: u8>(
         h: 0.0,
         error: 1.0e30,
         accepted: false,
+        rates: [Derivs::default(); 2],
     }
 }
 
@@ -2191,7 +2200,8 @@ fn absorption_integral(alpha: f32, ds: f32) -> f32 {
 fn polarized_cell(j: Vec4, alpha: f32, rho: Vec3, ds: f32) -> Vec4 {
     let integral = absorption_integral(alpha, ds);
     let w = rho.length();
-    if w * ds < 1.0e-5 {
+    // Skipping the in-cell turn costs w ds / 2 of the polarized emission.
+    if w * ds < 1.0e-7 {
         return j * integral;
     }
     let axis = rho * (1.0 / w);
@@ -2204,6 +2214,52 @@ fn polarized_cell(j: Vec4, alpha: f32, rho: Vec3, ds: f32) -> Vec4 {
         j.x * integral,
         integral * parallel + ic * perpendicular + is * axis.cross(perpendicular),
     )
+}
+
+/// Decoupled transfer (checklist P1.9): most constant cells one geodesic step's plasma
+/// is split into. Longer steps through the slab left the thin-disk Stokes error twice
+/// the coupled scheme's at 32 cells; at 8 it matches, for 3% more steps.
+const MAX_TRANSFER_CELLS: u32 = 8;
+
+/// Longest decoupled transfer cell as a fraction of the radius, for emissivity and
+/// Doppler variation along the orbit: the hot flow's quarter scale height (0.125 r) left
+/// a p99 relative intensity error of 2.4e-4; 0.05 r brings it to 8.9e-5.
+const ORBIT_CELL: f32 = 0.05;
+
+/// Cubic Hermite dense output at fraction `u` of an accepted step of length `h`.
+#[inline(always)]
+fn hermite_ray(a: Ray, b: Ray, rates: [Derivs; 2], h: f32, u: f32) -> Ray {
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let (w0, w1) = (2.0 * u3 - 3.0 * u2 + 1.0, h * (u3 - 2.0 * u2 + u));
+    let (w2, w3) = (3.0 * u2 - 2.0 * u3, h * (u3 - u2));
+    let [r0, r1] = rates;
+    Ray {
+        pos: w0 * a.pos + w1 * r0.pos + w2 * b.pos + w3 * r1.pos,
+        p: w0 * a.p + w1 * r0.p + w2 * b.p + w3 * r1.p,
+        screen: w0 * a.screen + w1 * r0.screen + w2 * b.screen + w3 * r1.screen,
+    }
+}
+
+/// Adds one constant-coefficient plasma cell of length `ds` behind the accumulated
+/// foreground (front to back along the backward ray).
+#[inline(always)]
+fn composite_plasma(
+    plasma: &Plasma,
+    ds: f32,
+    polarized: bool,
+    rgb: &mut Vec3,
+    stokes: &mut Vec4,
+    transmission: &mut f32,
+    foreground: &mut Mat3,
+) {
+    if polarized {
+        let cell = polarized_cell(plasma.j, plasma.alpha, plasma.rho, ds);
+        *stokes += *transmission * vec4_f_v3(cell.x, *foreground * cell.yzw());
+        *foreground = *foreground * faraday_rotation(plasma.rho, ds);
+    }
+    *rgb += *transmission * plasma.rgb * absorption_integral(plasma.alpha, ds);
+    *transmission *= exp(-plasma.alpha * ds);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -3089,7 +3145,7 @@ pub unsafe fn bh_geodesic(
     unsafe {
         render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false, true,
+            core::ptr::null_mut(), true, false, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3110,7 +3166,7 @@ pub unsafe fn bh_geodesic_full_trace(
     unsafe {
         render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), false, false, true,
+            core::ptr::null_mut(), false, false, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3132,7 +3188,7 @@ pub unsafe fn bh_geodesic_single(
     unsafe {
         render_geodesic::<false, false, SINGLE, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false, true,
+            core::ptr::null_mut(), true, false, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3155,7 +3211,7 @@ pub unsafe fn bh_geodesic_scalar(
     unsafe {
         render_geodesic::<false, false, SINGLE_SCALAR, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false, true,
+            core::ptr::null_mut(), true, false, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3163,7 +3219,9 @@ pub unsafe fn bh_geodesic_scalar(
 
 /// Any combination of the ray options: bit 0 the full trace instead of guarded early
 /// capture, bit 1 far-field steps, bit 2 the legacy step-doubling RK4 controller
-/// instead of Dormand–Prince.
+/// instead of Dormand–Prince, bit 3 the legacy coupled transfer (one midpoint cell per
+/// geodesic step, the step limited by the disk) instead of decoupled transfer (checklist
+/// P1.9), bits 4-7 a shift that divides the disk transfer cell length by 2^shift.
 #[cuda_device::kernel]
 pub unsafe fn bh_geodesic_experiments(
     out_image: *mut Vec4,
@@ -3181,6 +3239,7 @@ pub unsafe fn bh_geodesic_experiments(
         render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
+            experiments & 8 == 0, (experiments >> 4) & 15,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3212,7 +3271,7 @@ pub unsafe fn bh_geodesic_swarm(
     unsafe {
         render_geodesic::<false, true, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0, experiments & 8 == 0, 0,
             gid_x(), gid_y(),
             |start, end, t0, t1, _| swarm_bvh_hit(
                 start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
@@ -3274,7 +3333,7 @@ pub unsafe fn bh_geodesic_swarm_record(
     unsafe {
         render_geodesic::<false, true, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0, experiments & 8 == 0, 0,
             x, y,
             |start, end, t0, t1, state| {
                 if beyond_belt(swarm_query(start, end, t0, t1), belt_inner, belt_outer, belt_spread) {
@@ -3420,6 +3479,7 @@ pub unsafe fn bh_geodesic_diagnostics(
         render_geodesic::<true, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
             experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
+            experiments & 8 == 0, (experiments >> 4) & 15,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3550,6 +3610,8 @@ unsafe fn render_geodesic<
     early_capture: bool,
     far_field: bool,
     dormand_prince: bool,
+    decoupled: bool,
+    refine: u32,
     pix_x: u32,
     pix_y: u32,
     swarm_hit: F,
@@ -3561,6 +3623,8 @@ unsafe fn render_geodesic<
     let disk = unsafe { &*disk };
     let objects = unsafe { &*objects };
     let idx = (pix_y * width + pix_x) as usize;
+    // Hermite dense output needs the Dormand–Prince stage rates.
+    let decoupled = decoupled && dormand_prince;
 
     let dir = pixel_direction(cam, pix_x, pix_y, width, height);
     let mut metric = scene_metric(cam.pos, objects);
@@ -3625,12 +3689,27 @@ unsafe fn render_geodesic<
         let mut distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
         let clearance_limited_distance = distance;
         let radius = disk_radius(ray.pos, disk.spin, disk.binary_enabled != 0);
+        // Decoupled transfer: the length of the constant cells this step's plasma is
+        // split into, or zero for one midpoint cell.
+        let mut cell_length = 0.0_f32;
         if radius > disk.r1 - distance && radius < disk.r2 + distance {
             let r_clamped = radius.max(disk.r1);
             let height_d = (get_h_over_r(r_clamped, disk) * r_clamped).max(0.001);
             let mid = disk_midplane_y(radius.max(0.001), ray.pos.xz(), disk);
             let to_disk = ((ray.pos.y - mid).abs() - 4.0 * height_d).max(0.0);
-            distance = distance.min((0.25 * height_d).max(0.5 * to_disk));
+            let refinement = 1.0 / (1u32 << refine) as f32;
+            let cell = 0.25 * height_d * refinement;
+            if !decoupled {
+                distance = distance.min(cell.max(0.5 * to_disk));
+            } else if 0.5 * to_disk < distance {
+                // The coupled scheme's margin: a chord shorter than half the vertical
+                // distance `to_disk` does not reach the emitting slab, tilted or not.
+                let length = cell.min(ORBIT_CELL * r_clamped * refinement);
+                distance = distance.min((MAX_TRANSFER_CELLS as f32 * length).max(0.5 * to_disk));
+                if distance > 0.5 * to_disk {
+                    cell_length = length;
+                }
+            }
         }
         let near_horizon = DIAGNOSTICS && metric.clearance < 1.0;
         let speed = velocity.length().max(1.0e-6);
@@ -3698,25 +3777,42 @@ unsafe fn render_geodesic<
                 break;
             }
         }
-        let middle = Ray {
-            pos: 0.5 * (ray.pos + next.pos),
-            p: 0.5 * (ray.p + next.p),
-            screen: 0.5 * (ray.screen + next.screen),
+        let cells = if cell_length > 0.0 {
+            clamp_f32(-floor_f32(-h * speed / cell_length), 1.0, MAX_TRANSFER_CELLS as f32) as u32
+        } else {
+            1
         };
-        let plasma = sample_plasma(middle, objects, cam, disk);
-        let ds = h * plasma.energy;
-        if DIAGNOSTICS {
-            stats.plasma_steps += (ds > 0.0) as u32;
-            stats.vacuum_disk_steps += (disk_limited && ds <= 0.0) as u32;
-        }
-        if ds > 0.0 {
-            if cam.polarization_view != 0 {
-                let cell = polarized_cell(plasma.j, plasma.alpha, plasma.rho, ds);
-                stokes += transmission * vec4_f_v3(cell.x, foreground * cell.yzw());
-                foreground = foreground * faraday_rotation(plasma.rho, ds);
+        let mut sampled = false;
+        let mut cell = 0u32;
+        while cell < cells {
+            let middle = if decoupled {
+                hermite_ray(ray, next, step.rates, h, (cell as f32 + 0.5) / cells as f32)
+            } else {
+                Ray {
+                    pos: 0.5 * (ray.pos + next.pos),
+                    p: 0.5 * (ray.p + next.p),
+                    screen: 0.5 * (ray.screen + next.screen),
+                }
+            };
+            let plasma = sample_plasma(middle, objects, cam, disk);
+            let ds = h / cells as f32 * plasma.energy;
+            if ds > 0.0 {
+                sampled = true;
+                composite_plasma(
+                    &plasma,
+                    ds,
+                    cam.polarization_view != 0,
+                    &mut rgb,
+                    &mut stokes,
+                    &mut transmission,
+                    &mut foreground,
+                );
             }
-            rgb += transmission * plasma.rgb * absorption_integral(plasma.alpha, ds);
-            transmission *= exp(-plasma.alpha * ds);
+            cell += 1;
+        }
+        if DIAGNOSTICS {
+            stats.plasma_steps += sampled as u32;
+            stats.vacuum_disk_steps += (disk_limited && !sampled) as u32;
         }
         winding += swept_angle(ray.pos, next.pos);
         ray = next;
@@ -4767,6 +4863,41 @@ pub unsafe fn bh_test_transfer(cases: *const Vec4, results: *mut Vec4, count: u3
     unsafe {
         *results.add(base_out) = result.stokes;
         *results.add(base_out + 1) = vec4(if result.valid { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0);
+    }
+}
+
+const TEST_PATH_CELLS: usize = 8;
+
+/// Checklist P1.9: composites a fixed path of constant-coefficient cells, camera side
+/// first, with the renderer's own cell routine. Each cell is three vectors: the Stokes
+/// emissivity, (alpha, rho) and (ds, scalar emissivity, -, -).
+#[cuda_device::kernel]
+pub unsafe fn bh_test_transfer_path(cases: *const Vec4, results: *mut Vec4, count: u32) {
+    let id = gid_x();
+    if id >= count {
+        return;
+    }
+    let mut rgb = vec3_splat(0.0);
+    let mut stokes = vec4_splat(0.0);
+    let mut transmission = 1.0_f32;
+    let mut foreground = faraday_rotation(vec3_splat(0.0), 0.0);
+    let mut cell = 0usize;
+    while cell < TEST_PATH_CELLS {
+        let base = id as usize * 3 * TEST_PATH_CELLS + 3 * cell;
+        let (j, k, extent) = unsafe { (*cases.add(base), *cases.add(base + 1), *cases.add(base + 2)) };
+        let plasma = Plasma {
+            rgb: vec3_splat(extent.y),
+            j,
+            alpha: k.x,
+            rho: k.yzw(),
+            energy: 1.0,
+        };
+        composite_plasma(&plasma, extent.x, true, &mut rgb, &mut stokes, &mut transmission, &mut foreground);
+        cell += 1;
+    }
+    unsafe {
+        *results.add(2 * id as usize) = stokes;
+        *results.add(2 * id as usize + 1) = vec4(rgb.x, transmission, 0.0, 0.0);
     }
 }
 

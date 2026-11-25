@@ -19,6 +19,9 @@ fn main() {
     let far_field = std::env::args_os().any(|arg| arg == "--experiment-far-field");
     // The step-doubling RK4 controller, kept for one release after Dormand–Prince became the default.
     let rk4 = std::env::args_os().any(|arg| arg == "--rk4-controller");
+    // One midpoint transfer cell per geodesic step, kept for one release after decoupled
+    // transfer became the default (checklist P1.9).
+    let coupled_transfer = std::env::args_os().any(|arg| arg == "--coupled-transfer");
     let mut window = Window {
         title: "Black Hole".into(),
         resolution: (800u32, 600u32).into(),
@@ -47,8 +50,8 @@ fn main() {
     if profiling {
         compute::profile::install(&mut app);
     }
-    if full_trace || far_field || rk4 {
-        compute::enable_ray_experiments(&mut app, full_trace, far_field, rk4);
+    if full_trace || far_field || rk4 || coupled_transfer {
+        compute::enable_ray_experiments(&mut app, full_trace, far_field, rk4, coupled_transfer);
     }
     app.run();
 }

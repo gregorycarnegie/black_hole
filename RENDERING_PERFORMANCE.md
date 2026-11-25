@@ -248,6 +248,50 @@ Not covered:
 - Escaping vortical rays (Q <= 0).
 - A Carlson-integral formulation separate from the elliptic one. The second method is quadrature instead.
 
+## Decoupled transfer (checklist P1.9, default)
+
+Before this change, the renderer took one midpoint plasma sample per geodesic step. Near the disk it limited the step to a quarter of the disk scale height H, so the plasma's resolution set the trajectory's step: 56% of accepted steps in the polarized close-up were disk-limited. Now the step's transfer is split into its own constant cells, and the geodesic step is limited only by the controller and by a cap of 8 cells:
+- **Dense output:** each cell samples the plasma at its midpoint on a cubic Hermite interpolant of the accepted Dormand–Prince step. The interpolant uses the stage rates k1 and k7, which the controller already computes, for position, momentum and screen vector.
+- **Cell length:** min(H/4, 0.05 r). The H/4 term is the old limit. The 0.05 r term resolves emissivity and Doppler variation along the orbit, which the thick hot flow's H/4 (0.125 r) did not.
+- **Which steps are split:** only steps that can reach the emitting slab (|z| < 4H). As in the coupled scheme, a chord shorter than half the vertical distance to the slab is taken in one cell.
+- **Cap of 8 cells per step:** at 32 cells the longer steps left the thin-disk Stokes error at twice the coupled value. At 8 cells it matches, for 3% more steps.
+- **Fallback:** `--coupled-transfer` (experiment bit 3) restores the old scheme for one release. The legacy RK4 controller has no stage rates, so it always uses the coupled scheme.
+
+**Fixed-path check.** `transfer_paths_match_the_constant_coefficient_solution` composites 8-cell paths of random constant coefficients through the renderer's own cell routine (`bh_test_transfer_path`). It compares them with a binary64 RK4 solution of dS/dl = j − αS + (0, ρ × S_pol). Over 32,768 paths the colour and transmission errors stay below 2.4e-7. The Stokes error relative to the path's unattenuated intensity stays below 1.3e-6. About 5 paths in 32,768 miss the 1e-6 target. Each of those rotates through tens of radians of Faraday angle, which binary32 holds only to 2^-24 of the angle, and each stays inside that floor. The named edge cases (`transfer_path_edge_cases`) meet 1e-6. One finding was fixed: `polarized_cell` skipped the rotation inside the cell when w·ds < 1e-5, which dropped up to w·ds/2 of the polarized emission (measured 2.2e-6). The cutoff is now 1e-7.
+
+**Image check.** `decoupled_transfer_against_a_refined_reference` renders 160×120 frames with the diagnostics kernel. The reference is the coupled scheme with cells 16 times shorter. A coupled run with cells 8 times shorter, and a decoupled run at the reference's refinement, agree with it to a p99 of 1.3e-6 to 4.8e-6. Errors are relative to the reference's peak intensity:
+
+| Scene | Coupled steps | Decoupled steps | Coupled p99 / max | Decoupled p99 / max |
+|---|---:|---:|---:|---:|
+| Thin disk, polarized, elevation 1.22 | 2.69M | 1.79M | 4.8e-6 / 9.6e-5 | 5.0e-6 / 1.1e-4 |
+| Thin disk, elevation 0.20 | 2.39M | 1.76M | 1.3e-5 / 2.8e-4 | 1.1e-5 / 6.7e-5 |
+| Hot flow (spin 0.5), circular polarization | 2.49M | 1.72M | 2.8e-4 / 8.0e-4 | 3.7e-5 / 4.4e-4 |
+| Warped disk (spin −0.9), elevation 0.40 | 2.31M | 1.76M | 2.1e-5 / 5.2e-5 | 2.0e-5 / 5.9e-5 |
+
+The p99 relative intensity error above 1e-3 of peak is 1.3e-5 to 8.9e-5 decoupled, against 1.5e-5 to 7.1e-4 coupled. Only the decoupled scheme meets the 1e-4 relative target at p99 in every scene. Neither meets it at the maximum: the worst decoupled pixel is 1.8e-3, and the refined runs disagree with each other by up to 1e-3 at the same pixels. Neither meets the 1e-6 Stokes target. No exit classification changes, and no pixel changes by more than 1/255.
+
+**Vacuum check.** Fewer, longer steps also make escape directions more accurate. Against the separated solution (`gpu_escapes_match_the_separated_solution`, which now runs both schemes), the near-pole frames' p99 direction error falls from 6.7–7.9e-6 rad to 3.0–4.1e-6 rad. The escapes that miss 1e-6 rad fall from 1,101–1,299 to 473–576 per frame. The near-equatorial frames change little: p99 2.5–3.5e-6 rad coupled, 2.5–3.2e-6 rad decoupled. Every escape/capture classification is the same.
+
+**Time.** A same-process A/B against the previous PTX, in the production kernels (17 timed launches each, medians):
+
+| Scene | Size | `bh_geodesic` | `bh_geodesic_single` | `bh_geodesic_scalar` |
+|---|---|---:|---:|---:|
+| Thin disk, elevation 1.22 | 400×300 | 14.75 → 14.46 ms (−2.0%) | 11.95 → 11.88 ms (−0.6%) | 10.31 → 10.10 ms (−2.1%) |
+| | 960×540 | 25.37 → 21.86 ms (−13.9%) | 22.54 → 19.30 ms (−14.4%) | 18.22 → 15.68 ms (−13.9%) |
+| Thin disk, polarized, elevation 1.22 | 400×300 | 15.00 → 15.51 ms (+3.4%) | 13.47 → 13.77 ms (+2.3%) | — |
+| | 960×540 | 26.72 → 24.11 ms (−9.8%) | 23.32 → 20.64 ms (−11.5%) | — |
+| Hot flow (spin 0.5), circular polarization | 400×300 | 8.24 → 9.55 ms (+16.0%) | 7.32 → 8.55 ms (+16.8%) | — |
+| | 960×540 | 25.47 → 24.25 ms (−4.8%) | 22.16 → 19.85 ms (−10.4%) | — |
+| Thin disk, elevation 0.20 | 400×300 | 8.55 → 8.66 ms (+1.3%) | 7.62 → 7.52 ms (−1.3%) | 6.63 → 6.50 ms (−2.1%) |
+| | 960×540 | 20.50 → 19.24 ms (−6.2%) | 17.84 → 16.52 ms (−7.4%) | 14.68 → 13.60 ms (−7.4%) |
+
+Registers: `bh_geodesic` 255 with 192 local bytes (was 184), `bh_geodesic_single` 240 with no spills (was 234), `bh_geodesic_scalar` 218 (was 222). The hot flow at 400×300 is slower because its cells are 2.5 times shorter. It buys an 8-fold smaller p99 error. At 960×540 the hot flow is still faster. The largest channel change is 0.0055, in the scalar kernel's edge-on 960×540 frame. Every other change in these frames is at most 0.002.
+
+Not covered:
+- **Error-controlled quadrature:** cells are sized from local scales (H and r), not from an error estimate.
+- **The |z| = 4H truncation:** the density jumps from exp(−8) of its midplane value to zero there, and that jump is not resolved.
+- **The EHT snapshot path:** it keeps its own transfer loop (`transfer_cell` and `grid_step`). Its status counts are unchanged (990 captured, 24,610 escaped), and it was not decoupled.
+
 ## Experiment order
 
 1. **Measure the interactive frame.** Fix the camera, spin, disk preset, pixel dimensions, and render mode for each comparison. Start with single-hole thermal intensity, then compare polarized or synchrotron-heavy rendering and the binary scene. Include a view with a prominent photon ring and measure the Ellis kernel separately if the wormhole view is slow. Record median and 95th-percentile frame times after warm-up. Time the geodesic and accumulation kernels with CUDA events. Measure the host wait/readback, Bevy texture upload, and total frame time separately. Use the `H` heatmap to locate long rays and count rejected attempts separately from outer iterations. If a few long-running rays dominate, check warp divergence, register pressure, and spills before changing block size or splitting up the ray work. [Existing CUDA-event example](tests/common/gpu.rs#L229) · [Kernel dispatch](src/compute/pipeline.rs#L356) · [Display path](src/compute/accumulate.rs#L156)
