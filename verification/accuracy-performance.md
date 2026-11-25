@@ -70,16 +70,17 @@ does not mean that its trajectories meet the accuracy targets.
   5e-9 the rays no longer reached their affine span. So on these rays the
   geometric step limit (0.12 × clearance) sets the step, not the error
   controller. The step-doubling estimate differences two binary32 end states,
-  so it cannot resolve truncation error below their rounding. The opt-in
-  Dormand–Prince 5(4) controller (`--experiment-dp45`) forms its estimate from
+  so it cannot resolve truncation error below their rounding. The
+  Dormand–Prince 5(4) controller (the default since P1.1b) forms its estimate from
   the stages. With the same tolerance it reduced impact 5.3 to 5.70e-4 position
   and 5.12e-6 momentum error, and impact 5.25 to 5.62e-4. That is about three
   times smaller, but still above target. So part of the miss was truncation.
   Compensated accumulation or selective precision for sensitive rays remain
   experiments, not established fixes. [Measurements](../RENDERING_PERFORMANCE.md)
-- **The full image still fails.** Current intensity L2 discrepancy is 0.719%;
-  worst intensity error is 2.75% of reference peak and worst relative intensity
-  error above the floor is 24.3%. These are comparisons to an uncertain
+- **The full image still fails.** Current intensity L2 discrepancy is 0.704%
+  with the default Dormand–Prince controller (0.719% with legacy RK4); worst
+  intensity error is 2.87% of reference peak (2.75%) and worst relative
+  intensity error above the floor is 24.3%. These are comparisons to an uncertain
   reference, not certified errors. After the reference is improved, separate
   path error from transfer quadrature and the discontinuous sigma/emission
   masks. Refine at detected difficult boundaries rather than reducing every

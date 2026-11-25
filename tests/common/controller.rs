@@ -1,7 +1,7 @@
 //! Production adaptive stepping against the trajectory targets (obligation N3).
 //!
-//! The `bh_test_controller_trace` CUDA kernel traces Schwarzschild rays with the production controller (and, with `cases.z`
-//! set, the Dormand–Prince experiment of checklist P1.1) and the
+//! The `bh_test_controller_trace` CUDA kernel traces Schwarzschild rays with the legacy RK4 controller (and, with `cases.z`
+//! set, the production Dormand–Prince controller of checklist P1.1b) and the
 //! renderer's step-size rule up to a fixed affine parameter. Two independent
 //! measures of the error at the end point are compared with TARGETS.md:
 //!
@@ -86,8 +86,8 @@ fn adaptive_controller_misses_trajectory_targets() {
     // (impact parameter, affine span): a wide deflection, two near-critical
     // passes around the photon sphere, and a direct long ray.
     let cases: [(f32, f32); 4] = [(10.0, 220.0), (5.3, 220.0), (5.25, 260.0), (30.0, 400.0)];
-    // Each case runs with the production controller, then with the Dormand–Prince
-    // experiment; only the first set is held to the counterexample.
+    // Each case runs with the legacy RK4 controller, then with the production
+    // Dormand–Prince one; both are held to the counterexample.
     let mut input = Vec::new();
     for dormand_prince in [0.0, 1.0] {
         for (impact, span) in cases {
@@ -139,10 +139,10 @@ fn adaptive_controller_misses_trajectory_targets() {
             failures[n / cases.len()] += 1;
         }
     }
-    // Records the counterexample: at least one accepted trajectory exceeds the
-    // TARGETS.md position or momentum error. Remove this assertion once the
-    // controller is certified.
-    assert!(failures[0] > 0, "every traced ray met the trajectory targets");
+    // Records the counterexample: for each controller, at least one accepted trajectory
+    // exceeds the TARGETS.md position or momentum error. Remove this assertion once
+    // the controller is certified.
+    assert!(failures.iter().all(|&f| f > 0), "a controller met every trajectory target: {failures:?}");
 }
 
 /// Schwarzschild classification (obligation N4). A geodesic with conserved

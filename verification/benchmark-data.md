@@ -301,9 +301,10 @@ target/verification-python/Scripts/python.exe verification/check_image.py compar
 
 The last command records `target/eht-benchmark/image-comparison.json` and
 **exits unsuccessfully while the requested numerical targets remain unmet**.
-The GPU test also writes `image-gpu-dp45.f32`, traced with the experimental
-Dormand–Prince controller. `compare --image image-gpu-dp45.f32` records it in
-`image-comparison-dp45.json`.
+`image-gpu.f32` is traced with the default Dormand–Prince controller. The GPU
+test also writes `image-gpu-rk4.f32`, traced with the legacy step-doubling RK4
+controller; `compare --image image-gpu-rk4.f32` records it in
+`image-comparison-rk4.json`.
 The GPU regression separately checks finite output and resolved rays; passing
 that regression does not assert numerical accuracy. `prepare --stride 8` is
 a 400-ray diagnostic. `--cell-fraction 0.25`, `0.125`, and `0.0625` reproduce

@@ -150,7 +150,7 @@ pub(super) fn write_ray_profile(
     ];
     create_dir_all("target")?;
     let mut path = String::from("target/renderer-rays");
-    for (bit, name) in [(1, "-early-capture"), (2, "-far-field"), (4, "-dp45")] {
+    for (bit, name) in [(1, "-early-capture"), (2, "-far-field"), (4, "-rk4")] {
         if experiments & bit != 0 {
             path.push_str(name);
         }

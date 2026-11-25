@@ -652,7 +652,7 @@ fn active_experiments(single_source: bool, experiments: Option<&RayExperiments>)
     } else {
         0
     };
-    single | (u32::from(experiments.dormand_prince) << 2)
+    single | (u32::from(experiments.rk4) << 2)
 }
 
 fn ray_launch_config(width: u32, height: u32, single_source_kerr: bool) -> LaunchConfig {
@@ -1200,9 +1200,9 @@ mod swarm_gpu {
         assert_eq!(differing, 0, "{differing} channels differ");
     }
 
-    /// The swarm with and without the Dormand–Prince controller (bit 2), BVH and,
-    /// with `--features optix`, OptiX; alternating launches, medians of five. The
-    /// accelerated images must still match brute force under DP45.
+    /// The swarm with the legacy RK4 controller (bit 2) and the default Dormand–Prince
+    /// one, BVH and, with `--features optix`, OptiX; alternating launches, medians of
+    /// five. The accelerated images must still match brute force under DP45.
     #[test]
     #[ignore = "requires a CUDA GPU; benchmark, run with --release -- --ignored --nocapture"]
     fn swarm_dp45_timing() {
@@ -1218,7 +1218,7 @@ mod swarm_gpu {
             let bvh = (count > 0).then(|| device(&bodies, false));
             let mut times = [Vec::new(), Vec::new()];
             for sample in 0..6 {
-                for (variant, experiments) in [0, 4].into_iter().enumerate() {
+                for (variant, experiments) in [4, 0].into_iter().enumerate() {
                     let ms = render_with(&scene, bvh.as_ref(), experiments).1;
                     if sample > 0 {
                         times[variant].push(ms);
@@ -1228,15 +1228,15 @@ mod swarm_gpu {
             let [rk4, dp45] = times.map(median);
             let mut row = format!("{count:>6} bodies: BVH rk4 {rk4:6.1} ms, dp45 {dp45:6.1} ms");
             if (1..=1024).contains(&count) {
-                let brute = render_with(&scene, Some(&device(&bodies, true)), 4).0;
-                let fast = render_with(&scene, bvh.as_ref(), 4).0;
+                let brute = render_with(&scene, Some(&device(&bodies, true)), 0).0;
+                let fast = render_with(&scene, bvh.as_ref(), 0).0;
                 assert!(brute.iter().zip(&fast).all(|(a, b)| a.to_bits() == b.to_bits()));
             }
             #[cfg(feature = "optix")]
             if count > 0 {
                 let mut times = [Vec::new(), Vec::new()];
                 for sample in 0..6 {
-                    for (variant, experiments) in [0, 4].into_iter().enumerate() {
+                    for (variant, experiments) in [4, 0].into_iter().enumerate() {
                         let ms = render_optix(&mut optix, &scene, &bodies, experiments).1;
                         if sample > 0 {
                             times[variant].push(ms);
@@ -1246,8 +1246,8 @@ mod swarm_gpu {
                 let [rk4, dp45] = times.map(median);
                 row += &format!("; OptiX rk4 {rk4:6.1} ms, dp45 {dp45:6.1} ms");
                 if count <= 1024 {
-                    let brute = render_with(&scene, Some(&device(&bodies, true)), 4).0;
-                    let image = render_optix(&mut optix, &scene, &bodies, 4).0;
+                    let brute = render_with(&scene, Some(&device(&bodies, true)), 0).0;
+                    let image = render_optix(&mut optix, &scene, &bodies, 0).0;
                     assert!(brute.iter().zip(&image).all(|(a, b)| a.to_bits() == b.to_bits()));
                 }
             }
@@ -1287,8 +1287,9 @@ mod swarm_gpu {
     }
 }
 
-/// Times `bh_geodesic` against `bh_geodesic_experiments` with Dormand–Prince
-/// (bit 2), alternating launches, and compares their images.
+/// Times the legacy RK4 controller (`bh_geodesic_experiments` with bit 2) against
+/// the default Dormand–Prince `bh_geodesic`, alternating launches, and compares
+/// their images.
 #[cfg(test)]
 #[test]
 #[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
@@ -1349,7 +1350,7 @@ fn dp45_controller_benchmark() {
             let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
             for sample in 0..23 {
                 for (variant, output) in outputs.iter_mut().enumerate() {
-                    let kernel = [&cuda.geodesic, &cuda.geodesic_experiments][variant];
+                    let kernel = [&cuda.geodesic_experiments, &cuda.geodesic][variant];
                     let start = cuda.stream.record_event(timing).unwrap();
                     let mut builder = cuda.stream.launch_builder(kernel);
                     builder.arg(output);
@@ -1361,7 +1362,7 @@ fn dp45_controller_benchmark() {
                     builder.arg(&height);
                     builder.arg(&2u32);
                     builder.arg(&1u32);
-                    if variant == 1 {
+                    if variant == 0 {
                         builder.arg(&4u32);
                     }
                     unsafe { builder.launch(cfg).unwrap() };
@@ -1467,9 +1468,9 @@ fn dp45_disagreements_against_a_binary64_reference() {
     let sky: CudaSlice<u8> =
         cuda.clone_htod(bytemuck::cast_slice(&[0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0]));
 
-    // Escape direction per pixel, or None, for the default (0) and DP45 (4) controllers.
+    // Escape direction per pixel, or None, for the RK4 (4) and default DP45 (0) controllers.
     let diagnostics_kernel = cuda.module.load_function("bh_geodesic_diagnostics").unwrap();
-    let directions = [0u32, 4].map(|experiments| {
+    let directions = [4u32, 0].map(|experiments| {
         let pixels = (width * height) as usize;
         let mut image = cuda.alloc_zeros::<f32>(pixels * 4);
         let mut diagnostics = cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);

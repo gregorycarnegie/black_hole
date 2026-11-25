@@ -1646,7 +1646,7 @@ const DP_E: [f32; 7] = [
     71.0 / 57600.0, 0.0, -71.0 / 16695.0, 71.0 / 1920.0, -17253.0 / 339200.0, 22.0 / 525.0, -1.0 / 40.0,
 ];
 
-/// Experiment (checklist P1.1): embedded Dormand–Prince 5(4), advancing the fifth-order
+/// The renderer's controller (checklist P1.1/P1.1b): embedded Dormand–Prince 5(4), advancing the fifth-order
 /// solution. Six metric evaluations per first-try step against eleven for step doubling.
 /// No FSAL: callers rewrite `screen` between steps, and the endpoint metric is reused anyway.
 #[inline(always)]
@@ -2670,7 +2670,7 @@ pub unsafe fn bh_geodesic(
     unsafe {
         render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), false, false, false,
+            core::ptr::null_mut(), false, false, true,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -2691,14 +2691,14 @@ pub unsafe fn bh_geodesic_early_capture(
     unsafe {
         render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false, false,
+            core::ptr::null_mut(), true, false, true,
             gid_x(), gid_y(), no_swarm,
         );
     }
 }
 
 /// Any combination of the ray experiments: bit 0 early capture, bit 1 far field,
-/// bit 2 the Dormand–Prince controller.
+/// bit 2 the legacy step-doubling RK4 controller instead of Dormand–Prince.
 #[cuda_device::kernel]
 pub unsafe fn bh_geodesic_experiments(
     out_image: *mut Vec4,
@@ -2715,7 +2715,7 @@ pub unsafe fn bh_geodesic_experiments(
     unsafe {
         render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 != 0,
+            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 == 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -2747,7 +2747,7 @@ pub unsafe fn bh_geodesic_swarm(
     unsafe {
         render_geodesic::<false, true, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 != 0,
+            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 == 0,
             gid_x(), gid_y(),
             |start, end, t0, t1, _| swarm_bvh_hit(
                 start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
@@ -2809,7 +2809,7 @@ pub unsafe fn bh_geodesic_swarm_record(
     unsafe {
         render_geodesic::<false, true, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 != 0,
+            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 == 0,
             x, y,
             |start, end, t0, t1, state| {
                 if beyond_belt(swarm_query(start, end, t0, t1), belt_inner, belt_outer, belt_spread) {
@@ -2954,7 +2954,7 @@ pub unsafe fn bh_geodesic_diagnostics(
     unsafe {
         render_geodesic::<true, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
-            experiments & 1 != 0, experiments & 2 != 0, experiments & 4 != 0,
+            experiments & 1 != 0, experiments & 2 != 0, experiments & 4 == 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -4097,7 +4097,7 @@ pub unsafe fn bh_test_controller_trace(
         let wanted = (distance / velocity.length().max(1.0e-6))
             .min(next_h)
             .min(c.y - affine);
-        // cases.z != 0 selects the Dormand–Prince experiment; zero keeps the production controller.
+        // cases.z != 0 selects the production Dormand–Prince controller; zero the legacy RK4 one.
         let mut m = metric;
         let step = if c.z != 0.0 {
             advance_ray_dp45::<true>(ray, wanted, &mut m, false, objects, &mut rejected)

@@ -16,7 +16,8 @@ fn main() {
     let profiling = std::env::args_os().any(|arg| arg == "--profile-renderer");
     let early_capture = std::env::args_os().any(|arg| arg == "--experiment-early-capture");
     let far_field = std::env::args_os().any(|arg| arg == "--experiment-far-field");
-    let dormand_prince = std::env::args_os().any(|arg| arg == "--experiment-dp45");
+    // The step-doubling RK4 controller, kept for one release after Dormand–Prince became the default.
+    let rk4 = std::env::args_os().any(|arg| arg == "--rk4-controller");
     let mut window = Window {
         title: "Black Hole".into(),
         resolution: (800u32, 600u32).into(),
@@ -45,8 +46,8 @@ fn main() {
     if profiling {
         compute::profile::install(&mut app);
     }
-    if early_capture || far_field || dormand_prince {
-        compute::enable_ray_experiments(&mut app, early_capture, far_field, dormand_prince);
+    if early_capture || far_field || rk4 {
+        compute::enable_ray_experiments(&mut app, early_capture, far_field, rk4);
     }
     app.run();
 }

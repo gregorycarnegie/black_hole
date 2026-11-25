@@ -31,9 +31,9 @@ fn headless_snapshot_image() {
     objects[..4].copy_from_slice(&1i32.to_le_bytes());
     objects[528..532].copy_from_slice(&1f32.to_le_bytes());
     objects[788..792].copy_from_slice(&0.9375f32.to_le_bytes());
-    // The production RK4 controller, then the Dormand–Prince experiment (checklist P1.1).
+    // The production Dormand–Prince controller, then the legacy RK4 one (checklist P1.1b).
     // Compare each with `python verification/check_image.py compare --image <file>`.
-    for (dormand_prince, file) in [(false, "image-gpu.f32"), (true, "image-gpu-dp45.f32")] {
+    for (dormand_prince, file) in [(true, "image-gpu.f32"), (false, "image-gpu-rk4.f32")] {
         let data = crate::gpu::image(
             &objects,
             &header,
