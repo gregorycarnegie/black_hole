@@ -211,6 +211,25 @@ Close-up, `--profile-renderer`, two alternating runs each, still / orbit medians
 
 After the change, `dp45_controller_benchmark` gives 15.0 and 33.6 ms for the binary at the two sizes, against 16.2 and 34.5 ms. Single-hole times and the close-up are unchanged.
 
+## Specialised single-hole kernels (checklist P1.2)
+
+Single-hole scenes run their own builds of the production renderer, chosen on the host. `render_geodesic` takes the path as a const parameter.
+
+- **`bh_geodesic_single`** (any single-source scene with default options). It calls `metric_and_rhs_one`, which does the operations of `metric_and_rhs`'s two-slot path with the second slot empty, so the second source's state is never live. It needs 234 registers and no local memory, against 255 registers and 184 spilled bytes for `bh_geodesic`. Images are bit-identical.
+- **`bh_geodesic_scalar`** (single source, polarization view off, disk model other than the hot flow). This is `sample_plasma`'s own thermal shortcut condition, under which the screen vector is never read. The kernel does not transport the screen vector, its step error omits the screen term, and it skips `screen_frame` after each step. It needs 222 registers and no local memory. On the 400×300 thin-disk frame it takes 16,826,671 accepted steps and 174,324 rejected attempts, against 16,827,795 and 176,118 for `bh_geodesic`. The screen term almost never limited the step, so the time saved is work per step, not coarser steps. Images are not bit-identical. The largest channel difference from `bh_geodesic` is 0.0021 on the benchmark frames and 0.00203 in the match test, under half of 1/255.
+
+`specialised_kernel_benchmark` (thin disk, default camera, launches interleaved, 17 timed rounds):
+
+| Kernel | Registers / local bytes | 400×300 | 960×540 |
+|---|---|---|---|
+| `bh_geodesic` | 255 / 184 | 13.07 ms | 23.66 ms |
+| `bh_geodesic_single` | 234 / 0 | 11.35 ms | 20.56 ms |
+| `bh_geodesic_scalar` | 222 / 0 | 9.33 ms | 16.67 ms |
+
+The close-up (`--profile-renderer`) uses polarization view 2 and the hot flow, so it runs `bh_geodesic_single`. Two rounds each, alternating, still / orbit medians: 18.35 / 16.92 and 18.25 / 16.98 ms with `bh_geodesic`, against 16.47 / 15.01 and 16.22 / 15.09 ms with `bh_geodesic_single` (about 11%).
+
+`specialised_kernels_match_bh_geodesic` renders 4 spins (0, 0.82, -0.99, 0.999), all 4 disk models, polarization views 0, 2 and 5, and 2 camera elevations. It requires `bh_geodesic_single` to match `bh_geodesic` bit for bit everywhere, and `bh_geodesic_scalar` to stay within 1/255 in every channel in each thermal-only mode. Binaries, the swarm, the wormhole, diagnostics and the `--full-trace`, `--experiment-far-field` and `--rk4-controller` options still use the generic kernels.
+
 ## Experiment order
 
 1. **Measure the interactive frame.** Fix the camera, spin, disk preset, pixel dimensions, and render mode for each comparison. Start with single-hole thermal intensity, then compare polarized or synchrotron-heavy rendering and the binary scene. Include a view with a prominent photon ring and measure the Ellis kernel separately if the wormhole view is slow. Record median and 95th-percentile frame times after warm-up. Time the geodesic and accumulation kernels with CUDA events. Measure the host wait/readback, Bevy texture upload, and total frame time separately. Use the `H` heatmap to locate long rays and count rejected attempts separately from outer iterations. If a few long-running rays dominate, check warp divergence, register pressure, and spills before changing block size or splitting up the ray work. [Existing CUDA-event example](tests/common/gpu.rs#L229) · [Kernel dispatch](src/compute/pipeline.rs#L356) · [Display path](src/compute/accumulate.rs#L156)

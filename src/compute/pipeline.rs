@@ -521,11 +521,23 @@ pub fn dispatch_geodesic(
     let cuda = shared_cuda();
     cuda.bind_to_thread();
 
-    let wormhole = camera.is_some_and(|camera| camera.wormhole_radius > 0.0);
+    let wormhole = camera
+        .as_ref()
+        .is_some_and(|camera| camera.wormhole_radius > 0.0);
     let single_source = pipeline
         .last_objects
         .as_ref()
         .is_some_and(|objects| objects.num_objects == 1);
+    // Thermal intensity alone never reads the screen vector (checklist P1.2); this is
+    // `sample_plasma`'s own shortcut condition.
+    let scalar = single_source
+        && camera
+            .as_ref()
+            .is_some_and(|camera| camera.polarization_view == 0)
+        && pipeline
+            .last_disk
+            .as_ref()
+            .is_some_and(|disk| disk.model != 1);
     #[cfg(feature = "optix")]
     if !wormhole && !pipeline.optix_bodies.is_empty() {
         let experiments = active_experiments(single_source, experiments.as_deref());
@@ -597,6 +609,8 @@ pub fn dispatch_geodesic(
         return;
     }
     let kernel = match enabled {
+        0 if scalar => &cuda.geodesic_scalar,
+        0 if single_source => &cuda.geodesic_single,
         0 => &cuda.geodesic,
         1 => &cuda.geodesic_full_trace,
         _ => &cuda.geodesic_experiments,
@@ -1595,6 +1609,202 @@ fn launch_tuning_sweep() {
                 caps[c],
                 t[t.len() / 2],
                 if identical[n] { "" } else { "  IMAGE DIFFERS" }
+            );
+        }
+    }
+}
+
+/// Renders one single-hole frame with `kernel` (the `bh_geodesic` signature) and returns
+/// the image and the launch time in milliseconds.
+#[cfg(test)]
+fn render_single_hole(
+    kernel: &cudarc::driver::CudaFunction,
+    (spin, model, polarization_view): (f32, crate::simulation::DiskModel, u32),
+    elevation: f64,
+    (width, height): (u32, u32),
+) -> (Vec<f32>, f32) {
+    use crate::simulation::{DiskConfig, default_binary_spins, scene_objects};
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+    let scene = scene_objects(spin, false, false, 0.0, default_binary_spins());
+    let mut objects = GpuObjectsUniform::zeroed();
+    objects.num_objects = scene.len() as i32;
+    for (i, object) in scene.iter().enumerate() {
+        objects.pos_radius[i] = object.position.extend(object.radius).into();
+        objects.color[i] = object.color.into();
+        objects.mass[i][0] = object.mass;
+        objects.spin[i] = object.spin.extend(0.0).into();
+    }
+    let config = DiskConfig::for_model(model, spin);
+    let disk = build_disk_uniform(&DiskConfigUniform {
+        spin: config.spin,
+        r_outer_rs: config.r_outer_rs,
+        model: config.model.as_u32(),
+        h_thin: config.h_thin,
+        h_hot: config.h_hot,
+        r_trunc_rs: config.r_trunc_rs,
+        tilt_deg: config.tilt_deg,
+        r_bp_rs: config.r_bp_rs,
+        twist_deg: config.twist_deg,
+        binary_enabled: false,
+    });
+    let cam = crate::camera::OrbitalCamera {
+        elevation,
+        ..Default::default()
+    };
+    let camera = GpuCameraUniform {
+        pos: cam.position().into(),
+        right: cam.right().into(),
+        up: cam.up().into(),
+        forward: cam.forward().into(),
+        tan_half_fov: cam.tan_half_fov(),
+        aspect: width as f32 / height as f32,
+        max_iter: cam.max_iter,
+        polarization_view,
+        frequency_ghz: cam.frequency_ghz,
+        faraday_depth: cam.faraday_depth,
+        conversion_depth: cam.conversion_depth,
+        ..GpuCameraUniform::zeroed()
+    };
+    let sky: CudaSlice<u8> = cuda.clone_htod(bytemuck::cast_slice(&[
+        0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0,
+    ]));
+    let d_objects = cuda.clone_htod(bytemuck::bytes_of(&objects));
+    let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
+    let d_camera = cuda.clone_htod(bytemuck::bytes_of(&camera));
+    let mut output = cuda.alloc_zeros::<f32>((width * height * 4) as usize);
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let start = cuda.stream.record_event(timing).unwrap();
+    let mut builder = cuda.stream.launch_builder(kernel);
+    builder.arg(&mut output);
+    builder.arg(&d_camera);
+    builder.arg(&d_disk);
+    builder.arg(&d_objects);
+    builder.arg(&sky);
+    builder.arg(&width);
+    builder.arg(&height);
+    builder.arg(&2u32);
+    builder.arg(&1u32);
+    unsafe {
+        builder
+            .launch(ray_launch_config(width, height, true))
+            .unwrap()
+    };
+    drop(builder);
+    let end = cuda.stream.record_event(timing).unwrap();
+    end.synchronize().unwrap();
+    (cuda.clone_dtoh(&output), start.elapsed_ms(&end).unwrap())
+}
+
+/// Checklist P1.2: across spins, disk models (hot flow and warped disk included),
+/// polarization views and camera elevations, the single-source kernel renders
+/// `bh_geodesic`'s image bit for bit, and in every thermal-only mode the scalar kernel
+/// stays within 1/255 of it in every channel.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn specialised_kernels_match_bh_geodesic() {
+    use crate::simulation::DiskModel;
+    let cuda = shared_cuda();
+    let mut scalar_largest = 0.0_f32;
+    for spin in [0.0_f32, 0.82, -0.99, 0.999] {
+        for model in [
+            DiskModel::ThinNt,
+            DiskModel::TruncatedHotFlow,
+            DiskModel::SlimFunnel,
+            DiskModel::WarpedThin,
+        ] {
+            for polarization_view in [0u32, 2, 5] {
+                for elevation in [0.15, std::f64::consts::FRAC_PI_2 + 0.5] {
+                    let mode = (spin, model.clone(), polarization_view);
+                    let size = (160, 120);
+                    let (generic, _) =
+                        render_single_hole(&cuda.geodesic, mode.clone(), elevation, size);
+                    let (single, _) =
+                        render_single_hole(&cuda.geodesic_single, mode.clone(), elevation, size);
+                    assert!(
+                        generic
+                            .iter()
+                            .zip(&single)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "spin {spin} {model:?} view {polarization_view} elevation {elevation}"
+                    );
+                    if polarization_view != 0 || model == DiskModel::TruncatedHotFlow {
+                        continue;
+                    }
+                    let (scalar, _) =
+                        render_single_hole(&cuda.geodesic_scalar, mode, elevation, size);
+                    let largest = generic
+                        .iter()
+                        .zip(&scalar)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0_f32, f32::max);
+                    assert!(
+                        largest <= 1.0 / 255.0,
+                        "scalar: spin {spin} {model:?} elevation {elevation}: {largest}"
+                    );
+                    scalar_largest = scalar_largest.max(largest);
+                }
+            }
+        }
+    }
+    println!("scalar kernel: largest channel difference {scalar_largest:.5}");
+}
+
+/// Checklist P1.2: register use and time of the specialised single-hole kernels against
+/// `bh_geodesic`, launches interleaved.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn specialised_kernel_benchmark() {
+    use crate::simulation::{DiskModel, KERR_SPIN};
+    let cuda = shared_cuda();
+    let kernels = [
+        ("bh_geodesic", &cuda.geodesic),
+        ("bh_geodesic_single", &cuda.geodesic_single),
+        ("bh_geodesic_scalar", &cuda.geodesic_scalar),
+    ];
+    for (name, f) in kernels {
+        println!(
+            "{name}: {} registers, {} local bytes per thread",
+            f.num_regs().unwrap(),
+            f.local_size_bytes().unwrap()
+        );
+    }
+    let elevation = crate::camera::OrbitalCamera::default().elevation;
+    for size in [(400u32, 300u32), (960, 540)] {
+        let mode = (KERR_SPIN, DiskModel::ThinNt, 0u32);
+        let mut times = vec![Vec::new(); kernels.len()];
+        let mut images = vec![Vec::new(); kernels.len()];
+        for round in 0..20 {
+            for (n, (_, f)) in kernels.iter().enumerate() {
+                let (image, t) = render_single_hole(f, mode.clone(), elevation, size);
+                if round >= 3 {
+                    times[n].push(t);
+                }
+                images[n] = image;
+            }
+        }
+        for (((name, _), mut t), image) in kernels.iter().zip(times).zip(&images) {
+            t.sort_unstable_by(f32::total_cmp);
+            let differing = image
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(images[0].as_chunks::<4>().0)
+                .filter(|(a, b)| a.iter().zip(*b).any(|(x, y)| (x - y).abs() > 1.0 / 255.0))
+                .count();
+            let largest = image
+                .iter()
+                .zip(&images[0])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            println!(
+                "{name} {}×{}: median {:.2} ms; {differing} pixels differ from bh_geodesic by \
+                 more than 1/255, largest channel difference {largest:.4}",
+                size.0,
+                size.1,
+                t[t.len() / 2]
             );
         }
     }

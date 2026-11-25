@@ -1492,12 +1492,38 @@ fn rhs_from_terms(k: Vec4, m: Metric, force: Vec3, transport: Vec4) -> Derivs {
     }
 }
 
+/// The gradient of the source's h.
+#[inline(always)]
+fn kerr_h_gradient(s: KerrSource, dr: Vec3) -> Vec3 {
+    s.h * (3.0 * s.inv_r * dr - (4.0 * s.r * s.r2 * dr + 2.0 * s.ax * s.a) * s.inv_den)
+}
+
+/// The gradient of ell . v at fixed v.
+#[inline(always)]
+fn ell_gradient(s: KerrSource, x: Vec3, dr: Vec3, v: Vec3) -> Vec3 {
+    let av = s.a.dot(v);
+    let grad_n = (x.dot(v) - s.ax * av * s.inv_r2) * dr + s.r * v - v.cross(s.a)
+        + (av * s.inv_r) * s.a;
+    (grad_n - (2.0 * s.r * s.ell.dot(v)) * dr) * s.inv_r2_a2
+}
+
+/// `source_terms`' force alone, for paths without screen transport.
+#[inline(always)]
+fn source_force(s: KerrSource, x: Vec3, k: Vec4) -> Vec3 {
+    let ks = k.yzw();
+    let dr = kerr_radius_gradient(s, x);
+    let dh = kerr_h_gradient(s, dr);
+    let u = k.x + s.ell.dot(ks);
+    let gk = ell_gradient(s, x, dr, ks);
+    2.0 * u * u * dh + 2.0 * (2.0 * s.h) * u * gk
+}
+
 /// One source's share of `geodesic_rhs`'s contractions.
 #[inline(always)]
 fn source_terms(s: KerrSource, x: Vec3, k: Vec4, f: Vec4, force: &mut Vec3, transport: &mut Vec4) {
     let (ks, fs) = (k.yzw(), f.yzw());
     let dr = kerr_radius_gradient(s, x);
-    let dh = s.h * (3.0 * s.inv_r * dr - (4.0 * s.r * s.r2 * dr + 2.0 * s.ax * s.a) * s.inv_den);
+    let dh = kerr_h_gradient(s, dr);
     // sum_j v_j d_j ell, with n = r x - a × x + (a.x / r) a = (r² + a²) ell.
     let along = |v: Vec3| {
         let dv_r = dr.dot(v);
@@ -1505,13 +1531,7 @@ fn source_terms(s: KerrSource, x: Vec3, k: Vec4, f: Vec4, force: &mut Vec3, tran
             + (s.a.dot(v) * s.inv_r - s.ax * dv_r * s.inv_r2) * s.a;
         (dn - s.ell * (2.0 * s.r * dv_r)) * s.inv_r2_a2
     };
-    // The gradient of ell . v at fixed v.
-    let gradient = |v: Vec3| {
-        let av = s.a.dot(v);
-        let grad_n = (x.dot(v) - s.ax * av * s.inv_r2) * dr + s.r * v - v.cross(s.a)
-            + (av * s.inv_r) * s.a;
-        (grad_n - (2.0 * s.r * s.ell.dot(v)) * dr) * s.inv_r2_a2
-    };
+    let gradient = |v: Vec3| ell_gradient(s, x, dr, v);
     let u = k.x + s.ell.dot(ks);
     let w = f.x + s.ell.dot(fs);
     let (dk_l, df_l) = (along(ks), along(fs));
@@ -1780,9 +1800,92 @@ fn metric_and_rhs(r: Ray, gauged: bool, objects: &Objects) -> (Metric, Option<De
     (m, Some(ray_rhs(r, m, gauged, objects)))
 }
 
+/// Render paths (checklist P1.2). `SINGLE`: exactly one source. `SINGLE_SCALAR`: one
+/// source and thermal intensity alone, which never reads the screen vector, so it is
+/// not transported and the step error omits it.
+const GENERIC: u8 = 0;
+const SINGLE: u8 = 1;
+const SINGLE_SCALAR: u8 = 2;
+
+/// `metric_and_rhs` for exactly one source: the operations of its two-slot path with
+/// slot 1 empty, so the same bits, without slot 1's live state.
+#[cuda_device::device]
+fn metric_and_rhs_one(r: Ray, gauged: bool, objects: &Objects) -> (Metric, Option<Derivs>) {
+    single_metric_and_rhs::<false>(r, gauged, objects)
+}
+
+/// `metric_and_rhs_one` without screen transport: the screen derivative is zero.
+#[cuda_device::device]
+fn metric_and_rhs_scalar(r: Ray, objects: &Objects) -> (Metric, Option<Derivs>) {
+    single_metric_and_rhs::<true>(r, false, objects)
+}
+
 #[inline(always)]
-fn dp_stage(ray: Ray, d: Derivs, h: f32, gauged: bool, objects: &Objects) -> Option<Derivs> {
-    metric_and_rhs(rk_state(ray, d, h), gauged, objects).1
+fn single_metric_and_rhs<const SCALAR: bool>(r: Ray, gauged: bool, objects: &Objects) -> (Metric, Option<Derivs>) {
+    let live = objects.mass[0].x > 0.0;
+    let x = r.pos - objects.pos_radius[0].xyz();
+    let s = if live {
+        kerr_source(x, objects.mass[0].x, objects.spin[0].xyz())
+    } else {
+        KerrSource::default()
+    };
+    let mut m = flat_metric();
+    if live {
+        m = add_kerr_source(m, s);
+    }
+    if !ray_valid(r, m) {
+        return (m, None);
+    }
+    let k = m.inv * r.p;
+    if SCALAR {
+        let force = if live { source_force(s, x, k) } else { vec3_splat(0.0) };
+        return (m, Some(scalar_rhs(k, force)));
+    }
+    let (mut force, mut transport) = (vec3_splat(0.0), vec4_splat(0.0));
+    if live {
+        source_terms(s, x, k, r.screen, &mut force, &mut transport);
+    }
+    (m, Some(gauge(rhs_from_terms(k, m, force, transport), k, gauged)))
+}
+
+#[inline(always)]
+fn scalar_rhs(k: Vec4, force: Vec3) -> Derivs {
+    Derivs {
+        pos: k.yzw(),
+        p: 0.5 * vec4_f_v3(0.0, force),
+        screen: vec4_splat(0.0),
+    }
+}
+
+#[inline(always)]
+fn stage_metric_and_rhs<const PATH: u8>(r: Ray, gauged: bool, objects: &Objects) -> (Metric, Option<Derivs>) {
+    match PATH {
+        SINGLE => metric_and_rhs_one(r, gauged, objects),
+        SINGLE_SCALAR => metric_and_rhs_scalar(r, objects),
+        _ => metric_and_rhs(r, gauged, objects),
+    }
+}
+
+/// The right-hand side at a ray whose metric `m` is already known.
+#[inline(always)]
+fn first_stage<const PATH: u8>(ray: Ray, m: Metric, gauged: bool, objects: &Objects) -> Derivs {
+    if PATH == SINGLE_SCALAR {
+        let k = m.inv * ray.p;
+        let mass = objects.mass[0].x.max(0.0);
+        let force = if mass > 0.0 {
+            let x = ray.pos - objects.pos_radius[0].xyz();
+            source_force(kerr_source(x, mass, objects.spin[0].xyz()), x, k)
+        } else {
+            vec3_splat(0.0)
+        };
+        return scalar_rhs(k, force);
+    }
+    ray_rhs(ray, m, gauged, objects)
+}
+
+#[inline(always)]
+fn dp_stage<const PATH: u8>(ray: Ray, d: Derivs, h: f32, gauged: bool, objects: &Objects) -> Option<Derivs> {
+    stage_metric_and_rhs::<PATH>(rk_state(ray, d, h), gauged, objects).1
 }
 
 #[inline(always)]
@@ -1811,7 +1914,7 @@ const DP_E: [f32; 7] = [
 /// solution. Six metric evaluations per first-try step against eleven for step doubling.
 /// No FSAL: callers rewrite `screen` between steps, and the endpoint metric is reused anyway.
 #[inline(always)]
-fn advance_ray_dp45<const DIAGNOSTICS: bool>(
+fn advance_ray_dp45<const DIAGNOSTICS: bool, const PATH: u8>(
     ray: Ray,
     requested_h: f32,
     m: &mut Metric,
@@ -1827,16 +1930,16 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
             accepted: false,
         };
     }
-    let k1 = ray_rhs(ray, *m, gauged, objects);
+    let k1 = first_stage::<PATH>(ray, *m, gauged, objects);
     let mut next_h = requested_h;
     for retry in 0..12 {
         let h = next_h;
         next_h = 0.5 * h;
-        let Some(k2) = dp_stage(ray, scale_derivs(DP_A[0][0], k1), h, gauged, objects) else {
+        let Some(k2) = dp_stage::<PATH>(ray, scale_derivs(DP_A[0][0], k1), h, gauged, objects) else {
             continue;
         };
         let d = add_derivs(scale_derivs(DP_A[1][0], k1), DP_A[1][1], k2);
-        let Some(k3) = dp_stage(ray, d, h, gauged, objects) else {
+        let Some(k3) = dp_stage::<PATH>(ray, d, h, gauged, objects) else {
             continue;
         };
         let d = add_derivs(
@@ -1844,7 +1947,7 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
             DP_A[2][2],
             k3,
         );
-        let Some(k4) = dp_stage(ray, d, h, gauged, objects) else {
+        let Some(k4) = dp_stage::<PATH>(ray, d, h, gauged, objects) else {
             continue;
         };
         let d = add_derivs(
@@ -1856,7 +1959,7 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
             DP_A[3][3],
             k4,
         );
-        let Some(k5) = dp_stage(ray, d, h, gauged, objects) else {
+        let Some(k5) = dp_stage::<PATH>(ray, d, h, gauged, objects) else {
             continue;
         };
         let d = add_derivs(
@@ -1872,7 +1975,7 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
             DP_A[4][4],
             k5,
         );
-        let Some(k6) = dp_stage(ray, d, h, gauged, objects) else {
+        let Some(k6) = dp_stage::<PATH>(ray, d, h, gauged, objects) else {
             continue;
         };
         let d = add_derivs(
@@ -1889,7 +1992,7 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
             k6,
         );
         let next = rk_state(ray, d, h);
-        let (metric, k7) = metric_and_rhs(next, gauged, objects);
+        let (metric, k7) = stage_metric_and_rhs::<PATH>(next, gauged, objects);
         let Some(k7) = k7 else {
             continue;
         };
@@ -2984,7 +3087,7 @@ pub unsafe fn bh_geodesic(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, _>(
+        render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), true, false, true,
             gid_x(), gid_y(), no_swarm,
@@ -3005,9 +3108,54 @@ pub unsafe fn bh_geodesic_full_trace(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, _>(
+        render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), false, false, true,
+            gid_x(), gid_y(), no_swarm,
+        );
+    }
+}
+
+/// `bh_geodesic` for a scene with exactly one source (checklist P1.2).
+#[cuda_device::kernel]
+pub unsafe fn bh_geodesic_single(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+) {
+    unsafe {
+        render_geodesic::<false, false, SINGLE, _>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+            core::ptr::null_mut(), true, false, true,
+            gid_x(), gid_y(), no_swarm,
+        );
+    }
+}
+
+/// `bh_geodesic_single` for thermal intensity alone: no polarization view and no hot
+/// flow, so `sample_plasma` never reads the screen vector (checklist P1.2).
+#[cuda_device::kernel]
+pub unsafe fn bh_geodesic_scalar(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+) {
+    unsafe {
+        render_geodesic::<false, false, SINGLE_SCALAR, _>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+            core::ptr::null_mut(), true, false, true,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -3030,7 +3178,7 @@ pub unsafe fn bh_geodesic_experiments(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, _>(
+        render_geodesic::<false, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
             gid_x(), gid_y(), no_swarm,
@@ -3062,7 +3210,7 @@ pub unsafe fn bh_geodesic_swarm(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<false, true, _>(
+        render_geodesic::<false, true, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
             gid_x(), gid_y(),
@@ -3124,7 +3272,7 @@ pub unsafe fn bh_geodesic_swarm_record(
     let (x, y) = (gid_x(), gid_y() + row0);
     let pixel = y * width + x;
     unsafe {
-        render_geodesic::<false, true, _>(
+        render_geodesic::<false, true, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
             x, y,
@@ -3269,7 +3417,7 @@ pub unsafe fn bh_geodesic_diagnostics(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<true, false, _>(
+        render_geodesic::<true, false, GENERIC, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
             experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
             gid_x(), gid_y(), no_swarm,
@@ -3278,12 +3426,12 @@ pub unsafe fn bh_geodesic_diagnostics(
 }
 
 #[inline(always)]
-fn advance_render_ray<const DIAGNOSTICS: bool>(
+fn advance_render_ray<const DIAGNOSTICS: bool, const PATH: u8>(
     ray: Ray, h: f32, metric: &mut Metric, objects: &Objects, stats: &mut RayDiagnostics,
     dormand_prince: bool,
 ) -> AdaptiveStep {
     if dormand_prince {
-        advance_ray_dp45::<DIAGNOSTICS>(ray, h, metric, false, objects, &mut stats.rejected_attempts)
+        advance_ray_dp45::<DIAGNOSTICS, PATH>(ray, h, metric, false, objects, &mut stats.rejected_attempts)
     } else if DIAGNOSTICS {
         advance_ray_counting::<true>(ray, h, metric, false, objects, &mut stats.rejected_attempts)
     } else {
@@ -3386,6 +3534,7 @@ pub unsafe fn bh_test_capture_guard(
 unsafe fn render_geodesic<
     const DIAGNOSTICS: bool,
     const SWARM: bool,
+    const PATH: u8,
     F: Fn(Vec3, Vec3, f32, f32, PixelState) -> Vec4,
 >(
     out_image: *mut Vec4,
@@ -3493,7 +3642,7 @@ unsafe fn render_geodesic<
         } else {
             ordinary_h
         };
-        let mut step = advance_render_ray::<DIAGNOSTICS>(ray, proposed_h, &mut metric, objects, &mut stats, dormand_prince);
+        let mut step = advance_render_ray::<DIAGNOSTICS, PATH>(ray, proposed_h, &mut metric, objects, &mut stats, dormand_prince);
         if far_field && proposed_h > ordinary_h
             && (!step.accepted || ray.pos.dot(step.ray.pos - ray.pos) < 0.0)
         {
@@ -3501,7 +3650,7 @@ unsafe fn render_geodesic<
             if step.accepted {
                 metric = scene_metric(ray.pos, objects);
             }
-            step = advance_render_ray::<DIAGNOSTICS>(ray, ordinary_h, &mut metric, objects, &mut stats, dormand_prince);
+            step = advance_render_ray::<DIAGNOSTICS, PATH>(ray, ordinary_h, &mut metric, objects, &mut stats, dormand_prince);
         }
         // Stop when the affine parameter can no longer advance in binary32.
         if !step.accepted || affine + step.h == affine {
@@ -3571,8 +3720,10 @@ unsafe fn render_geodesic<
         }
         winding += swept_angle(ray.pos, next.pos);
         ray = next;
-        let frame = screen_frame(ray, metric);
-        ray.screen = vec4_f_v3(0.0, frame[0]);
+        if PATH != SINGLE_SCALAR {
+            let frame = screen_frame(ray, metric);
+            ray.screen = vec4_f_v3(0.0, frame[0]);
+        }
         if ray.pos.length() > ESCAPE_R && winding > UNRESOLVED_WINDING {
             // Unresolved: no sky, as for the iteration limit; captures already add none.
             if DIAGNOSTICS {
@@ -4435,7 +4586,7 @@ pub unsafe fn bh_test_controller_classify(
         // cases.z != 0 selects the Dormand–Prince controller.
         let step = if c.z != 0.0 {
             let mut m = metric;
-            advance_ray_dp45::<false>(ray, wanted, &mut m, false, objects, &mut 0)
+            advance_ray_dp45::<false, GENERIC>(ray, wanted, &mut m, false, objects, &mut 0)
         } else {
             advance_ray(ray, wanted, metric, objects)
         };
@@ -4508,7 +4659,7 @@ pub unsafe fn bh_test_controller_trace(
         // cases.z != 0 selects the production Dormand–Prince controller; zero the legacy RK4 one.
         let mut m = metric;
         let step = if c.z != 0.0 {
-            advance_ray_dp45::<true>(ray, wanted, &mut m, false, objects, &mut rejected)
+            advance_ray_dp45::<true, GENERIC>(ray, wanted, &mut m, false, objects, &mut rejected)
         } else {
             advance_ray_counting::<true>(ray, wanted, &mut m, false, objects, &mut rejected)
         };
@@ -4742,7 +4893,7 @@ pub unsafe fn bh_test_image(
         }
         last_h = h;
         let step = if dormand_prince != 0 {
-            advance_ray_dp45::<false>(ray, h, &mut m, true, objects, &mut 0)
+            advance_ray_dp45::<false, GENERIC>(ray, h, &mut m, true, objects, &mut 0)
         } else {
             advance_ray_gauge(ray, h, &mut m, true, objects)
         };
