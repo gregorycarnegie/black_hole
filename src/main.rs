@@ -14,7 +14,8 @@ mod ui;
 
 fn main() {
     let profiling = std::env::args_os().any(|arg| arg == "--profile-renderer");
-    let early_capture = std::env::args_os().any(|arg| arg == "--experiment-early-capture");
+    // Turns off guarded single-Kerr early capture, which is on by default.
+    let full_trace = std::env::args_os().any(|arg| arg == "--full-trace");
     let far_field = std::env::args_os().any(|arg| arg == "--experiment-far-field");
     // The step-doubling RK4 controller, kept for one release after Dormand–Prince became the default.
     let rk4 = std::env::args_os().any(|arg| arg == "--rk4-controller");
@@ -46,8 +47,8 @@ fn main() {
     if profiling {
         compute::profile::install(&mut app);
     }
-    if early_capture || far_field || rk4 {
-        compute::enable_ray_experiments(&mut app, early_capture, far_field, rk4);
+    if full_trace || far_field || rk4 {
+        compute::enable_ray_experiments(&mut app, full_trace, far_field, rk4);
     }
     app.run();
 }

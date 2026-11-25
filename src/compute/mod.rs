@@ -34,19 +34,19 @@ pub struct GeodesicComputePlugin;
 
 #[derive(Resource)]
 pub(super) struct RayExperiments {
-    early_capture: bool,
+    full_trace: bool,
     far_field: bool,
     rk4: bool,
 }
 
 pub(crate) fn enable_ray_experiments(
     app: &mut App,
-    early_capture: bool,
+    full_trace: bool,
     far_field: bool,
     rk4: bool,
 ) {
     app.sub_app_mut(RenderApp).insert_resource(RayExperiments {
-        early_capture,
+        full_trace,
         far_field,
         rk4,
     });

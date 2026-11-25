@@ -594,7 +594,7 @@ pub fn dispatch_geodesic(
     }
     let kernel = match enabled {
         0 => &cuda.geodesic,
-        1 => &cuda.geodesic_early_capture,
+        1 => &cuda.geodesic_full_trace,
         _ => &cuda.geodesic_experiments,
     };
     let mut builder = cuda.stream.launch_builder(kernel);
@@ -646,9 +646,10 @@ fn active_experiments(single_source: bool, experiments: Option<&RayExperiments>)
     let Some(experiments) = experiments else {
         return 0;
     };
-    // Early capture and far field assume a single source; the controller does not.
+    // Far field assumes a single source. Early capture is on by default and its kernel
+    // guard rejects other scenes; bit 0 asks for the full trace.
     let single = if single_source {
-        u32::from(experiments.early_capture) | (u32::from(experiments.far_field) << 1)
+        u32::from(experiments.full_trace) | (u32::from(experiments.far_field) << 1)
     } else {
         0
     };
@@ -1226,6 +1227,7 @@ mod swarm_gpu {
                 }
             }
             let [rk4, dp45] = times.map(median);
+            #[cfg_attr(not(feature = "optix"), allow(unused_mut))]
             let mut row = format!("{count:>6} bodies: BVH rk4 {rk4:6.1} ms, dp45 {dp45:6.1} ms");
             if (1..=1024).contains(&count) {
                 let brute = render_with(&scene, Some(&device(&bodies, true)), 0).0;
@@ -1542,31 +1544,7 @@ fn dp45_disagreements_against_a_binary64_reference() {
     let spin = scene[0].spin.as_dvec3().to_array();
     let kerr = black_hole::certified::Kerr::new(spin).unwrap();
     let horizon = 1.0 + (1.0 - spin.iter().map(|a| a * a).sum::<f64>()).sqrt();
-    // Binary64 RK4 with steps of `factor` times horizon clearance over speed, until the
-    // coordinate radius passes 1600 as in the renderer. None if it nears the horizon.
-    let reference = |start: [f64; 11], factor: f64| -> Option<[f64; 3]> {
-        let mut s = start;
-        let add = |s: [f64; 11], d: [f64; 11], h: f64| std::array::from_fn(|i| s[i] + h * d[i]);
-        for _ in 0..50_000_000 {
-            let k1 = kerr.phase_rhs(s);
-            if s[..3].iter().map(|x| x * x).sum::<f64>().sqrt() > 1600.0 {
-                return Some([k1[0], k1[1], k1[2]]);
-            }
-            let clearance = kerr.radius([s[0], s[1], s[2]]) - horizon;
-            if clearance < 1.0e-3 {
-                return None;
-            }
-            let speed = k1[..3].iter().map(|x| x * x).sum::<f64>().sqrt();
-            let h = factor * clearance / speed;
-            let k2 = kerr.phase_rhs(add(s, k1, 0.5 * h));
-            let k3 = kerr.phase_rhs(add(s, k2, 0.5 * h));
-            let k4 = kerr.phase_rhs(add(s, k3, h));
-            s = std::array::from_fn(|i| {
-                s[i] + h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
-            });
-        }
-        None
-    };
+    let reference = |start, factor| binary64_reference(&kerr, horizon, start, factor);
     let (mut rk4_closer, mut dp45_closer) = (0, 0);
     for (n, &i) in chosen.iter().enumerate() {
         let v: Vec<f64> = states[12 * n..12 * n + 12].iter().map(|&x| f64::from(x)).collect();
@@ -1597,4 +1575,225 @@ fn dp45_disagreements_against_a_binary64_reference() {
         }
     }
     println!("largest disagreements: dp45 closer at {dp45_closer}, rk4 closer at {rk4_closer}");
+}
+
+/// Binary64 RK4 on the CPU Kerr field with steps of `factor` times horizon clearance
+/// over speed, until the coordinate radius passes 1600 as in the renderer. Returns the
+/// escape direction, or None if the ray nears the horizon.
+#[cfg(test)]
+fn binary64_reference(
+    kerr: &black_hole::certified::Kerr,
+    horizon: f64,
+    start: [f64; 11],
+    factor: f64,
+) -> Option<[f64; 3]> {
+    let mut s = start;
+    let add = |s: [f64; 11], d: [f64; 11], h: f64| std::array::from_fn(|i| s[i] + h * d[i]);
+    for _ in 0..50_000_000 {
+        let k1 = kerr.phase_rhs(s);
+        if s[..3].iter().map(|x| x * x).sum::<f64>().sqrt() > 1600.0 {
+            return Some([k1[0], k1[1], k1[2]]);
+        }
+        let clearance = kerr.radius([s[0], s[1], s[2]]) - horizon;
+        if clearance < 1.0e-3 {
+            return None;
+        }
+        let speed = k1[..3].iter().map(|x| x * x).sum::<f64>().sqrt();
+        let h = factor * clearance / speed;
+        let k2 = kerr.phase_rhs(add(s, k1, 0.5 * h));
+        let k3 = kerr.phase_rhs(add(s, k2, 0.5 * h));
+        let k4 = kerr.phase_rhs(add(s, k3, h));
+        s = std::array::from_fn(|i| s[i] + h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]));
+    }
+    None
+}
+
+/// Guarded early capture (checklist P0.3) must not change the image. Renders each
+/// scene with the default kernel options and with the full trace (bit 0) through the
+/// diagnostics kernel and requires bit-identical output, across spins up to the
+/// |a| <= 0.995 guard edge and the 0.999 fallback, every disk model, intensity, EVPA
+/// and circular-polarization views, cameras near the pole and just above and below
+/// the disk, and the binary fallback. A sample of early-captured pixels is also traced
+/// from the GPU's initial state in binary64 on the CPU Kerr field; none may escape.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn early_capture_matches_the_full_trace() {
+    use crate::simulation::{DiskConfig, DiskModel, default_binary_spins, scene_objects};
+    const EARLY_CAPTURE: u32 = 9;
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+    let (width, height) = (160u32, 120u32);
+    let pixels = (width * height) as usize;
+    let sky: CudaSlice<u8> =
+        cuda.clone_htod(bytemuck::cast_slice(&[0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0]));
+    let diagnostics_kernel = cuda.module.load_function("bh_geodesic_diagnostics").unwrap();
+    let pixel_kernel = cuda.module.load_function("bh_test_pixel_ray").unwrap();
+    let models = [
+        DiskModel::ThinNt,
+        DiskModel::TruncatedHotFlow,
+        DiskModel::SlimFunnel,
+        DiskModel::WarpedThin,
+    ];
+    let elevations = [
+        0.15,
+        std::f64::consts::FRAC_PI_2 - 0.1,
+        std::f64::consts::FRAC_PI_2 + 0.5,
+    ];
+    let mut checked = 0;
+    for spin in [0.0_f32, 0.82, -0.82, 0.99, -0.99, 0.995, -0.995, 0.999] {
+        let mut early_total = 0;
+        for binary in [false, true] {
+            if binary && spin != 0.82 {
+                continue;
+            }
+            let scene = scene_objects(spin, false, binary, 0.0, default_binary_spins());
+            let mut objects = GpuObjectsUniform::zeroed();
+            objects.num_objects = scene.len() as i32;
+            for (i, object) in scene.iter().enumerate() {
+                objects.pos_radius[i] = object.position.extend(object.radius).into();
+                objects.color[i] = object.color.into();
+                objects.mass[i][0] = object.mass;
+                objects.spin[i] = object.spin.extend(0.0).into();
+            }
+            let d_objects = cuda.clone_htod(bytemuck::bytes_of(&objects));
+            let mut binary_early = 0;
+            for model in &models {
+                let config = DiskConfig::for_model(model.clone(), spin);
+                let disk = build_disk_uniform(&DiskConfigUniform {
+                    spin: config.spin,
+                    r_outer_rs: config.r_outer_rs,
+                    model: config.model.as_u32(),
+                    h_thin: config.h_thin,
+                    h_hot: config.h_hot,
+                    r_trunc_rs: config.r_trunc_rs,
+                    tilt_deg: config.tilt_deg,
+                    r_bp_rs: config.r_bp_rs,
+                    twist_deg: config.twist_deg,
+                    binary_enabled: binary,
+                });
+                let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
+                for elevation in elevations {
+                    for polarization_view in [0u32, 2, 5] {
+                        let mut cam = crate::camera::OrbitalCamera::default();
+                        cam.radius = 24.0;
+                        cam.elevation = elevation;
+                        cam.azimuth = 0.7;
+                        let camera = GpuCameraUniform {
+                            pos: cam.position().into(),
+                            right: cam.right().into(),
+                            up: cam.up().into(),
+                            forward: cam.forward().into(),
+                            tan_half_fov: cam.tan_half_fov(),
+                            aspect: width as f32 / height as f32,
+                            max_iter: cam.max_iter,
+                            polarization_view,
+                            frequency_ghz: cam.frequency_ghz,
+                            faraday_depth: cam.faraday_depth,
+                            conversion_depth: cam.conversion_depth,
+                            ..GpuCameraUniform::zeroed()
+                        };
+                        let d_camera = cuda.clone_htod(bytemuck::bytes_of(&camera));
+                        let [(early_image, early_rays), (full_image, _)] =
+                            [0u32, 1].map(|experiments| {
+                                let mut image = cuda.alloc_zeros::<f32>(pixels * 4);
+                                let mut diagnostics =
+                                    cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);
+                                let mut launch = cuda.stream.launch_builder(&diagnostics_kernel);
+                                launch.arg(&mut image);
+                                launch.arg(&d_camera);
+                                launch.arg(&d_disk);
+                                launch.arg(&d_objects);
+                                launch.arg(&sky);
+                                launch.arg(&width);
+                                launch.arg(&height);
+                                launch.arg(&2u32);
+                                launch.arg(&1u32);
+                                launch.arg(&mut diagnostics);
+                                launch.arg(&experiments);
+                                let cfg = ray_launch_config(width, height, !binary);
+                                unsafe { launch.launch(cfg).unwrap() };
+                                drop(launch);
+                                (cuda.clone_dtoh(&image), cuda.clone_dtoh(&diagnostics))
+                            });
+                        let differing = early_image
+                            .iter()
+                            .zip(&full_image)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        assert_eq!(
+                            differing, 0,
+                            "spin {spin}, binary {binary}, {model:?}, elevation {elevation}, view {polarization_view}"
+                        );
+                        let early: Vec<usize> = early_rays
+                            .as_chunks::<RAY_FIELDS>()
+                            .0
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, d)| d[7] == EARLY_CAPTURE)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if binary {
+                            binary_early += early.len();
+                            continue;
+                        }
+                        early_total += early.len();
+                        if early.is_empty() || polarization_view != 0 {
+                            continue;
+                        }
+                        // Independent check of four early-captured pixels.
+                        let chosen: Vec<u32> =
+                            (0..4).map(|k| early[k * early.len() / 4] as u32).collect();
+                        let input: Vec<f32> = chosen
+                            .iter()
+                            .flat_map(|&i| {
+                                [(i % width) as f32, (i / width) as f32, width as f32, height as f32]
+                            })
+                            .collect();
+                        let d_pixels = cuda.clone_htod(&input);
+                        let mut d_states = cuda.alloc_zeros::<f32>(chosen.len() * 12);
+                        let count = chosen.len() as u32;
+                        let mut launch = cuda.stream.launch_builder(&pixel_kernel);
+                        launch.arg(&d_camera);
+                        launch.arg(&d_objects);
+                        launch.arg(&d_pixels);
+                        launch.arg(&mut d_states);
+                        launch.arg(&count);
+                        let one_thread_each = LaunchConfig {
+                            grid_dim: (count, 1, 1),
+                            block_dim: (1, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        unsafe { launch.launch(one_thread_each).unwrap() };
+                        drop(launch);
+                        let states = cuda.clone_dtoh(&d_states);
+                        let kerr =
+                            black_hole::certified::Kerr::new(scene[0].spin.as_dvec3().to_array())
+                                .unwrap();
+                        let a = f64::from(spin);
+                        let horizon = 1.0 + (1.0 - a * a).sqrt();
+                        for (n, &i) in chosen.iter().enumerate() {
+                            let v: Vec<f64> =
+                                states[12 * n..12 * n + 12].iter().map(|&x| f64::from(x)).collect();
+                            let start =
+                                [v[0], v[1], v[2], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]];
+                            assert!(
+                                binary64_reference(&kerr, horizon, start, 0.004).is_none(),
+                                "early-captured pixel {i} escapes in binary64 at spin {spin}, {model:?}, elevation {elevation}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(binary_early, 0, "the binary must keep the full trace");
+        }
+        println!("spin {spin}: {early_total} early captures; every image identical");
+        if spin.abs() > 0.995 {
+            assert_eq!(early_total, 0, "spin {spin} is outside the guard");
+        } else {
+            assert!(early_total > 0, "no early captures at spin {spin}");
+        }
+    }
+    println!("{checked} early-captured pixels confirmed captured in binary64");
 }

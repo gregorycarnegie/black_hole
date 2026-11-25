@@ -2670,14 +2670,14 @@ pub unsafe fn bh_geodesic(
     unsafe {
         render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), false, false, true,
+            core::ptr::null_mut(), true, false, true,
             gid_x(), gid_y(), no_swarm,
         );
     }
 }
 
 #[cuda_device::kernel]
-pub unsafe fn bh_geodesic_early_capture(
+pub unsafe fn bh_geodesic_full_trace(
     out_image: *mut Vec4,
     cam: *const Camera,
     disk: *const Disk,
@@ -2691,14 +2691,15 @@ pub unsafe fn bh_geodesic_early_capture(
     unsafe {
         render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false, true,
+            core::ptr::null_mut(), false, false, true,
             gid_x(), gid_y(), no_swarm,
         );
     }
 }
 
-/// Any combination of the ray experiments: bit 0 early capture, bit 1 far field,
-/// bit 2 the legacy step-doubling RK4 controller instead of Dormand–Prince.
+/// Any combination of the ray options: bit 0 the full trace instead of guarded early
+/// capture, bit 1 far-field steps, bit 2 the legacy step-doubling RK4 controller
+/// instead of Dormand–Prince.
 #[cuda_device::kernel]
 pub unsafe fn bh_geodesic_experiments(
     out_image: *mut Vec4,
@@ -2715,7 +2716,7 @@ pub unsafe fn bh_geodesic_experiments(
     unsafe {
         render_geodesic::<false, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 == 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
@@ -2747,7 +2748,7 @@ pub unsafe fn bh_geodesic_swarm(
     unsafe {
         render_geodesic::<false, true, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 == 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
             gid_x(), gid_y(),
             |start, end, t0, t1, _| swarm_bvh_hit(
                 start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
@@ -2809,7 +2810,7 @@ pub unsafe fn bh_geodesic_swarm_record(
     unsafe {
         render_geodesic::<false, true, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, experiments & 4 == 0,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
             x, y,
             |start, end, t0, t1, state| {
                 if beyond_belt(swarm_query(start, end, t0, t1), belt_inner, belt_outer, belt_spread) {
@@ -2954,7 +2955,7 @@ pub unsafe fn bh_geodesic_diagnostics(
     unsafe {
         render_geodesic::<true, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
-            experiments & 1 != 0, experiments & 2 != 0, experiments & 4 == 0,
+            experiments & 1 == 0, experiments & 2 != 0, experiments & 4 == 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
