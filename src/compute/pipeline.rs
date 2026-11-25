@@ -550,7 +550,11 @@ pub fn dispatch_geodesic(
         ..
     } = *pipeline;
 
-    let cfg = ray_launch_config(width, height, !wormhole && single_source);
+    let cfg = if wormhole {
+        block_launch_config(width, height, (16, 16))
+    } else {
+        ray_launch_config(width, height, single_source)
+    };
     if wormhole {
         // Reuse the near sky until the second asynchronous asset has loaded.
         let (far_sky, far_w, far_h) = if other_sky_width > 0 && other_sky_height > 0 {
@@ -657,12 +661,17 @@ fn active_experiments(single_source: bool, experiments: Option<&RayExperiments>)
 }
 
 fn ray_launch_config(width: u32, height: u32, single_source_kerr: bool) -> LaunchConfig {
-    // Keep each warp on one scanline for the single-source Kerr kernel.
-    let (block_width, block_height) = if single_source_kerr {
-        (32, 4)
-    } else {
-        (16, 16)
-    };
+    // Single Kerr: each warp on one scanline. Others: 8×8 tiles, 2.5–6.7% faster than
+    // 16×16 for the binary in `launch_tuning_sweep` (checklist P1.4).
+    let shape = if single_source_kerr { (32, 4) } else { (8, 8) };
+    block_launch_config(width, height, shape)
+}
+
+fn block_launch_config(
+    width: u32,
+    height: u32,
+    (block_width, block_height): (u32, u32),
+) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (
             width.div_ceil(block_width),
@@ -1431,6 +1440,161 @@ fn dp45_controller_benchmark() {
                 rk4_t.1,
                 dp45_t.0,
                 dp45_t.1,
+            );
+        }
+    }
+}
+
+/// Checklist P1.4: times `bh_geodesic` under a `.maxnreg` register cap, a maximum-L1
+/// carveout (each a separate module) and launch shapes, and checks each image against
+/// the shipped configuration bit for bit. Caps of 200, 168 and 128 were measured too:
+/// they spill 440–792 bytes and run 6% to 3.7× slower.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn launch_tuning_sweep() {
+    use crate::simulation::{KERR_SPIN, default_binary_spins, scene_objects};
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+    let header = ".visible .entry bh_geodesic(";
+    let at = super::cuda::PTX.find(header).unwrap();
+    let body = at + super::cuda::PTX[at..].find("\n{").unwrap();
+    let caps = ["default", "cap 232", "max L1"];
+    let kernels: Vec<_> = caps
+        .iter()
+        .map(|&variant| {
+            if variant == "default" {
+                return cuda.geodesic.clone();
+            }
+            let directive = if variant == "cap 232" { "\n.maxnreg 232" } else { "" };
+            let ptx = format!(
+                "{}{directive}{}",
+                &super::cuda::PTX[..body],
+                &super::cuda::PTX[body..]
+            );
+            let module = cuda.context.load_module(cudarc::nvrtc::Ptx::from_src(ptx)).unwrap();
+            let f = module.load_function("bh_geodesic").unwrap();
+            if variant == "max L1" {
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                    0,
+                )
+                .unwrap();
+            }
+            f
+        })
+        .collect();
+    for (variant, f) in caps.iter().zip(&kernels) {
+        println!(
+            "{variant}: {} registers, {} local bytes, SASS sm_{}",
+            f.num_regs().unwrap(),
+            f.local_size_bytes().unwrap(),
+            f.binary_version().unwrap()
+        );
+    }
+    let shapes = [(32u32, 4u32), (16, 8), (8, 8), (16, 16)];
+    let cam = crate::camera::OrbitalCamera::default();
+    let sky: CudaSlice<u8> = cuda.clone_htod(bytemuck::cast_slice(&[
+        0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0,
+    ]));
+    for (binary, width, height) in [
+        (false, 400u32, 300u32),
+        (false, 960, 540),
+        (true, 400, 300),
+        (true, 960, 540),
+    ] {
+        let scene = scene_objects(KERR_SPIN, false, binary, 0.0, default_binary_spins());
+        let mut objects = GpuObjectsUniform::zeroed();
+        objects.num_objects = scene.len() as i32;
+        for (i, object) in scene.iter().enumerate() {
+            objects.pos_radius[i] = object.position.extend(object.radius).into();
+            objects.color[i] = object.color.into();
+            objects.mass[i][0] = object.mass;
+            objects.spin[i] = object.spin.extend(0.0).into();
+        }
+        let disk = build_disk_uniform(&DiskConfigUniform {
+            spin: KERR_SPIN,
+            binary_enabled: binary,
+            ..DiskConfigUniform::default()
+        });
+        let camera = GpuCameraUniform {
+            pos: cam.position().into(),
+            right: cam.right().into(),
+            up: cam.up().into(),
+            forward: cam.forward().into(),
+            tan_half_fov: cam.tan_half_fov(),
+            aspect: width as f32 / height as f32,
+            max_iter: cam.max_iter,
+            frequency_ghz: cam.frequency_ghz,
+            faraday_depth: cam.faraday_depth,
+            conversion_depth: cam.conversion_depth,
+            ..GpuCameraUniform::zeroed()
+        };
+        let d_objects = cuda.clone_htod(bytemuck::bytes_of(&objects));
+        let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
+        let d_camera = cuda.clone_htod(bytemuck::bytes_of(&camera));
+        let mut output = cuda.alloc_zeros::<f32>((width * height * 4) as usize);
+        let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let run = |output: &mut CudaSlice<f32>,
+                   kernel: &cudarc::driver::CudaFunction,
+                   cfg: LaunchConfig| {
+            let start = cuda.stream.record_event(timing).unwrap();
+            let mut builder = cuda.stream.launch_builder(kernel);
+            builder.arg(output);
+            builder.arg(&d_camera);
+            builder.arg(&d_disk);
+            builder.arg(&d_objects);
+            builder.arg(&sky);
+            builder.arg(&width);
+            builder.arg(&height);
+            builder.arg(&2u32);
+            builder.arg(&1u32);
+            unsafe { builder.launch(cfg).unwrap() };
+            drop(builder);
+            let end = cuda.stream.record_event(timing).unwrap();
+            end.synchronize().unwrap();
+            start.elapsed_ms(&end).unwrap()
+        };
+        run(
+            &mut output,
+            &cuda.geodesic,
+            ray_launch_config(width, height, !binary),
+        );
+        let reference = cuda.clone_dtoh(&output);
+        let name = if binary { "binary" } else { "single" };
+        // Interleave configurations within each round so drift affects all alike.
+        let configs: Vec<(usize, (u32, u32))> = (0..caps.len())
+            .flat_map(|c| shapes.iter().map(move |&s| (c, s)))
+            .collect();
+        let mut times = vec![Vec::new(); configs.len()];
+        let mut identical = vec![true; configs.len()];
+        for round in 0..16 {
+            for (n, &(c, (bw, bh))) in configs.iter().enumerate() {
+                let cfg = LaunchConfig {
+                    grid_dim: (width.div_ceil(bw), height.div_ceil(bh), 1),
+                    block_dim: (bw, bh, 1),
+                    shared_mem_bytes: 0,
+                };
+                let t = run(&mut output, &kernels[c], cfg);
+                if round == 0 {
+                    let image = cuda.clone_dtoh(&output);
+                    identical[n] = image
+                        .iter()
+                        .zip(&reference)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                } else {
+                    times[n].push(t);
+                }
+            }
+        }
+        for (n, &(c, (bw, bh))) in configs.iter().enumerate() {
+            let t = &mut times[n];
+            t.sort_unstable_by(f32::total_cmp);
+            println!(
+                "{name} {width}×{height} {} block {bw}×{bh}: median {:.2} ms{}",
+                caps[c],
+                t[t.len() / 2],
+                if identical[n] { "" } else { "  IMAGE DIFFERS" }
             );
         }
     }
