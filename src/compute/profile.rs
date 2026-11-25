@@ -32,6 +32,20 @@ const SAMPLES: usize = 60;
 const WARMUP: usize = 12;
 const PHASE_FRAMES: usize = SAMPLES + WARMUP;
 pub(super) const RAY_FIELDS: usize = 18;
+/// Exit names in the order of RayExit in the CUDA kernel.
+pub(super) const RAY_EXITS: [&str; 11] = [
+    "iteration_limit",
+    "invalid_camera",
+    "invalid_metric",
+    "horizon",
+    "step_rejected",
+    "affine_stagnation",
+    "object_hit",
+    "escaped",
+    "opaque",
+    "early_capture",
+    "near_critical",
+];
 
 #[derive(Clone, Default, ExtractResource, Resource)]
 #[extract_app(RenderApp)]
@@ -134,20 +148,7 @@ pub(super) fn write_ray_profile(
     data: &[u32],
     experiments: u32,
 ) -> io::Result<()> {
-    // Field order and exit ordinals match RayDiagnostics and RayExit in the CUDA kernel.
-    let reasons = [
-        "iteration_limit",
-        "invalid_camera",
-        "invalid_metric",
-        "horizon",
-        "step_rejected",
-        "affine_stagnation",
-        "object_hit",
-        "escaped",
-        "opaque",
-        "early_capture",
-        "near_critical",
-    ];
+    // Field order matches RayDiagnostics in the CUDA kernel.
     create_dir_all("target")?;
     let mut path = String::from("target/renderer-rays");
     for (bit, name) in [(1, "-full-trace"), (2, "-far-field"), (4, "-rk4")] {
@@ -189,7 +190,7 @@ pub(super) fn write_ray_profile(
     {
         let x = pixel % width as usize;
         let y = pixel / width as usize;
-        let reason = reasons[exit as usize];
+        let reason = RAY_EXITS[exit as usize];
         let [sky_x, sky_y, sky_z] = [sky_x, sky_y, sky_z].map(f32::from_bits);
         let [stokes_i, stokes_q, stokes_u, stokes_v] =
             [stokes_i, stokes_q, stokes_u, stokes_v].map(f32::from_bits);

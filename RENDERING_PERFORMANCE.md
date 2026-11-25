@@ -292,6 +292,51 @@ Not covered:
 - **The |z| = 4H truncation:** the density jumps from exp(−8) of its midplane value to zero there, and that jump is not resolved.
 - **The EHT snapshot path:** it keeps its own transfer loop (`transfer_cell` and `grid_step`). Its status counts are unchanged (990 captured, 24,610 escaped), and it was not decoupled.
 
+## Baseline profile (checklist P0.1, in progress)
+
+`baseline_profile` times the production kernels on a fixed scene set, with the kernel and launch shape `dispatch_geodesic` picks for each scene. In the same rounds it times `bh_geodesic` from the checklist's pinned revision (e9ce1b95), loaded from `PINNED_PTX`. That kernel was the pinned app's default: the RK4 controller, full trace, 16×16 blocks for the binary. The camera, disk, frame index and sub-pixel sample are fixed, and the sky is a two-texel test texture. Each launch is timed with CUDA events: 10 warm-up rounds, then 30 timed rounds. Within a round the scenes run in turn, and the current and pinned kernels alternate which goes first. Per-launch times go to `target/baseline-profile.csv`. Step and exit counts come from a separate pass of the diagnostics kernel, so timing runs without instrumentation.
+
+```
+PINNED_PTX=<git show e9ce1b95:src/compute/kernels.ptx> cargo test --release --bin black_hole baseline_profile -- --ignored --nocapture
+```
+
+**Setup.** RTX 4090, driver 621.01, Windows 11. PTX source SHA256 eee2004e…, cuda-oxide e027ac32, LLVM NVPTX `sm_80` PTX 7.0. Under load the GPU held P2 at 2,820 MHz SM and 10,251 MHz memory, 44–54 °C, 180–297 W. Kernel resources: `bh_geodesic` 255 registers and 192 local bytes, `bh_geodesic_single` 236 and none, `bh_geodesic_scalar` 218 and none, pinned `bh_geodesic` 255 and 704 local bytes. Each fits 2 blocks of 128 threads per SM.
+
+**Time.** Medians and p95 in ms. Two runs in separate processes; their medians agree within 1.5%.
+
+| Scene | Kernel | 400×300 median (run 1 / 2) | p95 | Pinned median | 960×540 median (run 1 / 2) | p95 | Pinned median |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Thin disk, elevation 1.22 | scalar | 9.81 / 9.96 | 10.58 | 130.9 (−92.5%) | 15.48 / 15.52 | 15.83 | 158.6 (−90.2%) |
+| Thin disk, elevation 0.20 | scalar | 6.32 / 6.29 | 6.65 | 75.0 (−91.6%) | 13.03 / 12.94 | 13.59 | 98.9 (−86.8%) |
+| Warped disk, spin −0.9, polarized, elevation 0.40 | single | 11.50 / 11.36 | 12.32 | 92.2 (−87.5%) | 18.22 / 18.28 | 19.14 | 126.4 (−85.6%) |
+| Hot flow close-up, polarized | single | 16.19 / 16.18 | 17.59 | 190.8 (−91.5%) | 28.54 / 28.44 | 29.52 | 242.7 (−88.2%) |
+| Binary | generic | 15.75 / 15.59 | 16.07 | 35.1 (−55.1%) | 29.56 / 29.77 | 30.37 | 83.9 (−64.8%) |
+
+p95 is run 1's. The pinned kernel's p95 is 3–24% above its median, against 2–9% for the current kernels.
+
+**Ray cost.** From the diagnostics pass at 960×540. An attempt is an accepted step or a rejected one. Warp lane efficiency is the attempts made divided by the attempts each warp's lanes would make if every lane ran as long as the warp's costliest ray, in the launch's own block shape.
+
+| Scene | Accepted steps | Rejected | Attempts per ray p50 / p90 / p99 / max | Costliest 1% of rays | Warp lane efficiency | Exits other than escape |
+|---|---:|---:|---|---:|---:|---|
+| Thin disk, elevation 1.22 | 46.2M | 1.28% | 86 / 110 / 149 / 1,337 | 2.1% | 93.8% | early capture 6,811, opaque 183, near-critical 4 |
+| Thin disk, elevation 0.20 | 45.5M | 1.82% | 86 / 107 / 146 / 1,089 | 2.0% | 95.0% | early capture 6,565, horizon 9, near-critical 4 |
+| Warped disk, spin −0.9 | 45.6M | 1.81% | 87 / 106 / 148 / 1,171 | 2.0% | 94.6% | early capture 6,448, near-critical 12, horizon 3, stagnation 1 |
+| Hot flow close-up | 49.0M | 1.95% | 90 / 114 / 168 / 1,564 | 2.8% | 90.5% | early capture 24,929, opaque 93, near-critical 26 |
+| Binary | 48.9M | 1.05% | 87 / 116 / 235 / 935 | 4.1% | 96.4% | stagnation 5,123, opaque 56 |
+
+At 400×300 the shares are similar: the costliest 1% of rays make 2.0–4.2% of the attempts, and warp lane efficiency is 83.9–94.1% (lowest for the hot flow close-up).
+
+What this says about the next steps:
+- **Long tails are small.** No scene loses more than about 10% of its lanes to waiting on slower rays in the same warp (16% for the 400×300 close-up). That bounds what the long-tail scheduler (P1.5) can recover by regrouping rays, before its own compaction and relaunch costs.
+- **Time goes into each step.** The scenes take 86–90 attempts per median ray, yet the polarized hot flow takes 1.8 times as long as the thermal thin disk at 960×540. The difference is per-step work: polarized transport and plasma sampling.
+- **The binary stagnates.** 5,123 binary rays (1.0%) end in affine stagnation, against at most 1 per single-hole frame.
+
+Not yet done for P0.1:
+- **Nsight Systems and Nsight Compute.** Neither is installed, so there is no timeline, occupancy, stall, branch-efficiency, memory-traffic or instruction-mix data yet.
+- **The rest of the benchmark matrix:** spins ±0.99 and ±0.999, Schwarzschild, the distant view at radius 160, and near-horizon views.
+- **The EHT snapshot**, which is timed separately and not part of this harness.
+- **The app's sky texture.** The test sky has two texels, so sky lookups are cheaper than in the app.
+
 ## Experiment order
 
 1. **Measure the interactive frame.** Fix the camera, spin, disk preset, pixel dimensions, and render mode for each comparison. Start with single-hole thermal intensity, then compare polarized or synchrotron-heavy rendering and the binary scene. Include a view with a prominent photon ring and measure the Ellis kernel separately if the wormhole view is slow. Record median and 95th-percentile frame times after warm-up. Time the geodesic and accumulation kernels with CUDA events. Measure the host wait/readback, Bevy texture upload, and total frame time separately. Use the `H` heatmap to locate long rays and count rejected attempts separately from outer iterations. If a few long-running rays dominate, check warp divergence, register pressure, and spills before changing block size or splitting up the ray work. [Existing CUDA-event example](tests/common/gpu.rs#L229) · [Kernel dispatch](src/compute/pipeline.rs#L356) · [Display path](src/compute/accumulate.rs#L156)

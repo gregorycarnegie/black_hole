@@ -1630,7 +1630,7 @@ fn render_single_hole(
         elevation,
         ..Default::default()
     };
-    let [d_camera, d_disk, d_objects, sky] = single_hole_buffers(mode, &cam, (width, height));
+    let [d_camera, d_disk, d_objects, sky] = scene_buffers(mode, &cam, (width, height), false);
     let mut output = cuda.alloc_zeros::<f32>((width * height * 4) as usize);
     let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
     let start = cuda.stream.record_event(timing).unwrap();
@@ -1672,7 +1672,7 @@ fn diagnose_single_hole(
         .module
         .load_function("bh_geodesic_diagnostics")
         .unwrap();
-    let [d_camera, d_disk, d_objects, sky] = single_hole_buffers(mode, cam, (width, height));
+    let [d_camera, d_disk, d_objects, sky] = scene_buffers(mode, cam, (width, height), false);
     let pixels = (width * height) as usize;
     let mut output = cuda.alloc_zeros::<f32>(pixels * 4);
     let mut diagnostics = cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);
@@ -1697,18 +1697,19 @@ fn diagnose_single_hole(
     (cuda.clone_dtoh(&output), cuda.clone_dtoh(&diagnostics))
 }
 
-/// Camera, disk, objects and a two-texel sky for a single-hole frame at the default
-/// camera distance.
+/// Camera, disk, objects and a two-texel sky for a single-hole frame, or the binary
+/// when `binary` is set.
 #[cfg(test)]
-fn single_hole_buffers(
+fn scene_buffers(
     (spin, model, polarization_view): (f32, crate::simulation::DiskModel, u32),
     cam: &crate::camera::OrbitalCamera,
     (width, height): (u32, u32),
+    binary: bool,
 ) -> [CudaSlice<u8>; 4] {
     use crate::simulation::{DiskConfig, default_binary_spins, scene_objects};
     let cuda = shared_cuda();
     cuda.bind_to_thread();
-    let scene = scene_objects(spin, false, false, 0.0, default_binary_spins());
+    let scene = scene_objects(spin, false, binary, 0.0, default_binary_spins());
     let mut objects = GpuObjectsUniform::zeroed();
     objects.num_objects = scene.len() as i32;
     for (i, object) in scene.iter().enumerate() {
@@ -1728,7 +1729,7 @@ fn single_hole_buffers(
         tilt_deg: config.tilt_deg,
         r_bp_rs: config.r_bp_rs,
         twist_deg: config.twist_deg,
-        binary_enabled: false,
+        binary_enabled: binary,
     });
     let camera = GpuCameraUniform {
         pos: cam.position().into(),
@@ -2674,4 +2675,271 @@ fn the_capture_guard_is_certified_on_the_cpu() {
         );
         assert!(captured > CASES / 20, "too few captures at spin {spin}");
     }
+}
+
+/// Checklist P0.1: a baseline of the production kernels on a fixed scene set at 400×300
+/// and 960×540. Each scene runs the kernel the app picks for it and, when `PINNED_PTX`
+/// names the PTX of the checklist's pinned revision (e9ce1b95), that revision's
+/// `bh_geodesic` in the same rounds, alternating which goes first. Prints the device
+/// state, kernel resources, the median and p95 of 30 CUDA-event-timed launches after 10
+/// warm-up rounds, and, from a separate diagnostics pass, step, exit and ray-cost counts.
+/// Per-launch times go to `target/baseline-profile.csv`.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with -- --ignored --nocapture"]
+fn baseline_profile() {
+    use crate::{
+        camera::OrbitalCamera,
+        simulation::{DiskModel, KERR_SPIN},
+    };
+    use cudarc::driver::CudaFunction;
+    use std::fmt::Write as _;
+    const WARMUP: usize = 10;
+    const SAMPLES: usize = 30;
+    let cuda = shared_cuda();
+    let device = || {
+        std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=name,driver_version,pstate,clocks.sm,clocks.mem,temperature.gpu,power.draw,memory.used",
+                "--format=csv,noheader",
+            ])
+            .output()
+            .map_or_else(
+                |error| format!("nvidia-smi failed: {error}"),
+                |out| String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            )
+    };
+    println!("device idle: {}", device());
+    println!(
+        "PTX source SHA256 {}",
+        super::cuda::ptx_recorded_sha256().unwrap_or("unrecorded")
+    );
+    let pinned = std::env::var("PINNED_PTX").ok().map(|path| {
+        let ptx = cudarc::nvrtc::Ptx::from_src(std::fs::read_to_string(path).unwrap());
+        let module = cuda.context.load_module(ptx).unwrap();
+        module.load_function("bh_geodesic").unwrap()
+    });
+    let current = [
+        ("bh_geodesic", &cuda.geodesic),
+        ("bh_geodesic_single", &cuda.geodesic_single),
+        ("bh_geodesic_scalar", &cuda.geodesic_scalar),
+    ];
+    for (name, kernel) in current
+        .into_iter()
+        .chain(pinned.as_ref().map(|kernel| ("pinned bh_geodesic", kernel)))
+    {
+        println!(
+            "{name}: {} registers, {} local bytes, {} resident 128-thread blocks per SM",
+            kernel.num_regs().unwrap(),
+            kernel.local_size_bytes().unwrap(),
+            kernel
+                .occupancy_max_active_blocks_per_multiprocessor(128, 0, None)
+                .unwrap()
+        );
+    }
+
+    let at = |elevation| OrbitalCamera {
+        elevation,
+        ..Default::default()
+    };
+    let default = OrbitalCamera::default().elevation;
+    // The `--profile-renderer` close-up.
+    let close_up = OrbitalCamera {
+        radius: 24.0,
+        elevation: std::f64::consts::FRAC_PI_2 - 0.1,
+        ..Default::default()
+    };
+    let thin = (KERR_SPIN, DiskModel::ThinNt, 0);
+    let scenes = [
+        ("thin disk", thin.clone(), at(default), false),
+        ("thin disk, elevation 0.20", thin.clone(), at(0.2), false),
+        (
+            "warped disk, spin -0.9, polarized, elevation 0.40",
+            (-0.9, DiskModel::WarpedThin, 2),
+            at(0.4),
+            false,
+        ),
+        (
+            "hot flow close-up, polarized",
+            (KERR_SPIN, DiskModel::TruncatedHotFlow, 2),
+            close_up,
+            false,
+        ),
+        ("binary", thin, at(default), true),
+    ];
+    // The kernel `dispatch_geodesic` picks.
+    let chosen: Vec<(&str, &CudaFunction)> = scenes
+        .iter()
+        .map(|(_, (_, model, view), _, binary)| {
+            if *binary {
+                current[0]
+            } else if *view == 0 && *model != DiskModel::TruncatedHotFlow {
+                current[2]
+            } else {
+                current[1]
+            }
+        })
+        .collect();
+    let diagnostics_kernel = cuda
+        .module
+        .load_function("bh_geodesic_diagnostics")
+        .unwrap();
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    let mut csv = String::from("width,height,scene,kernel,round,ms\n");
+    for (width, height) in [(400u32, 300u32), (960, 540)] {
+        let pixels = (width * height) as usize;
+        let buffers: Vec<_> = scenes
+            .iter()
+            .map(|(_, mode, cam, binary)| {
+                scene_buffers(mode.clone(), cam, (width, height), *binary)
+            })
+            .collect();
+        let mut output = cuda.alloc_zeros::<f32>(pixels * 4);
+        let launch = |output: &mut CudaSlice<f32>,
+                      kernel: &CudaFunction,
+                      [camera, disk, objects, sky]: &[CudaSlice<u8>; 4],
+                      cfg: LaunchConfig,
+                      diagnostics: Option<&mut CudaSlice<u32>>| {
+            let production = 0u32;
+            let start = cuda.stream.record_event(timing).unwrap();
+            let mut builder = cuda.stream.launch_builder(kernel);
+            builder.arg(output);
+            builder.arg(camera);
+            builder.arg(disk);
+            builder.arg(objects);
+            builder.arg(sky);
+            builder.arg(&width);
+            builder.arg(&height);
+            builder.arg(&2u32);
+            builder.arg(&1u32);
+            if let Some(diagnostics) = diagnostics {
+                builder.arg(diagnostics);
+                builder.arg(&production);
+            }
+            unsafe { builder.launch(cfg).unwrap() };
+            drop(builder);
+            let end = cuda.stream.record_event(timing).unwrap();
+            end.synchronize().unwrap();
+            start.elapsed_ms(&end).unwrap()
+        };
+
+        let mut times = vec![[Vec::new(), Vec::new()]; scenes.len()];
+        for round in 0..WARMUP + SAMPLES {
+            if round == WARMUP {
+                println!("device under load: {}", device());
+            }
+            for (n, (scene, _, _, binary)) in scenes.iter().enumerate() {
+                for variant in [round % 2, 1 - round % 2] {
+                    let (name, kernel, cfg) = match (variant, &pinned) {
+                        (0, _) => (
+                            chosen[n].0,
+                            chosen[n].1,
+                            ray_launch_config(width, height, !binary),
+                        ),
+                        // The pinned revision launched binaries in 16×16 blocks.
+                        (_, Some(kernel)) => (
+                            "pinned bh_geodesic",
+                            kernel,
+                            block_launch_config(
+                                width,
+                                height,
+                                if *binary { (16, 16) } else { (32, 4) },
+                            ),
+                        ),
+                        (_, None) => continue,
+                    };
+                    let ms = launch(&mut output, kernel, &buffers[n], cfg, None);
+                    if round >= WARMUP {
+                        times[n][variant].push(ms);
+                        writeln!(csv, "{width},{height},{scene},{name},{round},{ms}").unwrap();
+                    }
+                }
+            }
+        }
+
+        for (n, (scene, _, _, binary)) in scenes.iter().enumerate() {
+            let [now, before] = times[n].each_mut().map(|t| {
+                t.sort_unstable_by(f32::total_cmp);
+                (t.len() == SAMPLES).then(|| {
+                    let median = 0.5 * (t[SAMPLES / 2 - 1] + t[SAMPLES / 2]);
+                    (median, t[(SAMPLES * 95).div_ceil(100) - 1])
+                })
+            });
+            let (median, p95) = now.unwrap();
+            let mut line = format!(
+                "{width}×{height} {scene} [{}]: median {median:.2} ms, p95 {p95:.2} ms",
+                chosen[n].0
+            );
+            if let Some((old_median, old_p95)) = before {
+                write!(
+                    line,
+                    "; pinned median {old_median:.2} ms, p95 {old_p95:.2} ms ({:+.1}%)",
+                    100.0 * (median / old_median - 1.0)
+                )
+                .unwrap();
+            }
+            println!("{line}");
+
+            // Counts come from a separate, untimed diagnostics pass.
+            let mut diagnostics = cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);
+            let shape = if *binary { (8, 8) } else { (32, 4) };
+            launch(
+                &mut output,
+                &diagnostics_kernel,
+                &buffers[n],
+                block_launch_config(width, height, shape),
+                Some(&mut diagnostics),
+            );
+            let data = cuda.clone_dtoh(&diagnostics);
+            let (rays, _) = data.as_chunks::<RAY_FIELDS>();
+            let attempts: Vec<u64> = rays.iter().map(|ray| u64::from(ray[1] + ray[2])).collect();
+            let steps: u64 = rays.iter().map(|ray| u64::from(ray[1])).sum();
+            let total: u64 = attempts.iter().sum();
+            let mut exits = [0u32; super::profile::RAY_EXITS.len()];
+            for ray in rays {
+                exits[ray[7] as usize] += 1;
+            }
+            // A warp runs until its costliest lane finishes.
+            let (block_width, block_height) = shape;
+            let mut warp_work = 0u64;
+            for block_y in 0..height.div_ceil(block_height) {
+                for block_x in 0..width.div_ceil(block_width) {
+                    for warp in 0..block_width * block_height / 32 {
+                        let lanes = (32 * warp..32 * (warp + 1)).filter_map(|thread| {
+                            let x = block_x * block_width + thread % block_width;
+                            let y = block_y * block_height + thread / block_width;
+                            (x < width && y < height).then(|| attempts[(y * width + x) as usize])
+                        });
+                        let (count, most) = lanes.fold((0, 0), |(c, m), a| (c + 1, m.max(a)));
+                        warp_work += count * most;
+                    }
+                }
+            }
+            let mut sorted = attempts;
+            sorted.sort_unstable();
+            let quantile = |q: f64| sorted[((sorted.len() - 1) as f64 * q).round() as usize];
+            let top: u64 = sorted[sorted.len() - pixels.div_ceil(100)..].iter().sum();
+            let exits: Vec<String> = exits
+                .iter()
+                .zip(super::profile::RAY_EXITS)
+                .filter(|(count, _)| **count > 0)
+                .map(|(count, name)| format!("{name} {count}"))
+                .collect();
+            println!(
+                "    {steps} accepted steps, {} rejected attempts ({:.2}%); attempts per ray p50 {} p90 {} p99 {} max {}; costliest 1% of rays {:.1}% of attempts; warp lane efficiency {:.1}%; exits: {}",
+                total - steps,
+                100.0 * (total - steps) as f64 / total as f64,
+                quantile(0.5),
+                quantile(0.9),
+                quantile(0.99),
+                sorted[sorted.len() - 1],
+                100.0 * top as f64 / total as f64,
+                100.0 * total as f64 / warp_work as f64,
+                exits.join(", ")
+            );
+        }
+    }
+    println!("device after: {}", device());
+    std::fs::create_dir_all("target").unwrap();
+    std::fs::write("target/baseline-profile.csv", csv).unwrap();
 }
