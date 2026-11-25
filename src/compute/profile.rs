@@ -155,7 +155,8 @@ pub(super) fn write_ray_profile(
         (1, "-full-trace"),
         (2, "-no-far-field"),
         (4, "-rk4"),
-        (256, "-no-analytic-escape"),
+        (256, "-no-analytic-legs"),
+        (512, "-band-legs"),
     ] {
         if experiments & bit != 0 {
             path.push_str(name);

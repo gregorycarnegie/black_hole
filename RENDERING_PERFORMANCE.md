@@ -228,7 +228,7 @@ Single-hole scenes run their own builds of the production renderer, chosen on th
 
 The close-up (`--profile-renderer`) uses polarization view 2 and the hot flow, so it runs `bh_geodesic_single`. Two rounds each, alternating, still / orbit medians: 18.35 / 16.92 and 18.25 / 16.98 ms with `bh_geodesic`, against 16.47 / 15.01 and 16.22 / 15.09 ms with `bh_geodesic_single` (about 11%).
 
-`specialised_kernels_match_bh_geodesic` renders 4 spins (0, 0.82, -0.99, 0.999), all 4 disk models, polarization views 0, 2 and 5, and 2 camera elevations. It requires `bh_geodesic_single` to match `bh_geodesic` bit for bit everywhere, and `bh_geodesic_scalar` to stay within 1/255 in every channel in each thermal-only mode. Binaries, the swarm, the wormhole, diagnostics and the `--full-trace`, `--no-far-field`, `--no-analytic-escape` and `--rk4-controller` options still use the generic kernels.
+`specialised_kernels_match_bh_geodesic` renders 4 spins (0, 0.82, -0.99, 0.999), all 4 disk models, polarization views 0, 2 and 5, and 2 camera elevations. It requires `bh_geodesic_single` to match `bh_geodesic` bit for bit everywhere, and `bh_geodesic_scalar` to stay within 1/255 in every channel in each thermal-only mode. Binaries, the swarm, the wormhole, diagnostics and the `--full-trace`, `--no-far-field`, `--no-analytic-legs`, `--band-legs` and `--rk4-controller` options still use the generic kernels.
 
 ## Far-field steps by default (checklist P1.8)
 
@@ -257,7 +257,9 @@ Shift check over six views (thin disk at two elevations, warped disk at spin −
 
 So a full analytic escape can add at most the difference between the oracle and the far-field default: about 5–13 points at 960×540, minus its own cost. The next section measures it.
 
-## Analytic escape (default, checklist P1.8)
+## Analytic escape (checklist P1.8)
+
+The next section generalises this leg; the names below are those of this first version.
 
 An escaping single-hole ray now leaves the numerical loop once it is outside the sphere enclosing the disk and the hole (radius at least 16) and moving outward within 18 degrees of radial, the far-field guard. From there `analytic_escape` in `tools/cuda/kernels.rs` carries it to Kerr–Schild radius 1600 with the separated solution and samples the sky. Swarm scenes keep the numerical trace, because the leg would skip their per-step intersection tests. `--no-analytic-escape` (experiment bit 8) turns the leg off; `--no-far-field` turns off both.
 
@@ -289,6 +291,52 @@ An escaping single-hole ray now leaves the numerical loop once it is outside the
 No image channel changed by more than 4e-4, and none by 1/255. Against a stub that moves the ray to r = 1600 for free, the leg costs 0–4% (mostly 1–3%), so most of the remaining gap to the oracle is not its arithmetic. Repeat runs moved individual rows by about ±1.5 points.
 
 **Not covered.** Only the escape leg is analytic. Vacuum intervals between disk crossings and inward legs to the horizon (where early capture already ends most rays) still use the numerical trace.
+
+## Vacuum legs (default, checklist P1.8)
+
+The escape leg above is now one case of a general vacuum leg. Outside the sphere enclosing the disk and the hole, every single-hole ray is carried analytically. An outward ray goes to the sky sphere, as before but without the 18-degree cone. An inward ray goes either back to the sphere or through its radial turning point and out to the sky. Inside the sphere the numerical trace runs as before. `analytic_vacuum_leg` in `tools/cuda/kernels.rs` is the device leg and `separated::vacuum_leg` its CPU twin. The trigger now sits at the top of the step loop, so rays leave the camera, which is outside the sphere in the default view, on a leg. `--no-analytic-legs` (experiment bit 8, which replaces `--no-analytic-escape`) turns the legs off.
+
+**Method.** The radial and polar parts are as in the escape leg, with three changes:
+- *Turning points.* With r ≥ 12, f(u) is either close to 1 or decreasing and concave in u, so a leg meets at most one radial root u₁, and it is simple. An inward ray turns before the sphere exactly when f(1/r_sphere) ≤ 0. Newton's method finds u₁ (8 binary32 iterations from 1/b, then 2 binary64). Synthetic division gives f = (u − u₁) q(u), and the substitution u = u₁ − t² makes ∫du/√f = ∫2 dt/√(−q), which is smooth. The same substitution covers rays that pass the sphere nearly tangentially, where f(u) < 1/2 at the deep end.
+- *Polar motion.* A turning leg sweeps up to about π, against 0.3 rad for the escape cone. With |n'|² taken from energy conservation, n'' = −ω²n + F(n) with F = a²(n_z ẑ − (2n_z² − n_z0²) n) and ω = |n'(0)|. The great circle n = A cos ωτ + B sin ωτ/ω is exact for a = 0. Sixteen binary32 RK4 steps integrate only the corrections to A and B (variation of constants), and F/ω² ≤ a²/b² is small for every leg that sweeps far.
+- *Winding.* The leg adds ωτ, the angle swept by the polar direction, to the near-critical winding count.
+
+**Accuracy.** Three proptests check `separated::vacuum_leg` against the binary64 quadrature reference at spins up to ±0.99. They cover outgoing rays tilted up to 89 degrees from radial, from r = 13 to 800. They also cover inward rays, which either turn outside a sphere of radius 12–40 or reach it; for those, the reference runs backward from the leg's end and must return to the start. Over 20,000 rays each, the direction error has median 1–7e-8 rad, 99th percentile 1.1–2.7e-7 rad and maximum 4.6e-7 rad. The binary32 radial sums set this error: in binary64 it falls to about 1e-8. The tests require 1e-6 rad, well below the numerical trace's own 99th percentile against the reference (2.5–4.0e-6 rad). On the GPU, `gpu_escapes_match_the_separated_solution` finds no classification change, median 1.3–1.8e-7 rad and 99th percentile 2.5–4.0e-6 rad, as before.
+
+**Steps.** 400×300, per frame:
+
+| View | Escape leg | Vacuum legs | Band legs (experiment) |
+|---|---:|---:|---:|
+| thin disk | 4.84 M | 2.86 M | 1.29 M |
+| thin disk, elevation 0.2 | 4.66 M | 2.69 M | 1.02 M |
+| hot flow, view 5 | 4.68 M | 4.65 M | 4.65 M |
+
+Every exit is unchanged. In the hot flow the enclosing sphere (radius about 90) contains the camera, so only escapes beyond it use a leg.
+
+**Time.** Same-process A/B against the escape-leg PTX (HEAD), 30 alternating samples after warm-up, medians:
+
+| Kernel | Scene | 400×300 | 960×540 |
+|---|---|---:|---:|
+| `bh_geodesic` | thin disk | 14.93 → 14.07 ms (−5.7%) | 19.74 → 17.00 ms (−13.9%) |
+| `bh_geodesic` | thin disk, view 2 | 16.77 → 15.41 ms (−8.1%) | 21.53 → 19.24 ms (−10.6%) |
+| `bh_geodesic` | hot flow, view 5 | 9.50 → 9.34 ms (−1.6%) | 18.60 → 18.15 ms (−2.4%) |
+| `bh_geodesic` | thin disk, elevation 0.2 | 8.92 → 8.69 ms (−2.7%) | 17.10 → 14.72 ms (−13.9%) |
+| `bh_geodesic_single` | thin disk | 13.41 → 12.94 ms (−3.5%) | 17.16 → 15.63 ms (−8.9%) |
+| `bh_geodesic_single` | thin disk, view 2 | 14.40 → 14.32 ms (−0.5%) | 18.56 → 17.00 ms (−8.4%) |
+| `bh_geodesic_single` | hot flow, view 5 | 8.39 → 8.38 ms (−0.2%) | 15.89 → 16.40 ms (+3.2%) |
+| `bh_geodesic_single` | thin disk, elevation 0.2 | 7.86 → 8.14 ms (+3.5%) | 14.94 → 13.33 ms (−10.8%) |
+| `bh_geodesic_scalar` | thin disk | 11.66 → 11.50 ms (−1.4%) | 16.14 → 13.94 ms (−13.7%) |
+| `bh_geodesic_scalar` | thin disk, elevation 0.2 | 7.48 → 7.14 ms (−4.5%) | 13.94 → 12.78 ms (−8.3%) |
+
+This run's absolute times are about 8% above the escape-leg table's, on the same GPU; compare within a row.
+
+Two pixels per 960×540 frame change by up to 0.01 in one channel. Both sit on the photon ring, with 240–300 steps and sky directions that differ by 1e-3–1.5 rad: chaotic rays where a 1e-7 difference at the start of the trace grows exponentially. Of the other pixels, 99.99% change by less than 1e-4. Repeat runs moved rows by about ±2 points.
+
+**Band legs inside the sphere (experiment, bit 9, `--band-legs`).** After the outside legs, 78% of the remaining thin-disk steps (2.06 M of 2.65 M for escaping rays) are vacuum steps inside the sphere but outside the emitting slab, 1.43 M of them at r ≥ 12. The thin disk's emission |y| < 4H, H = h r_disk, lies inside the polar band |cos θ| < k/√(1 + k²), k = 4h. So a leg from r > 12 with |cos θ| clear of that band can run until the first of three events: the band, r = 12 going in, or the sky. The polar Mino time to the band is a Gauss–Legendre sum in t = √(μ₊ − |cos θ|), with a turning point at μ₊ when the ray first moves away from the equator. A proptest checks it against a binary64 march of the polar motion to 1e-5. Vortical rays (η < 0) count as never reaching the band if μ₋ lies outside it, and are rejected otherwise. When the band comes first, Newton's method on the partial radial sums finds r at that Mino time. A fourth proptest checks band legs against the reference, forward or backward according to the end's radial direction. The same error statistics give median 1–3e-8 rad and maximum 4.0e-7 rad.
+
+On the GPU the band legs remove another 55–62% of the steps in thin-disk views. No pixel changes classification, and the reference errors are median 1.2–1.9e-7 rad and 99th percentile 1.7–6.4e-6 rad (up from 4.0e-6 in edge-on views). They are not faster. Against the outside legs alone, the band legs with a start margin of 2 (|cos θ| > 2× the band) measured −4.5% to +2.6% in thin-disk views, within noise. The same legs with a 1.02 margin, applied to the hot flow (band ±0.89), were 3–9% slower. Each leg costs about 300 binary64 operations, roughly as much as 20 Dormand–Prince steps on this GPU. A ray takes one to three band legs, at different iterations from its warp neighbours, so the warp runs each leg separately and the slowest lanes still set the time. So they stay an experiment: `render_geodesic`'s `BAND` parameter compiles them only into the experiment and diagnostics kernels. When compiled in, the dormant band branch alone cost the production kernels 1–10%. Thick flows (H/R > 0.1) and the warped disk take no band legs.
+
+**Not covered.** Inside r = 12 and inside the band the trace stays numerical, as do inward legs to the horizon. Early capture already ends most of those with a proved Kerr test. Cheaper band legs would need the binary64 setup and rebuild cut down, or warp-synchronous scheduling of the legs; the step counts above bound the possible gain.
 
 ## Separated Kerr reference (checklist P1.7)
 

@@ -2997,22 +2997,25 @@ fn inward_kerr_capture(ray: Ray, velocity: Vec3, spin: f32, disk_inner: f32) -> 
         && kerr_capture_certified(ray, spin, disk_inner)
 }
 
-/// Gauss–Legendre nodes and weights on [-1, 1], positive half, for the analytic escape.
-const ESCAPE_GL_NODES: [f64; 4] = [
+/// Gauss–Legendre nodes and weights on [-1, 1], positive half, for the vacuum legs.
+const LEG_GL_NODES: [f64; 4] = [
     0.183_434_642_495_649_8,
     0.525_532_409_916_329,
     0.796_666_477_413_626_7,
     0.960_289_856_497_536_3,
 ];
-const ESCAPE_GL_WEIGHTS: [f64; 4] = [
+const LEG_GL_WEIGHTS: [f64; 4] = [
     0.362_683_783_378_362,
     0.313_706_645_877_887_3,
     0.222_381_034_453_374_5,
     0.101_228_536_290_376_3,
 ];
-const ESCAPE_POLAR_STEPS: u32 = 8;
-const ESCAPE_RADIAL_FLOOR: f64 = 0.5;
-const ESCAPE_POLAR_FLOOR: f64 = 1.0e-6;
+const LEG_POLAR_STEPS: u32 = 16;
+const LEG_RADIAL_FLOOR: f64 = 0.5;
+const LEG_POLAR_FLOOR: f64 = 1.0e-6;
+const LEG_INNER_MIN: f64 = 12.0;
+const LEG_BAND_MARGIN: f32 = 2.0;
+
 
 /// sin x and cos x in binary64 for |x| up to about 1e9 (`separated::sin_cos`).
 #[inline(always)]
@@ -3050,18 +3053,14 @@ fn sin_cos_f64(x: f64) -> (f64, f64) {
 }
 
 #[derive(Clone, Copy)]
-struct EscapeEnd {
+struct LegEnd {
     ok: bool,
+    /// Reached `ESCAPE_R` going out, rather than the inner sphere going in or the band.
+    escaped: bool,
+    /// Angle swept by the polar direction.
+    arc: f32,
     pos: Vec3,
     p: Vec4,
-}
-
-#[inline(always)]
-fn escape_polar_accel(n: [f32; 3], dn: [f32; 3], a2: f32) -> [f32; 3] {
-    let speed2 = dn[0] * dn[0] + dn[1] * dn[1] + dn[2] * dn[2];
-    let pull = a2 * n[2];
-    let radial = speed2 + pull * n[2];
-    [-radial * n[0], -radial * n[1], pull - radial * n[2]]
 }
 
 #[inline(always)]
@@ -3071,17 +3070,124 @@ fn det3_f64(m: [[f64; 3]; 3]) -> f64 {
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
 }
 
-/// Analytic escape leg (checklist P1.8): the state at Kerr–Schild radius `ESCAPE_R` of
-/// an outgoing single-hole ray past its radial turning points, from the separated
-/// solution with only square roots. A line-for-line twin of `separated::far_escape`,
-/// which is tested against the binary64 reference; `ok` is false where its guards fail.
-/// Kept out of line: it runs once per escaping ray.
-#[cuda_device::device]
-#[inline(never)]
-fn analytic_escape(ray: Ray, spin: f32) -> EscapeEnd {
+/// The radial integrands at piece coordinate x (`separated::escape::radial_rate`):
+/// x = u, or with `substituted` x = t and u = u1 - t². Returns u, dτ/dx and the
+/// quantity that must stay above `LEG_RADIAL_FLOOR`.
+#[inline(always)]
+fn leg_radial_rate(x: f32, substituted: bool, u1: f32, q: [f32; 4], f: [f32; 3]) -> (f32, f32, f32) {
+    if substituted {
+        let u = u1 - x * x;
+        let g = -(q[0] + u * (q[1] + u * (q[2] + u * q[3])));
+        (u, 2.0 / sqrt(g), g * u1)
+    } else {
+        let fu = 1.0 + x * x * (f[0] + x * (f[1] + x * f[2]));
+        (x, 1.0 / sqrt(fu), fu)
+    }
+}
+
+/// Mino time and ∫ a(2r - aλ)/Δ dτ over piece coordinates `from` to `to`
+/// (`separated::escape::piece_sum`).
+#[inline(always)]
+fn leg_piece_sum(
+    from: f64,
+    to: f64,
+    substituted: bool,
+    u1: f32,
+    q: [f32; 4],
+    f: [f32; 3],
+    a: f32,
+    lambda: f32,
+) -> (bool, f64, f64) {
+    let (mid, half) = (0.5 * (to + from), 0.5 * (to - from).abs());
+    let (mid32, half32) = (mid as f32, half as f32);
+    let (mut mino, mut phi, mut floor) = (0.0_f32, 0.0_f32, 1.0_f32);
+    let mut i = 0;
+    while i < 8 {
+        let node = LEG_GL_NODES[i / 2] as f32;
+        let x = mid32 + if i % 2 == 0 { -1.0 } else { 1.0 } * half32 * node;
+        let (u, rate, size) = leg_radial_rate(x, substituted, u1, q, f);
+        floor = floor.min(size);
+        let w = LEG_GL_WEIGHTS[i / 2] as f32 * rate;
+        mino += w;
+        phi += w * a * u * (2.0 - a * lambda * u) / (1.0 - 2.0 * u + a * a * u * u);
+        i += 1;
+    }
+    (f64::from(floor) > LEG_RADIAL_FLOOR, f64::from(mino) * half, f64::from(phi) * half)
+}
+
+/// Mino time until |cos θ| first falls to `band` (`separated::escape::band_time`);
+/// negative where that function returns `None`.
+#[inline(always)]
+fn leg_band_time(cos: f64, rate: f64, band: f64, a2: f64, lambda: f64, eta: f64) -> f64 {
     use cuda_device::float::sqrt_rn_f64 as sqrt64;
-    let fail = EscapeEnd { ok: false, pos: ray.pos, p: ray.p };
+    let beta = eta + lambda * lambda - a2;
+    if !(eta > 0.0) {
+        let root = sqrt64(beta * beta + 4.0 * a2 * eta);
+        let low = -2.0 * eta / (root - beta);
+        return if low >= band * band { f64::INFINITY } else { -1.0 };
+    }
+    let up = 2.0 * eta / (beta + sqrt64(beta * beta + 4.0 * a2 * eta));
+    let top = sqrt64(up);
+    let start = cos.abs().min(top);
+    if !(start > band) {
+        return -1.0;
+    }
+    let (scale, top32, a2_32) = ((eta / up) as f32, top as f32, a2 as f32);
+    // ∫ dμ / √M from |cos θ| = lo to hi, as one or two pieces.
+    let toward = cos * rate <= 0.0;
+    let mut total = 0.0_f64;
+    let mut piece = 0;
+    while piece < if toward { 1 } else { 2 } {
+        let (lo, hi) = if toward { (band, start) } else if piece == 0 { (start, top) } else { (band, top) };
+        let (t_lo, t_hi) = (sqrt64((top - hi).max(0.0)), sqrt64(top - lo));
+        let (mid, half) = ((0.5 * (t_hi + t_lo)) as f32, (0.5 * (t_hi - t_lo)) as f32);
+        let mut sum = 0.0_f32;
+        let mut i = 0;
+        while i < 8 {
+            let t = mid + if i % 2 == 0 { -1.0 } else { 1.0 } * half * LEG_GL_NODES[i / 2] as f32;
+            let mu = top32 - t * t;
+            sum += LEG_GL_WEIGHTS[i / 2] as f32 * 2.0 / sqrt((top32 + mu) * (scale + a2_32 * mu * mu));
+            i += 1;
+        }
+        total += f64::from(sum * half);
+        piece += 1;
+    }
+    total
+}
+
+/// The polar perturbation's rates (`separated::escape::vacuum_leg`): with
+/// n = (n0 + da) c + (dn0 + db) s, F = a² (n_z ẑ - (2 n_z² - n_z0²) n), the rates of
+/// da and db are -F s and F c.
+#[inline(always)]
+fn leg_polar_rates(
+    da: [f32; 3],
+    db: [f32; 3],
+    c: f32,
+    s: f32,
+    n0: [f32; 3],
+    dn0: [f32; 3],
+    a2: f32,
+    nz0_2: f32,
+) -> ([f32; 3], [f32; 3]) {
+    let n = [
+        (n0[0] + da[0]) * c + (dn0[0] + db[0]) * s,
+        (n0[1] + da[1]) * c + (dn0[1] + db[1]) * s,
+        (n0[2] + da[2]) * c + (dn0[2] + db[2]) * s,
+    ];
+    let k = a2 * (2.0 * n[2] * n[2] - nz0_2);
+    let force = [-k * n[0], -k * n[1], a2 * n[2] - k * n[2]];
+    (
+        [-force[0] * s, -force[1] * s, -force[2] * s],
+        [force[0] * c, force[1] * c, force[2] * c],
+    )
+}
+
+#[inline(always)]
+fn vacuum_leg<const BAND: bool>(ray: Ray, spin: f32, inner: f32, band: f32) -> LegEnd {
+    use cuda_device::float::sqrt_rn_f64 as sqrt64;
+    let fail = LegEnd { ok: false, escaped: false, arc: 0.0, pos: ray.pos, p: ray.p };
     let target = ESCAPE_R as f64;
+    let inner = f64::from(inner);
     let a = f64::from(spin);
     let a2 = a * a;
     let (x, y, z) = (f64::from(ray.pos.x), f64::from(ray.pos.y), f64::from(ray.pos.z));
@@ -3093,7 +3199,7 @@ fn analytic_escape(ray: Ray, spin: f32) -> EscapeEnd {
     let r = sqrt64(r2);
     let cos = big_z / r;
     let sin2 = rho2 / (r2 + a2);
-    if !(r < target && sin2 > ESCAPE_POLAR_FLOOR && a2 < 1.0) {
+    if !(inner >= LEG_INNER_MIN && inner < r && r < target && sin2 > LEG_POLAR_FLOOR && a2 < 1.0) {
         return fail;
     }
     let sin = sqrt64(sin2);
@@ -3108,71 +3214,184 @@ fn analytic_escape(ray: Ray, spin: f32) -> EscapeEnd {
     let eta = carter / (energy * energy);
     let e_abs = energy.abs();
     let delta = r2 - 2.0 * r + a2;
-    if !(p_r - (2.0 * r * energy - a * angular) / delta > 0.0) {
-        return fail;
-    }
+    let outward = p_r - (2.0 * r * energy - a * angular) / delta > 0.0;
 
     let (fa, fb, fc) = (a2 - eta - lambda * lambda, 2.0 * (eta + (lambda - a) * (lambda - a)), -a2 * eta);
-    let (u_end, u_start) = (1.0 / target, 1.0 / r);
-    let (mid, half) = (0.5 * (u_start + u_end), 0.5 * (u_start - u_end));
-    let f_start = 1.0 + u_start * u_start * (fa + u_start * (fb + u_start * fc));
-    let f_end = 1.0 + u_end * u_end * (fa + u_end * (fb + u_end * fc));
-    let mut floor = f_start.min(f_end);
-    // Sums and polar stages in binary32, as in the CPU twin.
-    let (fa32, fb32, fc32, a32, lambda32) = (fa as f32, fb as f32, fc as f32, a as f32, lambda as f32);
-    let (mid32, half32) = (mid as f32, half as f32);
-    let (mut mino, mut phi_radial, mut ks_shift) = (0.0_f32, 0.0_f32, 0.0_f32);
-    let mut i = 0;
-    while i < 8 {
-        let node = ESCAPE_GL_NODES[i / 2] as f32;
-        let weight = ESCAPE_GL_WEIGHTS[i / 2] as f32;
-        let u = mid32 + if i % 2 == 0 { -1.0 } else { 1.0 } * half32 * node;
-        let fu = 1.0 + u * u * (fa32 + u * (fb32 + u * fc32));
-        floor = floor.min(f64::from(fu));
-        let w = weight / sqrt(fu);
-        let delta_u = 1.0 - 2.0 * u + a32 * a32 * u * u;
-        mino += w;
-        phi_radial += w * a32 * u * (2.0 - a32 * lambda32 * u) / delta_u;
-        ks_shift += weight * a32 / delta_u;
-        i += 1;
+    let (u_sky, u_start, u_inner) = (1.0 / target, 1.0 / r, 1.0 / inner);
+    let f_inner = 1.0 + u_inner * u_inner * (fa + u_inner * (fb + u_inner * fc));
+    let turning = !outward && !(f_inner > 0.0);
+    let escaped = outward || turning;
+    let hi = if outward { u_start } else { u_inner };
+    let f_hi = 1.0 + hi * hi * (fa + hi * (fb + hi * fc));
+    let substituted = turning || !(f_hi > LEG_RADIAL_FLOOR);
+    let mut u1 = 0.0_f64;
+    let mut q32 = [0.0_f32; 4];
+    if substituted {
+        let start = if turning { u_start } else { hi };
+        let (fa32, fb32, fc32) = (fa as f32, fb as f32, fc as f32);
+        let mut v = (1.0 / sqrt64((-fa).max(1.0e-30))).max(start) as f32;
+        let mut k = 0;
+        while k < 8 {
+            let value = 1.0 + v * v * (fa32 + v * (fb32 + v * fc32));
+            let slope = v * (2.0 * fa32 + v * (3.0 * fb32 + 4.0 * fc32 * v));
+            v -= value / slope;
+            k += 1;
+        }
+        u1 = f64::from(v);
+        let mut k = 0;
+        let mut f_u1 = 0.0;
+        while k < 3 {
+            f_u1 = 1.0 + u1 * u1 * (fa + u1 * (fb + u1 * fc));
+            if k < 2 {
+                u1 -= f_u1 / (u1 * (2.0 * fa + u1 * (3.0 * fb + 4.0 * fc * u1)));
+            }
+            k += 1;
+        }
+        let bracket = if turning { u_start <= u1 && u1 <= u_inner } else { hi < u1 };
+        if !(bracket && f_u1.abs() < 1.0e-12) {
+            return fail;
+        }
+        let q3 = fc;
+        let q2 = fb + u1 * q3;
+        let q1 = fa + u1 * q2;
+        let q0 = u1 * q1;
+        q32 = [q0 as f32, q1 as f32, q2 as f32, q3 as f32];
     }
-    if !(floor > ESCAPE_RADIAL_FLOOR) {
+    let f32s = [fa as f32, fb as f32, fc as f32];
+    let (a32, lambda32, u1_32) = (a as f32, lambda as f32, u1 as f32);
+    let coordinate = |u: f64| if substituted { sqrt64((u1 - u).max(0.0)) } else { u };
+    // One piece, or in to the turning point (t = 0) and back out to the sky; scalars,
+    // not arrays, which would go to local memory.
+    let first_from = coordinate(u_start);
+    let first_to = if turning { 0.0 } else { coordinate(if outward { u_sky } else { u_inner }) };
+    let (ok, first_time, first_phi) =
+        leg_piece_sum(first_from, first_to, substituted, u1_32, q32, f32s, a32, lambda32);
+    if !ok {
         return fail;
     }
-    let (mino, phi_radial, ks_shift) = (f64::from(mino) * half, f64::from(phi_radial) * half, f64::from(ks_shift) * half);
-
+    let second_to = if turning { coordinate(u_sky) } else { 0.0 };
+    let (mut second_time, mut second_phi) = (0.0, 0.0);
+    if turning {
+        let (ok, time, phi) = leg_piece_sum(0.0, second_to, substituted, u1_32, q32, f32s, a32, lambda32);
+        if !ok {
+            return fail;
+        }
+        (second_time, second_phi) = (time, phi);
+    }
     let theta_rate = p_theta / e_abs;
-    let mut n = [sin, 0.0, cos];
-    let mut dn = [cos * theta_rate, angular / (e_abs * sin), -sin * theta_rate];
-    let a2_32 = a2 as f32;
-    let h = (mino / ESCAPE_POLAR_STEPS as f64) as f32;
+    let band = f64::from(band);
+    let polar = if BAND && band > 0.0 {
+        leg_band_time(cos, -sin * theta_rate, band, a2, lambda, eta)
+    } else {
+        f64::INFINITY
+    };
+    if !(polar >= 0.0) {
+        return fail;
+    }
+    let mut mino = first_time + second_time;
+    let mut phi_radial = first_phi + second_phi;
+    let mut u_end = if escaped { u_sky } else { u_inner };
+    let mut outgoing_end = escaped;
+    let mut at_band = false;
+    if BAND && polar < mino {
+        // The band comes first: Newton's method on the partial sums for the piece
+        // coordinate where the Mino time is `polar`.
+        let second = turning && polar > first_time;
+        let (from, to) = if second { (0.0, second_to) } else { (first_from, first_to) };
+        let wanted = polar - if second { first_time } else { 0.0 };
+        let direction = if to > from { 1.0 } else { -1.0 };
+        let mut x = from + (to - from) * (wanted / if second { second_time } else { first_time });
+        let mut iteration = 0;
+        while iteration < 4 {
+            let (ok, time, _) = leg_piece_sum(from, x, substituted, u1_32, q32, f32s, a32, lambda32);
+            if !ok {
+                return fail;
+            }
+            let (_, rate, _) = leg_radial_rate(x as f32, substituted, u1_32, q32, f32s);
+            x = (x - direction * (time - wanted) / f64::from(rate)).clamp(from.min(to), from.max(to));
+            iteration += 1;
+        }
+        let (ok, _, phi) = leg_piece_sum(from, x, substituted, u1_32, q32, f32s, a32, lambda32);
+        if !ok {
+            return fail;
+        }
+        at_band = true;
+        mino = polar;
+        phi_radial = if second { first_phi } else { 0.0 } + phi;
+        u_end = if substituted { u1 - x * x } else { x };
+        outgoing_end = second || (outward && !turning);
+    }
+    let (mid, half) = ((0.5 * (u_start + u_end)) as f32, (0.5 * (u_start - u_end)) as f32);
+    let mut ks_shift = 0.0_f32;
+    let mut i = 0;
+    while i < 8 {
+        let u = mid + if i % 2 == 0 { -1.0 } else { 1.0 } * half * LEG_GL_NODES[i / 2] as f32;
+        ks_shift += LEG_GL_WEIGHTS[i / 2] as f32 * a32 / (1.0 - 2.0 * u + (a2 as f32) * u * u);
+        i += 1;
+    }
+    let ks_shift = f64::from(ks_shift * half);
+
+    let n0 = [sin, 0.0, cos];
+    let dn0 = [cos * theta_rate, angular / (e_abs * sin), -sin * theta_rate];
+    let omega = sqrt64(dn0[0] * dn0[0] + dn0[1] * dn0[1] + dn0[2] * dn0[2]).max(1.0e-30);
+    let h = mino / LEG_POLAR_STEPS as f64;
+    let (step_s, step_c) = sin_cos_f64(0.5 * omega * h);
+    let (step_c, step_s) = (step_c as f32, (step_s / omega) as f32);
+    let (omega2, a2_32, nz0_2) = ((omega * omega) as f32, a2 as f32, (cos * cos) as f32);
+    let n0_32 = [n0[0] as f32, n0[1] as f32, n0[2] as f32];
+    let dn0_32 = [dn0[0] as f32, dn0[1] as f32, dn0[2] as f32];
+    let h32 = h as f32;
+    let mut da = [0.0_f32; 3];
+    let mut db = [0.0_f32; 3];
+    let (mut c0, mut s0) = (1.0_f32, 0.0_f32);
     let mut step = 0;
-    while step < ESCAPE_POLAR_STEPS {
-        let n1 = [n[0] as f32, n[1] as f32, n[2] as f32];
-        let d1 = [dn[0] as f32, dn[1] as f32, dn[2] as f32];
-        let k1 = escape_polar_accel(n1, d1, a2_32);
-        let n2 = [n1[0] + 0.5 * h * d1[0], n1[1] + 0.5 * h * d1[1], n1[2] + 0.5 * h * d1[2]];
-        let d2 = [d1[0] + 0.5 * h * k1[0], d1[1] + 0.5 * h * k1[1], d1[2] + 0.5 * h * k1[2]];
-        let k2 = escape_polar_accel(n2, d2, a2_32);
-        let n3 = [n1[0] + 0.5 * h * d2[0], n1[1] + 0.5 * h * d2[1], n1[2] + 0.5 * h * d2[2]];
-        let d3 = [d1[0] + 0.5 * h * k2[0], d1[1] + 0.5 * h * k2[1], d1[2] + 0.5 * h * k2[2]];
-        let k3 = escape_polar_accel(n3, d3, a2_32);
-        let n4 = [n1[0] + h * d3[0], n1[1] + h * d3[1], n1[2] + h * d3[2]];
-        let d4 = [d1[0] + h * k3[0], d1[1] + h * k3[1], d1[2] + h * k3[2]];
-        let k4 = escape_polar_accel(n4, d4, a2_32);
+    while step < LEG_POLAR_STEPS {
+        let (c1, s1) = (c0 * step_c - omega2 * s0 * step_s, s0 * step_c + c0 * step_s);
+        let (c2, s2) = (c1 * step_c - omega2 * s1 * step_s, s1 * step_c + c1 * step_s);
+        let (ka1, kb1) = leg_polar_rates(da, db, c0, s0, n0_32, dn0_32, a2_32, nz0_2);
+        let (ka2, kb2) = leg_polar_rates(
+            [da[0] + 0.5 * h32 * ka1[0], da[1] + 0.5 * h32 * ka1[1], da[2] + 0.5 * h32 * ka1[2]],
+            [db[0] + 0.5 * h32 * kb1[0], db[1] + 0.5 * h32 * kb1[1], db[2] + 0.5 * h32 * kb1[2]],
+            c1, s1, n0_32, dn0_32, a2_32, nz0_2,
+        );
+        let (ka3, kb3) = leg_polar_rates(
+            [da[0] + 0.5 * h32 * ka2[0], da[1] + 0.5 * h32 * ka2[1], da[2] + 0.5 * h32 * ka2[2]],
+            [db[0] + 0.5 * h32 * kb2[0], db[1] + 0.5 * h32 * kb2[1], db[2] + 0.5 * h32 * kb2[2]],
+            c1, s1, n0_32, dn0_32, a2_32, nz0_2,
+        );
+        let (ka4, kb4) = leg_polar_rates(
+            [da[0] + h32 * ka3[0], da[1] + h32 * ka3[1], da[2] + h32 * ka3[2]],
+            [db[0] + h32 * kb3[0], db[1] + h32 * kb3[1], db[2] + h32 * kb3[2]],
+            c2, s2, n0_32, dn0_32, a2_32, nz0_2,
+        );
         let mut j = 0;
         while j < 3 {
-            n[j] += f64::from(h / 6.0 * (d1[j] + 2.0 * d2[j] + 2.0 * d3[j] + d4[j]));
-            dn[j] += f64::from(h / 6.0 * (k1[j] + 2.0 * k2[j] + 2.0 * k3[j] + k4[j]));
+            da[j] += h32 / 6.0 * (ka1[j] + 2.0 * ka2[j] + 2.0 * ka3[j] + ka4[j]);
+            db[j] += h32 / 6.0 * (kb1[j] + 2.0 * kb2[j] + 2.0 * kb3[j] + kb4[j]);
             j += 1;
         }
+        c0 = c2;
+        s0 = s2;
         step += 1;
+    }
+    let arc = omega * mino;
+    let (big_s, big_c) = sin_cos_f64(arc);
+    let (s_end, w_s) = (big_s / omega, omega * big_s);
+    let mut n = [0.0_f64; 3];
+    let mut dn = [0.0_f64; 3];
+    let mut j = 0;
+    while j < 3 {
+        let (base, rate) = (n0[j] + f64::from(da[j]), dn0[j] + f64::from(db[j]));
+        n[j] = base * big_c + rate * s_end;
+        dn[j] = -base * w_s + rate * big_c;
+        j += 1;
     }
     let length = sqrt64(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
     let c = n[2] / length;
     let rho = sqrt64(n[0] * n[0] + n[1] * n[1]);
     let sin = rho / length;
-    if !(sin * sin > ESCAPE_POLAR_FLOOR) {
+    // At the band, the polar sums and the RK4 motion must agree.
+    if !(sin * sin > LEG_POLAR_FLOOR && (!at_band || (c.abs() - band).abs() < 1.0e-5)) {
         return fail;
     }
     let sign_e = if energy < 0.0 { -1.0 } else { 1.0 };
@@ -3181,12 +3400,14 @@ fn analytic_escape(ray: Ray, spin: f32) -> EscapeEnd {
     let (cpsi, spsi) = (n[0] / rho, n[1] / rho);
     let (cp, sp) = (cp * cpsi - sp * spsi, sp * cpsi + cp * spsi);
 
-    let r = target;
+    let r = 1.0 / u_end;
     let v = dn[2] / length;
     let delta = r * r - 2.0 * r + a2;
-    let radial = r * r * r * r * f_end;
+    let f_end = 1.0 + u_end * u_end * (fa + u_end * (fb + u_end * fc));
+    let radial = r * r * r * r * f_end.max(0.0);
     let p_theta = -e_abs * v / sin;
-    let p_r = (e_abs * sqrt64(radial) + 2.0 * r * energy - a * angular) / delta;
+    let sign_r = if outgoing_end { 1.0 } else { -1.0 };
+    let p_r = (sign_r * e_abs * sqrt64(radial) + 2.0 * r * energy - a * angular) / delta;
     let big_x = (r * cp - a * sp) * sin;
     let big_y = (r * sp + a * cp) * sin;
     let big_z = r * c;
@@ -3204,11 +3425,32 @@ fn analytic_escape(ray: Ray, spin: f32) -> EscapeEnd {
         det3_f64(m) * inv_det
     };
     let (p_x, p_y, p_z) = (solve(0), solve(1), solve(2));
-    EscapeEnd {
+    LegEnd {
         ok: true,
+        escaped: escaped && !at_band,
+        arc: arc as f32,
         pos: vec3(big_y as f32, big_z as f32, big_x as f32),
         p: vec4(-energy as f32, p_y as f32, p_z as f32, p_x as f32),
     }
+}
+
+/// Analytic vacuum leg (checklist P1.8): from a single-hole state outside the sphere of
+/// radius `inner` and, when `band` > 0, outside the polar band |cos θ| <= `band`, the
+/// state where the separated solution first reaches Kerr–Schild radius `ESCAPE_R`
+/// going out, `inner` going in, or the band, with only square roots. A line-for-line twin of `separated::vacuum_leg`, which is tested
+/// against the binary64 reference; `ok` is false where its guards fail. Kept out of
+/// line: it runs at most a few times per ray. Production kernels take only the legs
+/// outside the sphere; `analytic_band_leg` is compiled into the experiment kernels.
+#[cuda_device::device]
+#[inline(never)]
+fn analytic_vacuum_leg(ray: Ray, spin: f32, inner: f32) -> LegEnd {
+    vacuum_leg::<false>(ray, spin, inner, 0.0)
+}
+
+#[cuda_device::device]
+#[inline(never)]
+fn analytic_band_leg(ray: Ray, spin: f32, inner: f32, band: f32) -> LegEnd {
+    vacuum_leg::<true>(ray, spin, inner, band)
 }
 
 /// The capture guard's hypotheses for the exact real values of the stored binary32
@@ -3358,7 +3600,7 @@ pub unsafe fn bh_geodesic(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, GENERIC, _>(
+        render_geodesic::<false, false, GENERIC, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), true, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
@@ -3379,7 +3621,7 @@ pub unsafe fn bh_geodesic_full_trace(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, GENERIC, _>(
+        render_geodesic::<false, false, GENERIC, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), false, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
@@ -3401,7 +3643,7 @@ pub unsafe fn bh_geodesic_single(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, SINGLE, _>(
+        render_geodesic::<false, false, SINGLE, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), true, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
@@ -3424,7 +3666,7 @@ pub unsafe fn bh_geodesic_scalar(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, SINGLE_SCALAR, _>(
+        render_geodesic::<false, false, SINGLE_SCALAR, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), true, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
@@ -3433,12 +3675,13 @@ pub unsafe fn bh_geodesic_scalar(
 }
 
 /// Any combination of the ray options: bit 0 the full trace instead of guarded early
-/// capture, bit 1 capped steps instead of far-field steps and the analytic escape
+/// capture, bit 1 capped steps instead of far-field steps and analytic vacuum legs
 /// (checklist P1.8), bit 2 the legacy step-doubling RK4 controller
 /// instead of Dormand–Prince, bit 3 the legacy coupled transfer (one midpoint cell per
 /// geodesic step, the step limited by the disk) instead of decoupled transfer (checklist
 /// P1.9), bits 4-7 a shift that divides the disk transfer cell length by 2^shift, bit 8
-/// numerical steps to the sky sphere instead of the analytic escape (checklist P1.8).
+/// numerical steps instead of analytic vacuum legs, bit 9 band legs inside the disk's
+/// enclosing sphere as well (checklist P1.8).
 #[cuda_device::kernel]
 pub unsafe fn bh_geodesic_experiments(
     out_image: *mut Vec4,
@@ -3453,12 +3696,22 @@ pub unsafe fn bh_geodesic_experiments(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, GENERIC, _>(
-            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
-            experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
-            gid_x(), gid_y(), no_swarm,
-        );
+        // Bit 9: band legs as well, compiled only into the experiment kernels.
+        if experiments & 512 != 0 {
+            render_geodesic::<false, false, GENERIC, true, _>(
+                out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+                core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
+                experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
+                gid_x(), gid_y(), no_swarm,
+            );
+        } else {
+            render_geodesic::<false, false, GENERIC, false, _>(
+                out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+                core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
+                experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
+                gid_x(), gid_y(), no_swarm,
+            );
+        }
     }
 }
 
@@ -3486,7 +3739,7 @@ pub unsafe fn bh_geodesic_swarm(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<false, true, GENERIC, _>(
+        render_geodesic::<false, true, GENERIC, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, false, 0,
             gid_x(), gid_y(),
@@ -3548,7 +3801,7 @@ pub unsafe fn bh_geodesic_swarm_record(
     let (x, y) = (gid_x(), gid_y() + row0);
     let pixel = y * width + x;
     unsafe {
-        render_geodesic::<false, true, GENERIC, _>(
+        render_geodesic::<false, true, GENERIC, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, false, 0,
             x, y,
@@ -3693,12 +3946,21 @@ pub unsafe fn bh_geodesic_diagnostics(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<true, false, GENERIC, _>(
-            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
-            experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
-            experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
-            gid_x(), gid_y(), no_swarm,
-        );
+        if experiments & 512 != 0 {
+            render_geodesic::<true, false, GENERIC, true, _>(
+                out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
+                experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
+                experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
+                gid_x(), gid_y(), no_swarm,
+            );
+        } else {
+            render_geodesic::<true, false, GENERIC, false, _>(
+                out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
+                experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
+                experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
+                gid_x(), gid_y(), no_swarm,
+            );
+        }
     }
 }
 
@@ -3805,6 +4067,36 @@ pub unsafe fn bh_test_capture_guard(
     }
 }
 
+/// The inner radius and band of the analytic leg to take from `ray`, or zero for none:
+/// outside the disk's enclosing sphere (squared radius `leg_sq`) a leg to that sphere
+/// or the sky, and with `BAND` inside it, beyond r = 12 and clear of the band, a leg to
+/// r = 12, the band or the sky. r² >= |x|² - a², so the margins keep the Kerr–Schild
+/// radius outside the sphere, and a leg that ends on the sphere going in leaves
+/// |x|² - a² <= r², below them. Recomputed after the loop rather than carried in
+/// registers through it.
+#[inline(always)]
+fn leg_bounds<const BAND: bool>(ray: Ray, metric: &Metric, spin_sq: f32, leg_sq: f32, leg_band: f32) -> (f32, f32) {
+    let length_sq = ray.pos.dot(ray.pos);
+    let beyond = length_sq - spin_sq;
+    if !(beyond < ESCAPE_R * ESCAPE_R) {
+        return (0.0, 0.0);
+    }
+    if beyond > 1.0001 * leg_sq {
+        let outward = ray.pos.dot((metric.inv * ray.p).yzw()) > 0.0;
+        if outward || beyond > 1.0201 * leg_sq {
+            return (sqrt(leg_sq), 0.0);
+        }
+    }
+    // |cos θ| >= |y| / |x| clears the band by `LEG_BAND_MARGIN`.
+    if BAND && leg_band > 0.0
+        && beyond > 1.0201 * (LEG_INNER_MIN * LEG_INNER_MIN) as f32
+        && ray.pos.y * ray.pos.y > (LEG_BAND_MARGIN * LEG_BAND_MARGIN * leg_band * leg_band) * length_sq
+    {
+        return (LEG_INNER_MIN as f32, leg_band);
+    }
+    (0.0, 0.0)
+}
+
 /// Renders pixel (`pix_x`, `pix_y`). With SWARM, `swarm_hit(start, end, t0, t1, state)`
 /// tests each accepted step against the swarm, as `swarm_segment_hit` does.
 #[inline(always)]
@@ -3812,6 +4104,7 @@ unsafe fn render_geodesic<
     const DIAGNOSTICS: bool,
     const SWARM: bool,
     const PATH: u8,
+    const BAND: bool,
     F: Fn(Vec3, Vec3, f32, f32, PixelState) -> Vec4,
 >(
     out_image: *mut Vec4,
@@ -3870,12 +4163,23 @@ unsafe fn render_geodesic<
         0.0
     };
     let vacuum_sq = if far_field { vacuum_radius_sq(objects, disk, 64.0) } else { f32::INFINITY };
-    // The analytic escape needs an isolated Kerr hole with spin along +y, and no swarm.
-    // Past r = 4 an outgoing ray has no radial turning point left; the CPU twin is
-    // tested from r = 12.
-    let escape_sq = if far_field { vacuum_radius_sq(objects, disk, 16.0) } else { f32::INFINITY };
+    // Analytic vacuum legs need an isolated Kerr hole with spin along +y, and no swarm.
+    // They run outside a sphere enclosing the disk, of Kerr–Schild radius at least 16
+    // (the CPU twin is tested from 12).
+    let leg_sq = if far_field { vacuum_radius_sq(objects, disk, 16.0) } else { f32::INFINITY };
     let hole_spin = objects.spin[0];
-    let mut analytic = analytic_leg && !SWARM && escape_sq < f32::INFINITY && hole_spin.x == 0.0 && hole_spin.z == 0.0;
+    let mut analytic = analytic_leg && !SWARM && leg_sq < f32::INFINITY && hole_spin.x == 0.0 && hole_spin.z == 0.0;
+    let spin_sq = hole_spin.y * hole_spin.y;
+    // Inside the sphere, legs end where |cos θ| falls to `leg_band`, which contains the
+    // emitting slab |y - mid| < 4H when H/R <= `aspect` and the midplane is flat.
+    // Thick flows fill most polar angles, so legs would rarely save steps there.
+    let aspect = match disk.model {
+        0 => disk.h_thin,
+        1 | 2 => disk.h_thin.max(disk.h_hot),
+        _ => 0.0,
+    };
+    let aspect = if BAND && aspect <= 0.1 { aspect } else { 0.0 };
+    let leg_band = 4.0 * aspect * inverse_sqrt(1.0 + 16.0 * aspect * aspect);
     // Coordinate time relative to the camera; it decreases along the backward ray.
     let mut ray_time = 0.0_f32;
     let mut winding = 0.0_f32;
@@ -3885,6 +4189,11 @@ unsafe fn render_geodesic<
         let mut pending = false;
         while i < cam.max_iter {
             iterations = i + 1;
+            if analytic && leg_bounds::<BAND>(ray, &metric, spin_sq, leg_sq, leg_band).0 > 0.0 {
+                // Leave the loop so the warp's lanes run the f64 leg together.
+                pending = true;
+                break;
+            }
             if metric.clearance < 0.002 || !metric.valid {
                 if DIAGNOSTICS {
                     exit = if !metric.valid {
@@ -4047,18 +4356,6 @@ unsafe fn render_geodesic<
                 let frame = screen_frame(ray, metric);
                 ray.screen = vec4_f_v3(0.0, frame[0]);
             }
-            if analytic {
-                let radius_sq = ray.pos.dot(ray.pos);
-                if radius_sq > escape_sq && radius_sq < ESCAPE_R * ESCAPE_R {
-                    // The far-field guard: an outward ray within 18 degrees of radial.
-                    let v = (metric.inv * ray.p).yzw();
-                    if ray.pos.dot(v) > 0.95 * sqrt(radius_sq) * v.length() {
-                        // Leave the loop so the warp's escaping lanes run the f64 leg together.
-                        pending = true;
-                        break;
-                    }
-                }
-            }
             if ray.pos.length() > ESCAPE_R && winding > UNRESOLVED_WINDING {
                 // Unresolved: no sky, as for the iteration limit; captures already add none.
                 if DIAGNOSTICS {
@@ -4079,17 +4376,30 @@ unsafe fn render_geodesic<
             i += 1;
         }
         if pending {
-            let end = analytic_escape(ray, hole_spin.y);
+            let (leg_inner, leg_polar) = leg_bounds::<BAND>(ray, &metric, spin_sq, leg_sq, leg_band);
+            let end = if BAND && leg_polar > 0.0 {
+                analytic_band_leg(ray, hole_spin.y, leg_inner, leg_polar)
+            } else {
+                analytic_vacuum_leg(ray, hole_spin.y, leg_inner)
+            };
             if !end.ok {
                 // Resume the numerical trace; the guards rarely fail.
                 analytic = false;
-                i += 1;
                 continue;
             }
-            winding += swept_angle(ray.pos, end.pos);
+            winding += end.arc;
             ray.pos = end.pos;
             ray.p = end.p;
             metric = scene_metric(ray.pos, objects);
+            if !end.escaped {
+                // On the sphere going in, or at the band: trace on from there.
+                next_h = 1.0e8;
+                if PATH != SINGLE_SCALAR {
+                    let frame = screen_frame(ray, metric);
+                    ray.screen = vec4_f_v3(0.0, frame[0]);
+                }
+                continue;
+            }
             if winding > UNRESOLVED_WINDING {
                 if DIAGNOSTICS {
                     exit = RayExit::NearCritical;

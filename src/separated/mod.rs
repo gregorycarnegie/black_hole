@@ -15,7 +15,7 @@ mod quadrature;
 
 use crate::certified::Kerr;
 use elliptic::{amplitude, legendre_f, legendre_pi, legendre_pi_near_one};
-pub use escape::{far_escape, sin_cos};
+pub use escape::{End, Leg, sin_cos, vacuum_leg};
 use quadrature::tanh_sinh;
 
 /// Why a ray has no reference answer.
