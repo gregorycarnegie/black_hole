@@ -1219,13 +1219,13 @@ fn disk_radius(pos: Vec3, spin: f32, binary: bool) -> f32 {
     )
 }
 
+/// The scene metric and its inverse. Derivatives are not stored: `geodesic_rhs`
+/// contracts them per source (checklist P1.3), and `MetricJet` materializes them for
+/// the diagnostics that need whole matrices.
 #[derive(Clone, Copy, Default)]
 pub struct Metric {
     pub g: Mat4,
     pub inv: Mat4,
-    pub dx: Mat4,
-    pub dy: Mat4,
-    pub dz: Mat4,
     pub clearance: f32,
     pub valid: bool,
 }
@@ -1235,32 +1235,37 @@ fn flat_metric() -> Metric {
     Metric {
         g: ETA,
         inv: ETA,
-        dx: Mat4::default(),
-        dy: Mat4::default(),
-        dz: Mat4::default(),
         clearance: ESCAPE_R,
         valid: true,
     }
 }
 
-#[cuda_device::device]
-fn add_kerr(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
-    add_kerr_fields::<true>(base, x, mass, spin)
+/// One Kerr–Schild source at offset `x`: g += 2h l l with covariant l = (1, ell).
+#[derive(Clone, Copy, Default)]
+struct KerrSource {
+    a: Vec3,
+    a2: f32,
+    ax: f32,
+    raw_r: f32,
+    horizon: f32,
+    r: f32,
+    r2: f32,
+    inv_den: f32,
+    inv_r: f32,
+    inv_r2: f32,
+    inv_r2_a2: f32,
+    h: f32,
+    ell: Vec3,
 }
 
 #[inline(always)]
-fn add_kerr_fields<const DERIVATIVES: bool>(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
-    let mut m = base;
-    if mass <= 0.0 {
-        return m;
-    }
+fn kerr_source(x: Vec3, mass: f32, spin: Vec3) -> KerrSource {
     let inv_spin_scale = 1.0 / (spin.length() / 0.999).max(1.0);
     let a = mass * spin * inv_spin_scale;
     let a2 = a.dot(a);
     let ax = a.dot(x);
     let raw_r = kerr_radius(x, a);
     let horizon = mass + sqrt((mass * mass - a2).max(0.0));
-    m.clearance = m.clearance.min(raw_r - horizon);
     let r = raw_r.max(0.8 * horizon);
     let r2 = r * r;
     let den = r2 * r2 + ax * ax;
@@ -1270,61 +1275,105 @@ fn add_kerr_fields<const DERIVATIVES: bool>(base: Metric, x: Vec3, mass: f32, sp
     let inv_r2_a2 = 1.0 / (r2 + a2);
     let h = mass * r * r2 * inv_den;
     let numerator = r * x - a.cross(x) + (ax * inv_r) * a;
-    let ell = vec4_f_v3(1.0, numerator * inv_r2_a2);
-    let ll = outer(ell, ell);
-    m.g += 2.0 * h * ll;
-    if DERIVATIVES {
-        let inv_dr = 1.0 / (2.0 * r2 - x.dot(x) + a2).max(1.0e-12);
-        let dr = (r * x + (ax * inv_r) * a) * inv_dr;
-        // Constant axes keep the derivative matrices in registers instead of local memory.
-        let derivative = |ej: Vec3, dr_j: f32, a_j: f32| {
-            let dh = h * (3.0 * dr_j * inv_r - (4.0 * r * r2 * dr_j + 2.0 * ax * a_j) * inv_den);
-            let dn = dr_j * x + r * ej - a.cross(ej) + (a_j * inv_r - ax * dr_j * inv_r2) * a;
-            let dl = vec4_f_v3(0.0, (dn - ell.yzw() * 2.0 * r * dr_j) * inv_r2_a2);
-            2.0 * dh * ll + 2.0 * h * (outer(dl, ell) + outer(ell, dl))
-        };
-        m.dx += derivative(vec3(1.0, 0.0, 0.0), dr.x, a.x);
-        m.dy += derivative(vec3(0.0, 1.0, 0.0), dr.y, a.y);
-        m.dz += derivative(vec3(0.0, 0.0, 1.0), dr.z, a.z);
+    KerrSource {
+        a, a2, ax, raw_r, horizon, r, r2, inv_den, inv_r, inv_r2, inv_r2_a2, h,
+        ell: numerator * inv_r2_a2,
     }
+}
+
+/// Gradient of the source's Kerr radius (with r clamped as in `kerr_source`).
+#[inline(always)]
+fn kerr_radius_gradient(s: KerrSource, x: Vec3) -> Vec3 {
+    let inv_dr = 1.0 / (2.0 * s.r2 - x.dot(x) + s.a2).max(1.0e-12);
+    (s.r * x + (s.ax * s.inv_r) * s.a) * inv_dr
+}
+
+#[cuda_device::device]
+fn add_kerr(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
+    if mass <= 0.0 {
+        return base;
+    }
+    add_kerr_source(base, kerr_source(x, mass, spin))
+}
+
+#[inline(always)]
+fn add_kerr_source(base: Metric, s: KerrSource) -> Metric {
+    let mut m = base;
+    m.clearance = m.clearance.min(s.raw_r - s.horizon);
+    let ell = vec4_f_v3(1.0, s.ell);
+    m.g += 2.0 * s.h * outer(ell, ell);
     let raised = m.inv * ell;
-    let divisor = 1.0 + 2.0 * h * ell.dot(raised);
+    let divisor = 1.0 + 2.0 * s.h * ell.dot(raised);
     if divisor <= 1.0e-6 {
         m.valid = false;
         return m;
     }
-    m.inv -= (2.0 * h / divisor) * outer(raised, raised);
+    m.inv -= (2.0 * s.h / divisor) * outer(raised, raised);
     m.valid = m.valid && m.inv[0][0] < -1.0e-6;
     m
 }
 
-#[cuda_device::device]
-fn scene_metric(pos: Vec3, objects: &Objects) -> Metric {
-    scene_metric_fields::<true>(pos, objects)
+/// The source's metric derivatives d_x g, d_y g, d_z g as whole matrices.
+#[inline(always)]
+fn kerr_metric_derivatives(x: Vec3, mass: f32, spin: Vec3) -> [Mat4; 3] {
+    if mass <= 0.0 {
+        return [Mat4::default(); 3];
+    }
+    let s = kerr_source(x, mass, spin);
+    let (a, r, h) = (s.a, s.r, s.h);
+    let ell = vec4_f_v3(1.0, s.ell);
+    let ll = outer(ell, ell);
+    let dr = kerr_radius_gradient(s, x);
+    let derivative = |ej: Vec3, dr_j: f32, a_j: f32| {
+        let dh = h * (3.0 * dr_j * s.inv_r - (4.0 * r * s.r2 * dr_j + 2.0 * s.ax * a_j) * s.inv_den);
+        let dn = dr_j * x + r * ej - a.cross(ej) + (a_j * s.inv_r - s.ax * dr_j * s.inv_r2) * a;
+        let dl = vec4_f_v3(0.0, (dn - s.ell * 2.0 * r * dr_j) * s.inv_r2_a2);
+        2.0 * dh * ll + 2.0 * h * (outer(dl, ell) + outer(ell, dl))
+    };
+    [
+        derivative(vec3(1.0, 0.0, 0.0), dr.x, a.x),
+        derivative(vec3(0.0, 1.0, 0.0), dr.y, a.y),
+        derivative(vec3(0.0, 0.0, 1.0), dr.z, a.z),
+    ]
 }
 
-#[inline(always)]
-fn scene_metric_fields<const DERIVATIVES: bool>(pos: Vec3, objects: &Objects) -> Metric {
+#[cuda_device::device]
+fn scene_metric(pos: Vec3, objects: &Objects) -> Metric {
     let mut m = flat_metric();
     let mut i = 0i32;
     while i < objects.num_objects {
         let idx = i as usize;
         let x = pos - objects.pos_radius[idx].xyz();
-        let mass = objects.mass[idx].x.max(0.0);
-        let spin = objects.spin[idx].xyz();
-        m = if DERIVATIVES {
-            add_kerr(m, x, mass, spin)
-        } else {
-            add_kerr_fields::<false>(m, x, mass, spin)
-        };
+        m = add_kerr(m, x, objects.mass[idx].x.max(0.0), objects.spin[idx].xyz());
         i += 1;
     }
     m
 }
 
+/// A metric with its first derivatives as whole matrices, for diagnostics and the
+/// reference `geodesic_rhs_matrix`.
+#[derive(Clone, Copy, Default)]
+pub struct MetricJet {
+    pub m: Metric,
+    pub dx: Mat4,
+    pub dy: Mat4,
+    pub dz: Mat4,
+}
+
+#[inline(always)]
+fn add_kerr_jet(base: MetricJet, x: Vec3, mass: f32, spin: Vec3) -> MetricJet {
+    let [dx, dy, dz] = kerr_metric_derivatives(x, mass, spin);
+    MetricJet {
+        m: add_kerr(base.m, x, mass, spin),
+        dx: base.dx + dx,
+        dy: base.dy + dy,
+        dz: base.dz + dz,
+    }
+}
+
 #[cuda_device::device]
 fn plasma_metric(pos: Vec3, objects: &Objects) -> (Mat4, Mat4) {
-    let m = scene_metric_fields::<false>(pos, objects);
+    let m = scene_metric(pos, objects);
     (m.g, m.inv)
 }
 
@@ -1381,9 +1430,12 @@ pub struct Derivs {
     pub screen: Vec4,
 }
 
-#[cuda_device::device]
-fn geodesic_rhs(ray: Ray, m: Metric) -> Derivs {
-    let k = m.inv * ray.p;
+/// Reference right-hand side from whole derivative matrices. Its arithmetic is the
+/// program `CudaGeodesic.geodesic_rhs_exact_inputs` bounds; `geodesic_rhs` must agree
+/// with it (`bh_test_rhs_forms`).
+#[inline(always)]
+fn geodesic_rhs_matrix(ray: Ray, m: MetricJet) -> Derivs {
+    let k = m.m.inv * ray.p;
     let dx_k = m.dx * k;
     let dy_k = m.dy * k;
     let dz_k = m.dz * k;
@@ -1400,11 +1452,76 @@ fn geodesic_rhs(ray: Ray, m: Metric) -> Derivs {
         pos: k.yzw(),
         p: 0.5 * vec4(0.0, k.dot(dx_k), k.dot(dy_k), k.dot(dz_k)),
         screen: -0.5
-            * (m.inv
+            * (m.m.inv
                 * ((k.y * dx_f + k.z * dy_f + k.w * dz_f)
                     + (ray.screen.y * dx_k + ray.screen.z * dy_k + ray.screen.w * dz_k)
                     - contracted)),
     }
+}
+
+/// Geodesic and screen-transport right-hand side (checklist P1.3). Each source adds
+/// d_i g = 2 d_i h l l + 2h (d_i l l + l d_i l) with l = (1, ell); only the contractions
+/// with k = g^-1 p and the screen vector f are formed, never the matrices. The sum over
+/// sources is the derivative of the superposed metric, and the inverse stays generic.
+#[cuda_device::device]
+fn geodesic_rhs(ray: Ray, m: Metric, objects: &Objects) -> Derivs {
+    let k = m.inv * ray.p;
+    // k . d_i g . k, and sum_i (k^i d_i g f + f^i d_i g k) - (0, k . d_i g . f).
+    let mut force = vec3_splat(0.0);
+    let mut transport = vec4_splat(0.0);
+    let mut i = 0i32;
+    while i < objects.num_objects {
+        let idx = i as usize;
+        let mass = objects.mass[idx].x.max(0.0);
+        if mass > 0.0 {
+            let x = ray.pos - objects.pos_radius[idx].xyz();
+            let s = kerr_source(x, mass, objects.spin[idx].xyz());
+            source_terms(s, x, k, ray.screen, &mut force, &mut transport);
+        }
+        i += 1;
+    }
+    rhs_from_terms(k, m, force, transport)
+}
+
+#[inline(always)]
+fn rhs_from_terms(k: Vec4, m: Metric, force: Vec3, transport: Vec4) -> Derivs {
+    Derivs {
+        pos: k.yzw(),
+        p: 0.5 * vec4_f_v3(0.0, force),
+        screen: -0.5 * (m.inv * transport),
+    }
+}
+
+/// One source's share of `geodesic_rhs`'s contractions.
+#[inline(always)]
+fn source_terms(s: KerrSource, x: Vec3, k: Vec4, f: Vec4, force: &mut Vec3, transport: &mut Vec4) {
+    let (ks, fs) = (k.yzw(), f.yzw());
+    let dr = kerr_radius_gradient(s, x);
+    let dh = s.h * (3.0 * s.inv_r * dr - (4.0 * s.r * s.r2 * dr + 2.0 * s.ax * s.a) * s.inv_den);
+    // sum_j v_j d_j ell, with n = r x - a × x + (a.x / r) a = (r² + a²) ell.
+    let along = |v: Vec3| {
+        let dv_r = dr.dot(v);
+        let dn = dv_r * x + s.r * v - s.a.cross(v)
+            + (s.a.dot(v) * s.inv_r - s.ax * dv_r * s.inv_r2) * s.a;
+        (dn - s.ell * (2.0 * s.r * dv_r)) * s.inv_r2_a2
+    };
+    // The gradient of ell . v at fixed v.
+    let gradient = |v: Vec3| {
+        let av = s.a.dot(v);
+        let grad_n = (x.dot(v) - s.ax * av * s.inv_r2) * dr + s.r * v - v.cross(s.a)
+            + (av * s.inv_r) * s.a;
+        (grad_n - (2.0 * s.r * s.ell.dot(v)) * dr) * s.inv_r2_a2
+    };
+    let u = k.x + s.ell.dot(ks);
+    let w = f.x + s.ell.dot(fs);
+    let (dk_l, df_l) = (along(ks), along(fs));
+    let (gk, gf) = (gradient(ks), gradient(fs));
+    let h2 = 2.0 * s.h;
+    *force += 2.0 * u * u * dh + 2.0 * h2 * u * gk;
+    let on_l = 2.0 * (w * dh.dot(ks) + u * dh.dot(fs) + s.h * (fs.dot(dk_l) + ks.dot(df_l)));
+    let spatial = on_l * s.ell + h2 * (w * dk_l + u * df_l)
+        - (2.0 * u * w * dh + h2 * (w * gk + u * gf));
+    *transport += vec4_f_v3(on_l, spatial);
 }
 
 #[inline(always)]
@@ -1433,14 +1550,18 @@ fn ray_valid(ray: Ray, m: Metric) -> bool {
 
 #[cuda_device::device]
 fn ray_endpoint_valid(ray: Ray, objects: &Objects) -> bool {
-    ray_valid(ray, scene_metric_fields::<false>(ray.pos, objects))
+    ray_valid(ray, scene_metric(ray.pos, objects))
 }
 
 #[inline(always)]
-fn ray_rhs(ray: Ray, m: Metric, gauged: bool) -> Derivs {
-    let mut result = geodesic_rhs(ray, m);
+fn ray_rhs(ray: Ray, m: Metric, gauged: bool, objects: &Objects) -> Derivs {
+    gauge(geodesic_rhs(ray, m, objects), m.inv * ray.p, gauged)
+}
+
+#[inline(always)]
+fn gauge(d: Derivs, k: Vec4, gauged: bool) -> Derivs {
+    let mut result = d;
     if gauged {
-        let k = m.inv * ray.p;
         if k.x.abs() > 1.0e-20 {
             result.screen -= k * (result.screen.x / k.x);
             result.screen.x = 0.0;
@@ -1456,19 +1577,19 @@ fn rk4_stages(ray: Ray, h: f32, k1: Derivs, gauged: bool, objects: &Objects) -> 
     if !ray_valid(r2, m2) {
         return None;
     }
-    let k2 = ray_rhs(r2, m2, gauged);
+    let k2 = ray_rhs(r2, m2, gauged, objects);
     let r3 = rk_state(ray, k2, 0.5 * h);
     let m3 = scene_metric(r3.pos, objects);
     if !ray_valid(r3, m3) {
         return None;
     }
-    let k3 = ray_rhs(r3, m3, gauged);
+    let k3 = ray_rhs(r3, m3, gauged, objects);
     let r4 = rk_state(ray, k3, h);
     let m4 = scene_metric(r4.pos, objects);
     if !ray_valid(r4, m4) {
         return None;
     }
-    let k4 = ray_rhs(r4, m4, gauged);
+    let k4 = ray_rhs(r4, m4, gauged, objects);
     Some(rk_state(
         ray,
         Derivs {
@@ -1483,7 +1604,7 @@ fn rk4_stages(ray: Ray, h: f32, k1: Derivs, gauged: bool, objects: &Objects) -> 
 #[inline(always)]
 fn step_ray(ray: Ray, h: f32, m: Metric, objects: &Objects) -> RayStep {
     if ray_valid(ray, m)
-        && let Some(next) = rk4_stages(ray, h, ray_rhs(ray, m, false), false, objects)
+        && let Some(next) = rk4_stages(ray, h, ray_rhs(ray, m, false, objects), false, objects)
     {
         return RayStep {
             ray: next,
@@ -1536,7 +1657,7 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
         };
     }
     // The coarse step, the first half step and every retry start from the same state.
-    let initial_rhs = ray_rhs(ray, *m, gauged);
+    let initial_rhs = ray_rhs(ray, *m, gauged, objects);
     let mut next_h = requested_h;
     for retry in 0..12 {
         let h = next_h;
@@ -1554,7 +1675,7 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
         if !ray_valid(half, half_metric) {
             continue;
         }
-        let half_rhs = ray_rhs(half, half_metric, gauged);
+        let half_rhs = ray_rhs(half, half_metric, gauged, objects);
         let Some(fine) = rk4_stages(half, next_h, half_rhs, gauged, objects) else {
             continue;
         };
@@ -1614,14 +1735,54 @@ fn scale_derivs(w: f32, k: Derivs) -> Derivs {
     }
 }
 
-#[inline(always)]
-fn dp_stage(ray: Ray, d: Derivs, h: f32, gauged: bool, objects: &Objects) -> Option<Derivs> {
-    let r = rk_state(ray, d, h);
+/// The metric at `r` and, when the ray is valid there, its right-hand side. With one or
+/// two holes each source is computed once for both (checklist P1.3); the metric is
+/// built in `scene_metric`'s order, so it is the same bits.
+#[cuda_device::device]
+fn metric_and_rhs(r: Ray, gauged: bool, objects: &Objects) -> (Metric, Option<Derivs>) {
+    if objects.num_objects <= 2 {
+        let slot = |i: usize| {
+            let live = objects.num_objects > i as i32 && objects.mass[i].x > 0.0;
+            let x = r.pos - objects.pos_radius[i].xyz();
+            let s = if live {
+                kerr_source(x, objects.mass[i].x, objects.spin[i].xyz())
+            } else {
+                KerrSource::default()
+            };
+            (live, x, s)
+        };
+        let (live0, x0, s0) = slot(0);
+        let (live1, x1, s1) = slot(1);
+        let mut m = flat_metric();
+        if live0 {
+            m = add_kerr_source(m, s0);
+        }
+        if live1 {
+            m = add_kerr_source(m, s1);
+        }
+        if !ray_valid(r, m) {
+            return (m, None);
+        }
+        let k = m.inv * r.p;
+        let (mut force, mut transport) = (vec3_splat(0.0), vec4_splat(0.0));
+        if live0 {
+            source_terms(s0, x0, k, r.screen, &mut force, &mut transport);
+        }
+        if live1 {
+            source_terms(s1, x1, k, r.screen, &mut force, &mut transport);
+        }
+        return (m, Some(gauge(rhs_from_terms(k, m, force, transport), k, gauged)));
+    }
     let m = scene_metric(r.pos, objects);
     if !ray_valid(r, m) {
-        return None;
+        return (m, None);
     }
-    Some(ray_rhs(r, m, gauged))
+    (m, Some(ray_rhs(r, m, gauged, objects)))
+}
+
+#[inline(always)]
+fn dp_stage(ray: Ray, d: Derivs, h: f32, gauged: bool, objects: &Objects) -> Option<Derivs> {
+    metric_and_rhs(rk_state(ray, d, h), gauged, objects).1
 }
 
 #[inline(always)]
@@ -1666,7 +1827,7 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
             accepted: false,
         };
     }
-    let k1 = ray_rhs(ray, *m, gauged);
+    let k1 = ray_rhs(ray, *m, gauged, objects);
     let mut next_h = requested_h;
     for retry in 0..12 {
         let h = next_h;
@@ -1728,14 +1889,10 @@ fn advance_ray_dp45<const DIAGNOSTICS: bool>(
             k6,
         );
         let next = rk_state(ray, d, h);
-        if !ray_endpoint_valid(next, objects) {
+        let (metric, k7) = metric_and_rhs(next, gauged, objects);
+        let Some(k7) = k7 else {
             continue;
-        }
-        let metric = scene_metric(next.pos, objects);
-        if !ray_valid(next, metric) {
-            continue;
-        }
-        let k7 = ray_rhs(next, metric, gauged);
+        };
         // Difference between the fifth- and fourth-order solutions, formed directly
         // from the stages so it is not lost to binary32 rounding of the two states.
         let e = scale_derivs(
@@ -2726,7 +2883,7 @@ fn kerr_capture_certified(ray: Ray, spin: f32, disk_inner: f32) -> bool {
     let horizon_p = horizon.sq().add(a2).sub(a.mul(lambda));
     let barrier = r.sub(horizon).mul(r.add(horizon).sub(Bound::point(2.0))).mul(carter);
     // Sigma dr/dlambda: g^-1 = eta - 2h l#l#^T with l# = (-1, l), exact for the null l of
-    // add_kerr_fields with spin along +y.
+    // add_kerr with spin along +y.
     let h = r.mul(r2).div(r2.sq().add(a.mul(y).sq()));
     let lx = r.mul(x).sub(a.mul(z)).div(r2a2);
     let ly = y.div(r);
@@ -3215,7 +3372,7 @@ pub unsafe fn bh_test_capture_guard(
     let base = (2 * id) as usize;
     let (head, p) = unsafe { (*cases.add(base), *cases.add(base + 1)) };
     let ray = Ray { pos: head.xyz(), p, screen: vec4(0.0, 0.0, 0.0, 0.0) };
-    let metric = add_kerr_fields::<false>(flat_metric(), ray.pos, 1.0, vec3(0.0, head.w, 0.0));
+    let metric = add_kerr(flat_metric(), ray.pos, 1.0, vec3(0.0, head.w, 0.0));
     let velocity = (metric.inv * ray.p).yzw();
     unsafe {
         *results.add(id as usize) =
@@ -3510,11 +3667,12 @@ fn norm4(v: Vec4) -> f32 {
 }
 
 #[inline(always)]
-fn verification_metric(pos: Vec3, binary: bool) -> Metric {
+fn verification_metric(pos: Vec3, binary: bool) -> MetricJet {
+    let flat = MetricJet { m: flat_metric(), ..MetricJet::default() };
     if binary {
-        return add_kerr(
-            add_kerr(
-                flat_metric(),
+        return add_kerr_jet(
+            add_kerr_jet(
+                flat,
                 pos + vec3(7.0, 0.0, 0.0),
                 0.5,
                 vec3_splat(0.0),
@@ -3524,8 +3682,8 @@ fn verification_metric(pos: Vec3, binary: bool) -> Metric {
             vec3_splat(0.0),
         );
     }
-    add_kerr(
-        flat_metric(),
+    add_kerr_jet(
+        flat,
         pos + vec3(7.0, 0.0, 0.0),
         1.0,
         vec3_splat(0.0),
@@ -3533,7 +3691,7 @@ fn verification_metric(pos: Vec3, binary: bool) -> Metric {
 }
 
 #[inline(always)]
-fn metric_derivative(m: Metric, i: u32) -> Mat4 {
+fn metric_derivative(m: MetricJet, i: u32) -> Mat4 {
     if i == 1 {
         return m.dx;
     }
@@ -3547,14 +3705,14 @@ fn metric_derivative(m: Metric, i: u32) -> Mat4 {
 }
 
 #[inline(always)]
-fn connection(m: Metric, a: u32, b: u32, c: u32) -> f32 {
+fn connection(m: MetricJet, a: u32, b: u32, c: u32) -> f32 {
     let db = metric_derivative(m, b);
     let dc = metric_derivative(m, c);
     let mut value = 0.0_f32;
     let mut d = 0u32;
     while d < 4 {
         let dd = metric_derivative(m, d);
-        value += 0.5 * m.inv[d][a] * (db[c][d] + dc[b][d] - dd[c][b]);
+        value += 0.5 * m.m.inv[d][a] * (db[c][d] + dc[b][d] - dd[c][b]);
         d += 1;
     }
     value
@@ -3826,7 +3984,8 @@ pub unsafe fn bh_check_relativity(
     let identity = ETA * ETA;
     let x = vec3(3.0, 2.0, 4.0);
     let spin = vec3(0.4, -0.5, 0.6);
-    let m = add_kerr(flat_metric(), x, 0.7, spin);
+    let jet = add_kerr_jet(MetricJet { m: flat_metric(), ..MetricJet::default() }, x, 0.7, spin);
+    let m = jet.m;
     let j = vec4(1.0, 0.7, 0.1, 0.05);
     if i == 0 {
         passed = matrix_error(flat_metric().g, ETA) == 0.0;
@@ -3855,12 +4014,12 @@ pub unsafe fn bh_check_relativity(
         delta[i - 4] = 0.002;
         let plus = add_kerr(flat_metric(), x + delta, 0.7, spin);
         let minus = add_kerr(flat_metric(), x - delta, 0.7, spin);
-        let mut analytic = m.dx;
+        let mut analytic = jet.dx;
         if i == 5 {
-            analytic = m.dy;
+            analytic = jet.dy;
         }
         if i == 6 {
-            analytic = m.dz;
+            analytic = jet.dz;
         }
         passed = matrix_error((plus.g - minus.g) * 250.0, analytic) < 6.0e-5;
     }
@@ -4046,13 +4205,13 @@ pub unsafe fn bh_test_geodesic_rhs(inputs: *const f32, values: *mut f32, count: 
         return;
     }
     let b = (id * 72) as usize;
-    let mut m = Metric::default();
+    let mut m = MetricJet::default();
     unsafe {
-        m.inv = read_matrix(inputs, b);
+        m.m.inv = read_matrix(inputs, b);
         m.dx = read_matrix(inputs, b + 16);
         m.dy = read_matrix(inputs, b + 32);
         m.dz = read_matrix(inputs, b + 48);
-        let d = geodesic_rhs(
+        let d = geodesic_rhs_matrix(
             Ray {
                 pos: vec3_splat(0.0),
                 p: read_vec4(inputs, b + 64),
@@ -4070,6 +4229,71 @@ pub unsafe fn bh_test_geodesic_rhs(inputs: *const f32, values: *mut f32, count: 
             *values.add(o + 7 + i as usize) = d.screen[i];
             i += 1;
         }
+    }
+}
+
+/// Per state (pos, p, screen at stride 12): the matrix reference, the structured
+/// `geodesic_rhs` and the fused `metric_and_rhs`, 11 values each, then 1 when the fused
+/// metric has `scene_metric`'s bits (0 if not, -1 if the ray is invalid there).
+#[cuda_device::kernel]
+pub unsafe fn bh_test_rhs_forms(objects: *const Objects, inputs: *const f32, values: *mut f32, count: u32) {
+    let id = gid_x();
+    if id >= count {
+        return;
+    }
+    let objects = unsafe { &*objects };
+    let b = (id * 12) as usize;
+    unsafe {
+        let ray = Ray {
+            pos: read_vec4(inputs, b).xyz(),
+            p: read_vec4(inputs, b + 4),
+            screen: read_vec4(inputs, b + 8),
+        };
+        let mut jet = MetricJet { m: flat_metric(), ..MetricJet::default() };
+        let mut i = 0i32;
+        while i < objects.num_objects {
+            let idx = i as usize;
+            let x = ray.pos - objects.pos_radius[idx].xyz();
+            jet = add_kerr_jet(jet, x, objects.mass[idx].x.max(0.0), objects.spin[idx].xyz());
+            i += 1;
+        }
+        let m = scene_metric(ray.pos, objects);
+        let (fused_m, fused) = metric_and_rhs(ray, false, objects);
+        let o = (id * 34) as usize;
+        let forms = [
+            geodesic_rhs_matrix(ray, jet),
+            geodesic_rhs(ray, m, objects),
+            fused.unwrap_or_default(),
+        ];
+        let mut f = 0usize;
+        while f < 3 {
+            let d = forms[f];
+            let base = o + 11 * f;
+            let mut j = 0u32;
+            while j < 4 {
+                if j < 3 {
+                    *values.add(base + j as usize) = d.pos[j];
+                }
+                *values.add(base + 3 + j as usize) = d.p[j];
+                *values.add(base + 7 + j as usize) = d.screen[j];
+                j += 1;
+            }
+            f += 1;
+        }
+        let mut same = true;
+        let mut r = 0u32;
+        while r < 4 {
+            let mut c = 0u32;
+            while c < 4 {
+                same = same
+                    && fused_m.g[r][c].to_bits() == m.g[r][c].to_bits()
+                    && fused_m.inv[r][c].to_bits() == m.inv[r][c].to_bits();
+                c += 1;
+            }
+            r += 1;
+        }
+        same = same && fused_m.clearance.to_bits() == m.clearance.to_bits() && fused_m.valid == m.valid;
+        *values.add(o + 33) = if fused.is_none() { -1.0 } else if same { 1.0 } else { 0.0 };
     }
 }
 

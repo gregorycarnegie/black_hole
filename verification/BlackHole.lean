@@ -91,6 +91,7 @@ public import BlackHole.WgslCounterexamples
 public import BlackHole.WgslAtan2
 public import BlackHole.KernelFixture
 public import BlackHole.CudaGeodesic
+public import BlackHole.CudaStructuredRhs
 public import BlackHole.WgslRAChk
 public import BlackHole.NagaFixture
 public import BlackHole.NagaFixtureSmall

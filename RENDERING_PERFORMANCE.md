@@ -181,6 +181,25 @@ The classification test now runs both controllers at step factors 0.11, 0.12 and
 
 DP45 saves 34–44% with the BVH and 24–40% with OptiX. The BVH times leave out its host rebuild, which the table above puts at up to 75 ms.
 
+## Structured metric contractions (default)
+
+**Default since 2026-11-25 (checklist P1.3).** `Metric` now holds only g, g⁻¹, the clearance and a validity flag. The three 4×4 derivative matrices are gone. `geodesic_rhs` builds each Kerr–Schild source's contributions to k·∂ᵢg·k and to the screen transport directly from h, ℓ, ∂h and the derivatives of ℓ along k and f (`source_terms`). The sum over sources is the derivative of the superposed metric, and g⁻¹ stays the generic Sherman–Morrison update, so binaries are handled exactly as before. With one or two holes, `metric_and_rhs` computes each source once and uses it for both the metric and the right-hand side. Its metric has the same bits as `scene_metric`. The DP45 step no longer evaluates the endpoint metric twice. The matrix form survives as `geodesic_rhs_matrix`, behind `MetricJet`, for the diagnostics and the proved fixture. [RHS](tools/cuda/kernels.rs) · [Identity](verification/BlackHole/CudaStructuredRhs.lean)
+
+How it was built matters for the timings. The first version recomputed every source inside `geodesic_rhs` and inlined it into every stage. It was 30% slower (close-up 26.0 / 24.2 ms), even though it had fewer registers and no local memory. Moving the right-hand side back behind a device call recovered most of that. Computing each source once per stage made it faster than the matrix form.
+
+Close-up, `--profile-renderer`, two alternating runs each, still / orbit medians: 19.9 / 18.2 and 20.2 / 18.3 ms before, 18.3 / 16.8 and 18.6 / 16.9 ms after (about 8%). `dp45_controller_benchmark`:
+
+| Scene | DP45 before (ms) | DP45 after (ms) | RK4 before (ms) | RK4 after (ms) |
+|---|---:|---:|---:|---:|
+| Single hole 400×300 | 14.4 | 13.0 | 30.3 | 27.1 |
+| Single hole 960×540 | 26.9 | 23.8 | 59.8 | 49.0 |
+| Binary 400×300 | 17.6 | 16.2 | 35.1 | 35.1 |
+| Binary 960×540 | 38.7 | 34.5 | 84.1 | 76.8 |
+
+`bh_geodesic` local memory falls from 344 to 184 bytes per thread at 255 registers, and `bh_geodesic_experiments` from 1,128 to 464. Images: every GPU image and controller test passes unchanged, including bit-identical early capture, swarm BVH and OptiX against brute force, the EHT snapshot and the controller classification.
+
+`structured_geodesic_rhs_matches_the_matrix_form` compares, for 4,096 random states each on a spinning single hole (a = 0.9) and a tilted-spin binary, the structured and fused forms with the matrix form. Each output group is scaled by the size of its terms, as `absEval` is for the proved bound. The worst difference is 3.1e-7 (single) and 2.1e-7 (binary), against a limit of 1e-5. On the single hole, all three forms meet the binary64 `certified::Kerr` right-hand side to 8.0e-7 (matrix), 9.2e-7 (structured) and 8.6e-7 (fused), against 1e-4. `CudaStructuredRhs.lean` proves over ℝ that one source's structured terms equal its matrix contractions; both are linear in ∂g. The structured form's binary32 rounding has no proved bound. The proved 3e-4 bound (`CudaGeodesic.geodesic_rhs_exact_inputs`) now covers only `geodesic_rhs_matrix`.
+
 ## Experiment order
 
 1. **Measure the interactive frame.** Fix the camera, spin, disk preset, pixel dimensions, and render mode for each comparison. Start with single-hole thermal intensity, then compare polarized or synchrotron-heavy rendering and the binary scene. Include a view with a prominent photon ring and measure the Ellis kernel separately if the wormhole view is slow. Record median and 95th-percentile frame times after warm-up. Time the geodesic and accumulation kernels with CUDA events. Measure the host wait/readback, Bevy texture upload, and total frame time separately. Use the `H` heatmap to locate long rays and count rejected attempts separately from outer iterations. If a few long-running rays dominate, check warp divergence, register pressure, and spills before changing block size or splitting up the ray work. [Existing CUDA-event example](tests/common/gpu.rs#L229) · [Kernel dispatch](src/compute/pipeline.rs#L356) · [Display path](src/compute/accumulate.rs#L156)
