@@ -404,6 +404,7 @@ mod tests {
             BridgePlugin,
             crate::grid::GridPlugin,
             crate::compute::GeodesicComputePlugin,
+            crate::swarm::SwarmPlugin,
             crate::ui::UiPlugin,
         ))
         .add_systems(
