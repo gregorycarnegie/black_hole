@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1071119c011384b0eeec25774bcfd992ba507253c67b95a574858131d60d68b5 # shrinks to spin = 0.0, radius = 64.0, at = (1.805379186204358, 0.0), (tilt, turn) = (0.2924366996994089, -1.8579700587524226), backward = false
+cc 09cf59c0b659dc4e4e0c29d88e057fcedfca4389d2464d2467d113449740a982 # shrinks to spin = 0.38261842922375416, radius = 64.0, at = (0.05, 0.0), (tilt, turn) = (0.0, 0.0), backward = false
+cc 292b7e6889721de1c601f2f9363edc643974a223731b3cae5b9534c3862aca4b # shrinks to spin = 0.0, radius = 12.0, at = (2.7174571368326066, 0.0), (tilt, turn) = (0.30898548843864954, -1.3362331219077488), backward = false
+cc 5fb4ec449f94f9045cb63cb584d677ab758c168b3c3e2197c3d98275d893c5a8 # shrinks to spin = -0.9729239435052581, radius = 448.585618705749, at = (0.4872298265799556, 0.0), (tilt, turn) = (1.50702298480413, 0.0), backward = true
+cc 8297fd8a3e437b436a1b8443f869689cdcc41b0b06daf40b116503c359b9b024 # shrinks to spin = -0.17982732556220762, radius = 48.730090329359825, aspect = 0.010936780987215611, place = (false, 16.74381793815537, 0.0), aim = (1.0409541026252305, 2.373639339679233), backward = true

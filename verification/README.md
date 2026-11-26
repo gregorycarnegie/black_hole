@@ -86,7 +86,13 @@ arithmetic error bound. It also checks the thermal intensity and power/reciproca
 identities used by the disk optimizations. Its kernel-checked
 `fixtures/cuda-geodesic.sexp` is the oracle for
 `cargo test --test rendering geodesic_rhs_meets_the_proved_bound -- --ignored --nocapture`.
-Regenerate it with `lake env lean --run KernelFixtureGen.lean`. The archived
+Regenerate it with `lake env lean --run KernelFixtureGen.lean`. That bound now
+covers `geodesic_rhs_matrix`, the reference form. Production uses the structured
+`geodesic_rhs` (checklist P1.3), which forms each Kerr–Schild source's contractions
+without building the derivative matrices. `CudaStructuredRhs.lean` proves the two
+forms equal over ℝ. The structured form's rounding has no proved bound: on the GPU,
+`structured_geodesic_rhs_matches_the_matrix_form` checks that it stays within 1e-4 of
+the bounded form. The archived
 WESL/naga fixtures remain checked separately; complete CUDA source/compiler
 correspondence and full metric/plasma rounding bounds remain open obligations.
 

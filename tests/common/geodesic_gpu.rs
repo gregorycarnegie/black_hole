@@ -100,3 +100,119 @@ fn geodesic_rhs_meets_the_proved_bound() {
     }
     println!("geodesic_rhs: {cases} cases, worst error {worst:.3e} of absEval (bound 3e-4)");
 }
+
+/// The structured `geodesic_rhs` (checklist P1.3) and its fused one- and two-hole form
+/// against the matrix form above, on a spinning single hole and a tilted-spin binary.
+/// They are the same algebra in a different order (`CudaStructuredRhs.lean`), so they
+/// agree to binary32 rounding. On the single hole all three also meet the binary64
+/// `certified::Kerr` right-hand side.
+#[test]
+#[ignore = "requires a GPU; run with --release -- --ignored"]
+fn structured_geodesic_rhs_matches_the_matrix_form() {
+    // `Objects`: count, then 16-entry Vec4 arrays pos_radius, color, mass, spin.
+    let scene = |holes: &[([f32; 3], f32, [f32; 3])]| {
+        let mut objects = vec![0u8; 1040];
+        objects[..4].copy_from_slice(&i32::try_from(holes.len()).unwrap().to_le_bytes());
+        for (i, (pos, mass, spin)) in holes.iter().enumerate() {
+            let put = |o: &mut Vec<u8>, at: usize, v: &[f32]| {
+                o[at..at + 4 * v.len()].copy_from_slice(bytemuck::cast_slice(v));
+            };
+            put(&mut objects, 16 + 16 * i, pos);
+            put(&mut objects, 528 + 16 * i, &[*mass]);
+            put(&mut objects, 784 + 16 * i, spin);
+        }
+        objects
+    };
+    let single = [([0.0; 3], 1.0, [0.0, 0.9, 0.0])];
+    let binary = [
+        ([7.0, 0.0, 0.0], 0.5, [0.0, 0.6, 0.0]),
+        ([-7.0, 0.0, 0.0], 0.5, [0.3, 0.0, 0.4]),
+    ];
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut random = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+    };
+    let cases = 4096;
+    let kerr = black_hole::certified::Kerr::new([0.0, 0.9, 0.0]).unwrap();
+    for (name, holes) in [("single", &single[..]), ("binary", &binary[..])] {
+        // Positions from 2.5 to 30 from the origin, so most states are outside both horizons.
+        let inputs: Vec<f32> = (0..cases)
+            .flat_map(|_| {
+                let dir = [random(), random(), random()];
+                let n = dir.iter().map(|d| d * d).sum::<f32>().sqrt().max(1.0e-3);
+                let r = 2.5 + 27.5 * (0.5 + 0.5 * random());
+                let mut v = vec![r * dir[0] / n, r * dir[1] / n, r * dir[2] / n, 0.0];
+                v.extend((0..8).map(|_| random()));
+                v
+            })
+            .collect();
+        let values = crate::gpu::rhs_forms(&scene(holes), &inputs);
+        // Random p is not null, so outputs can cancel far below their terms. Each group is
+        // scaled by its terms' size instead, as `absEval` does for the proved bound: |p| for
+        // k, |p|²/d² for the force and |p| |f| / d² for transport, d the nearest hole.
+        let scales = |x: &[f32]| {
+            let d2 = holes
+                .iter()
+                .map(|(c, _, _)| (0..3).map(|i| (x[i] - c[i]).powi(2)).sum::<f32>())
+                .fold(f32::MAX, f32::min);
+            let p: f32 = x[4..8].iter().map(|v| v.abs()).sum();
+            let f: f32 = x[8..12].iter().map(|v| v.abs()).sum();
+            [(0, 3, p), (3, 7, p * p / d2), (7, 11, p * f / d2)]
+        };
+        let (mut worst, mut worst_exact, mut checked) = (0.0_f32, [0.0_f64; 3], 0);
+        for case in 0..cases {
+            let v = &values[case * 34..(case + 1) * 34];
+            if v[33] < 0.0 {
+                continue;
+            }
+            assert_eq!(
+                v[33], 1.0,
+                "{name} case {case}: fused metric differs from scene_metric"
+            );
+            checked += 1;
+            let x = &inputs[case * 12..(case + 1) * 12];
+            let exact = (name == "single").then(|| {
+                kerr.phase_rhs(std::array::from_fn(|i| {
+                    f64::from(x[if i < 3 { i } else { i + 1 }])
+                }))
+            });
+            for (lo, hi, scale) in scales(x) {
+                for i in lo..hi {
+                    for form in 1..3 {
+                        let error = (v[11 * form + i] - v[i]).abs() / scale;
+                        worst = worst.max(error);
+                        assert!(
+                            error <= 1.0e-5,
+                            "{name} case {case} form {form} output {i}: {} against {}",
+                            v[11 * form + i],
+                            v[i]
+                        );
+                    }
+                    let Some(exact) = exact else { continue };
+                    for (form, w) in worst_exact.iter_mut().enumerate() {
+                        let error =
+                            (f64::from(v[11 * form + i]) - exact[i]).abs() / f64::from(scale);
+                        *w = w.max(error);
+                        assert!(
+                            error <= 1.0e-4,
+                            "binary64 case {case} form {form} output {i}: {} against {}",
+                            v[11 * form + i],
+                            exact[i]
+                        );
+                    }
+                }
+            }
+        }
+        assert!(checked > cases / 2, "{name}: only {checked} valid states");
+        println!("{name}: {checked} states, worst difference from the matrix form {worst:.3e}");
+        if name == "single" {
+            println!(
+                "single against binary64: worst error matrix {:.3e}, structured {:.3e}, fused {:.3e}",
+                worst_exact[0], worst_exact[1], worst_exact[2]
+            );
+        }
+    }
+}

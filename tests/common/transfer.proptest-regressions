@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6d82527efc024d68e41458a44e68aa4e1e479a5433229cc45f47791cc6ea5e35 # found while writing the P1.9 transfer tests; shrunk value omitted (588 KB)

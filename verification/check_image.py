@@ -126,9 +126,9 @@ def prepare(args):
     print(f"Prepared {len(indices)} rays; cell fraction {args.cell_fraction}")
 
 
-def compare():
+def compare(image="image-gpu.f32"):
     meta = json.loads((OUT / "image-input.json").read_text())
-    values = np.fromfile(OUT / "image-gpu.f32", dtype="<f4").reshape(-1, 16)
+    values = np.fromfile(OUT / image, dtype="<f4").reshape(-1, 16)
     indices = meta["indices"]
     if len(values) != len(indices) or not np.isfinite(values).all():
         raise ValueError("Incomplete/nonfinite image output")
@@ -140,7 +140,7 @@ def compare():
     actual = values[:, :4].astype(float)
     denominator = np.linalg.norm(expected[:, 0])
     error = actual-expected
-    report = {"pixels": len(values), "cell_fraction": meta["cell_fraction"], "status_counts": statuses, "summed_stokes_Jy": actual.sum(axis=0).tolist(), "reference_summed_stokes_Jy": expected.sum(axis=0).tolist(), "component_l2_error_over_reference_I_l2": (np.linalg.norm(error,axis=0)/denominator).tolist(), "max_absolute_error_Jy": np.abs(error).max(axis=0).tolist(), "max_steps": int(values[:,4].max()), "max_null_residual": float(values[:,6].max()), "max_affine_length": float(values[:,7].max()), "complete_image": len(values)==25600, "scope": "empirical cross-code comparison; no universal accuracy claim"}
+    report = {"image": image, "pixels": len(values), "cell_fraction": meta["cell_fraction"], "status_counts": statuses, "summed_stokes_Jy": actual.sum(axis=0).tolist(), "reference_summed_stokes_Jy": expected.sum(axis=0).tolist(), "component_l2_error_over_reference_I_l2": (np.linalg.norm(error,axis=0)/denominator).tolist(), "max_absolute_error_Jy": np.abs(error).max(axis=0).tolist(), "max_steps": int(values[:,4].max()), "max_null_residual": float(values[:,6].max()), "max_affine_length": float(values[:,7].max()), "complete_image": len(values)==25600, "scope": "empirical cross-code comparison; no universal accuracy claim"}
     reference_intensity=float(full_reference[:,0].max())
     bright=expected[:,0]>1e-6*reference_intensity
     relative_I=float(np.max(np.abs(error[bright,0])/expected[bright,0]))
@@ -152,7 +152,7 @@ def compare():
         "requested_numerical_targets_met":bool(np.all(max_normalized<=1e-6) and relative_I<=1e-4),
         "zig_baseline_to_refined_l2_change_over_I_l2":(np.linalg.norm(expected-baseline,axis=0)/denominator).tolist(),
         "camera_and_outer_transport":meta["outer_transport"]})
-    (OUT / "image-comparison.json").write_text(json.dumps(report,indent=2)+"\n",encoding="utf-8")
+    (OUT / image.replace("image-gpu", "image-comparison").replace(".f32", ".json")).write_text(json.dumps(report,indent=2)+"\n",encoding="utf-8")
     print(json.dumps(report,indent=2))
     if not np.isin(values[:,5], [1,2]).all():
         raise ValueError("Image contains unresolved or failed rays; inspect status_counts")
@@ -166,5 +166,6 @@ if __name__ == "__main__":
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--cell-fraction", type=float, default=0.0625)
     parser.add_argument("--outer-fraction", type=float, default=0.02)
+    parser.add_argument("--image", default="image-gpu.f32", help="GPU output file to compare")
     args = parser.parse_args()
-    prepare(args) if args.action == "prepare" else compare()
+    prepare(args) if args.action == "prepare" else compare(args.image)

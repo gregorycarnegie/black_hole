@@ -34,14 +34,30 @@ pub struct GeodesicComputePlugin;
 
 #[derive(Resource)]
 pub(super) struct RayExperiments {
-    early_capture: bool,
-    far_field: bool,
+    full_trace: bool,
+    no_far_field: bool,
+    rk4: bool,
+    coupled_transfer: bool,
+    no_analytic_legs: bool,
+    band_legs: bool,
 }
 
-pub(crate) fn enable_ray_experiments(app: &mut App, early_capture: bool, far_field: bool) {
+pub(crate) fn enable_ray_experiments(
+    app: &mut App,
+    full_trace: bool,
+    no_far_field: bool,
+    rk4: bool,
+    coupled_transfer: bool,
+    no_analytic_legs: bool,
+    band_legs: bool,
+) {
     app.sub_app_mut(RenderApp).insert_resource(RayExperiments {
-        early_capture,
-        far_field,
+        full_trace,
+        no_far_field,
+        rk4,
+        coupled_transfer,
+        no_analytic_legs,
+        band_legs,
     });
 }
 

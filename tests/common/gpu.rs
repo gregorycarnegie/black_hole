@@ -35,6 +35,32 @@ pub fn geodesic_rhs(inputs: &[f32], cases: usize) -> Vec<f32> {
     cuda.clone_dtoh(&d_out)
 }
 
+pub fn rhs_forms(objects: &[u8], inputs: &[f32]) -> Vec<f32> {
+    let cuda = shared_cuda();
+    cuda.bind_to_thread();
+    let count = u32::try_from(inputs.len() / 12).unwrap();
+    let d_obj = cuda.clone_htod(objects);
+    let d_in = cuda.clone_htod(inputs);
+    let mut d_out = cuda.alloc_zeros::<f32>(count as usize * 34);
+
+    let cfg = LaunchConfig {
+        grid_dim: (count.div_ceil(64), 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = cuda.stream.launch_builder(&cuda.test_rhs_forms);
+    builder.arg(&d_obj);
+    builder.arg(&d_in);
+    builder.arg(&mut d_out);
+    builder.arg(&count);
+    unsafe {
+        builder
+            .launch(cfg)
+            .expect("CUDA bh_test_rhs_forms launch failed");
+    }
+    cuda.clone_dtoh(&d_out)
+}
+
 pub fn energies(cam: &[u8], dsk: &[u8], objects: &[u8]) -> Vec<f32> {
     let cuda = shared_cuda();
     cuda.bind_to_thread();
@@ -66,7 +92,7 @@ pub fn controller_trace(objects: &[u8], input: &[u8], count: u32) -> Vec<f32> {
     cuda.bind_to_thread();
     let d_obj = cuda.clone_htod(objects);
     let d_in = cuda.clone_htod(input);
-    let mut d_out = cuda.alloc_zeros::<f32>((count as usize) * 16);
+    let mut d_out = cuda.alloc_zeros::<f32>((count as usize) * 20);
 
     let cfg = LaunchConfig {
         grid_dim: (count, 1, 1),
@@ -208,6 +234,7 @@ pub fn image(
     seeds: &[u8],
     settings: &[u8],
     count: u32,
+    dormand_prince: bool,
 ) -> Vec<u8> {
     let cuda = shared_cuda();
     cuda.bind_to_thread();
@@ -238,6 +265,8 @@ pub fn image(
     builder.arg(&d_seeds);
     builder.arg(&d_settings);
     builder.arg(&mut d_out);
+    let dormand_prince = u32::from(dormand_prince);
+    builder.arg(&dormand_prince);
     unsafe {
         builder
             .launch(cfg)

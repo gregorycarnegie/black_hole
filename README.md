@@ -16,7 +16,7 @@ Simulates null geodesics (light paths) in Kerr spacetime in mass-independent gra
 
 ## Features
 
-1. **GPU ray-tracing** — one Cartesian Kerr–Schild Hamiltonian RK4 solver traces both single-hole and binary scenes, with analytic metric derivatives and a null-constraint check
+1. **GPU ray-tracing** — one Cartesian Kerr–Schild Hamiltonian Dormand–Prince 5(4) solver traces both single-hole and binary scenes, with analytic metric derivatives and a null-constraint check
 2. **Accretion disk** — four switchable geometry presets (thin NT, truncated thin + hot flow, slim/super-Eddington, warped Bardeen-Petterson) with Kerr ISCO, frame dragging, Doppler beaming, and gravitational redshift
 3. **Spacetime grid** — wireframe grid deformed by the Schwarzschild metric of each massive object
 4. **Binary black holes** — equal-mass spinning black holes orbit a shared barycentre, with per-hole spin vectors in a frozen superposed Kerr–Schild metric and a circumbinary disk
@@ -98,12 +98,15 @@ The window opens on a single Kerr black hole with a thin accretion disk. Drag wi
 
 ### Command-line options
 
-Pass options after `--`, for example `cargo run --release -- --experiment-far-field`.
+Pass options after `--`, for example `cargo run --release -- --full-trace`.
 
 | Option | Effect |
 |---|---|
-| `--experiment-early-capture` | Single hole only: ends rays early once a proved Kerr test shows they will fall into the horizon. Faster, with the same exit classification. |
-| `--experiment-far-field` | Single hole only: takes larger steps far from the hole and disk. |
+| `--full-trace` | Turns off early capture, which by default ends single-hole rays once a proved Kerr test shows they will fall into the horizon. The image is the same; the full trace is about five times slower in the close-up. |
+| `--no-far-field` | Single hole only: turns off the larger steps the renderer takes far from the hole and disk, and caps steps everywhere as before. It also turns off the analytic vacuum legs. Sky directions differ by at most 6e-7 rad, and it is slower. Kept for one release. |
+| `--no-analytic-legs` | Single hole only: traces rays step by step outside the sphere that encloses the disk, instead of carrying them with the separated Kerr solution to that sphere or the sky. Sky directions differ by about 1e-7 rad, and it is slower. Kept for one release. |
+| `--band-legs` | Single thin disk only, experimental: also carries rays analytically inside that sphere until they reach the band around the disk. About half the steps, but no faster on the tested GPU. |
+| `--rk4-controller` | All scenes: uses the earlier step-doubling RK4 controller instead of the default Dormand–Prince 5(4) one. About twice as slow; kept for one release. |
 | `--profile-renderer` | Runs a fixed benchmark and writes per-ray diagnostics to `target/renderer-rays*.csv`, then exits. |
 | `--optix` | In an RTX build (below), starts with the RTX button on. |
 
@@ -135,7 +138,7 @@ CI runs Rust lint and CPU tests on Linux and Windows and the Python verification
 
 The renderer runs on CUDA. The kernels are written in Rust in `tools/cuda/kernels.rs` and compiled ahead of time to PTX (`src/compute/kernels.ptx`) by [cuda-oxide](https://github.com/NVIDIA/cuda-rust). At startup the app loads that PTX through the NVIDIA driver with [cudarc](https://github.com/coreylowman/cudarc). Each frame, `src/compute/pipeline.rs` uploads the camera, the Kerr and accretion-disk parameters and the scene objects. It then launches a kernel with one thread per pixel, which traces that pixel's ray through curved spacetime. `bh_accumulate` (`src/compute/accumulate.rs`) blends successive frames of a still camera, each jittered by a fraction of a pixel, for anti-aliasing and converts the result to 8-bit colour. The frame is then uploaded to the texture that Bevy shows as a fullscreen sprite.
 
-Both modes use the same past-directed null geodesic solver in Cartesian ingoing Kerr–Schild coordinates. The covariant metric is `g = η + Σᵢ 2 Hᵢ lᵢ ⊗ lᵢ`; sequential rank-one inversion retains the cross terms of the combined metric. Each RK4 step evolves position, covariant momentum, and a parallel-transported screen vector using analytic spatial metric derivatives. Geometry and disk thickness limit the step; RK4 step doubling estimates position, momentum and screen errors; invalid stages or failed error/null checks trigger step halving. Horizon excision replaces the old enlarged shadow spheres. Rays that exhaust their iteration budget or fail numerical checks are dark, rather than incorrectly sampling the sky.
+Both modes use the same past-directed null geodesic solver in Cartesian ingoing Kerr–Schild coordinates. The covariant metric is `g = η + Σᵢ 2 Hᵢ lᵢ ⊗ lᵢ`; sequential rank-one inversion retains the cross terms of the combined metric. Each embedded Dormand–Prince 5(4) step evolves position, covariant momentum, and a parallel-transported screen vector using analytic spatial metric derivatives. Geometry and disk thickness limit the step; the difference between the fifth- and fourth-order solutions, formed from the stages, estimates position, momentum and screen errors; invalid stages or failed error/null checks trigger step halving. `--rk4-controller` restores the earlier step-doubling RK4 controller for one release. Horizon excision replaces the old enlarged shadow spheres. Rays that exhaust their iteration budget, fail numerical checks, or wind more than 14 rad around the hole (too close to the critical orbit to classify) are dark, rather than incorrectly sampling the sky.
 
 A single isolated term is the Kerr metric. Multiple terms are an **approximate frozen spacetime**, not an exact double-Kerr vacuum solution: positions and spins are held fixed during each ray trace, and boosts, retarded time, radiation, and relativistic orbital evolution are absent. The construction is suited to separated visual binaries; it is not validated for merger or overlapping strong fields. The Majumdar–Papapetrou alternative describes charged, nonrotating extremal holes and would not preserve this app's spinning neutral-hole scene.
 

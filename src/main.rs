@@ -14,8 +14,22 @@ mod ui;
 
 fn main() {
     let profiling = std::env::args_os().any(|arg| arg == "--profile-renderer");
-    let early_capture = std::env::args_os().any(|arg| arg == "--experiment-early-capture");
-    let far_field = std::env::args_os().any(|arg| arg == "--experiment-far-field");
+    // Turns off guarded single-Kerr early capture, which is on by default.
+    let full_trace = std::env::args_os().any(|arg| arg == "--full-trace");
+    // Capped steps far from the hole, kept for one release after far-field steps became
+    // the default (checklist P1.8).
+    let no_far_field = std::env::args_os().any(|arg| arg == "--no-far-field");
+    // The step-doubling RK4 controller, kept for one release after Dormand–Prince became the default.
+    let rk4 = std::env::args_os().any(|arg| arg == "--rk4-controller");
+    // One midpoint transfer cell per geodesic step, kept for one release after decoupled
+    // transfer became the default (checklist P1.9).
+    let coupled_transfer = std::env::args_os().any(|arg| arg == "--coupled-transfer");
+    // Numerical steps outside the disk's enclosing sphere, kept for one release after
+    // analytic vacuum legs became the default (checklist P1.8).
+    let no_analytic_legs = std::env::args_os().any(|arg| arg == "--no-analytic-legs");
+    // Analytic legs inside that sphere too, up to the band around a thin disk: fewer
+    // steps but no faster on the tested GPU (checklist P1.8).
+    let band_legs = std::env::args_os().any(|arg| arg == "--band-legs");
     let mut window = Window {
         title: "Black Hole".into(),
         resolution: (800u32, 600u32).into(),
@@ -44,8 +58,16 @@ fn main() {
     if profiling {
         compute::profile::install(&mut app);
     }
-    if early_capture || far_field {
-        compute::enable_ray_experiments(&mut app, early_capture, far_field);
+    if full_trace || no_far_field || rk4 || coupled_transfer || no_analytic_legs || band_legs {
+        compute::enable_ray_experiments(
+            &mut app,
+            full_trace,
+            no_far_field,
+            rk4,
+            coupled_transfer,
+            no_analytic_legs,
+            band_legs,
+        );
     }
     app.run();
 }

@@ -44,6 +44,9 @@ interactive prescribed-plasma renderer uses a separate transfer routine.
 All 21 rendering tests (including GPU cases) and 42 compute tests pass.
 The near-critical classification regression now requires zero wrong resolved
 answers, replacing its stale requirement that a counterexample must occur.
+Since the unresolved band (checklist P1.6, `UNRESOLVED_WINDING`), it holds for
+both controllers at step factors 0.11, 0.12 and 0.13. Before the band, RK4
+gave 5/0/9 wrong answers and DP45 1/2/2.
 The trajectory diagnostic still demonstrates failures; passing that diagnostic
 does not mean that its trajectories meet the accuracy targets.
 
@@ -58,14 +61,26 @@ does not mean that its trajectories meet the accuracy targets.
 - **Some production trajectories miss their targets.** The independently
   converged Schwarzschild test at impact 5.3 has position error 1.646e-3
   versus target 1.023e-4, and momentum error 1.500e-5 versus 1e-6. Impact 5.25
-  also fails. A useful experiment is higher-order extrapolation from the
-  coarse/fine RK4 results already computed by the controller: no additional
-  force evaluations, but accuracy, stage/event guards and runtime still need
-  measuring before adoption. Compensated accumulation or selective precision
-  for sensitive rays are subsequent experiments, not established fixes.
-- **The full image still fails.** Current intensity L2 discrepancy is 0.719%;
-  worst intensity error is 2.75% of reference peak and worst relative intensity
-  error above the floor is 24.3%. These are comparisons to an uncertain
+  also fails. Richardson extrapolation of the controller's coarse/fine pair
+  (`fine + (fine − coarse)/15`) was tried on 2026-11-24 and rejected. It made
+  impact 5.3 worse (position 2.127e-3, momentum 1.926e-5, 130 steps) and
+  impact 5.25 worse (4.106e-3 versus 1.584e-3), raised impact 10 from 1.867e-5
+  to 5.682e-5, and left impact 30 unchanged. Loosening `STEP_TOLERANCE` tenfold
+  to 5e-7 left the step counts (128/137) and the baseline errors unchanged. At
+  5e-9 the rays no longer reached their affine span. So on these rays the
+  geometric step limit (0.12 × clearance) sets the step, not the error
+  controller. The step-doubling estimate differences two binary32 end states,
+  so it cannot resolve truncation error below their rounding. The
+  Dormand–Prince 5(4) controller (the default since P1.1b) forms its estimate from
+  the stages. With the same tolerance it reduced impact 5.3 to 5.70e-4 position
+  and 5.12e-6 momentum error, and impact 5.25 to 5.62e-4. That is about three
+  times smaller, but still above target. So part of the miss was truncation.
+  Compensated accumulation or selective precision for sensitive rays remain
+  experiments, not established fixes. [Measurements](../RENDERING_PERFORMANCE.md)
+- **The full image still fails.** Current intensity L2 discrepancy is 0.704%
+  with the default Dormand–Prince controller (0.719% with legacy RK4); worst
+  intensity error is 2.87% of reference peak (2.75%) and worst relative
+  intensity error above the floor is 24.3%. These are comparisons to an uncertain
   reference, not certified errors. After the reference is improved, separate
   path error from transfer quadrature and the discontinuous sigma/emission
   masks. Refine at detected difficult boundaries rather than reducing every

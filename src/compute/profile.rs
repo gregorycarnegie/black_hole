@@ -32,6 +32,20 @@ const SAMPLES: usize = 60;
 const WARMUP: usize = 12;
 const PHASE_FRAMES: usize = SAMPLES + WARMUP;
 pub(super) const RAY_FIELDS: usize = 18;
+/// Exit names in the order of RayExit in the CUDA kernel.
+pub(super) const RAY_EXITS: [&str; 11] = [
+    "iteration_limit",
+    "invalid_camera",
+    "invalid_metric",
+    "horizon",
+    "step_rejected",
+    "affine_stagnation",
+    "object_hit",
+    "escaped",
+    "opaque",
+    "early_capture",
+    "near_critical",
+];
 
 #[derive(Clone, Default, ExtractResource, Resource)]
 #[extract_app(RenderApp)]
@@ -134,27 +148,22 @@ pub(super) fn write_ray_profile(
     data: &[u32],
     experiments: u32,
 ) -> io::Result<()> {
-    // Field order and exit ordinals match RayDiagnostics and RayExit in the CUDA kernel.
-    let reasons = [
-        "iteration_limit",
-        "invalid_camera",
-        "invalid_metric",
-        "horizon",
-        "step_rejected",
-        "affine_stagnation",
-        "object_hit",
-        "escaped",
-        "opaque",
-        "early_capture",
-    ];
+    // Field order matches RayDiagnostics in the CUDA kernel.
     create_dir_all("target")?;
-    let path = match experiments {
-        1 => "target/renderer-rays-early-capture.csv",
-        2 => "target/renderer-rays-far-field.csv",
-        3 => "target/renderer-rays-early-capture-far-field.csv",
-        _ => "target/renderer-rays.csv",
-    };
-    let mut file = BufWriter::new(File::create(path)?);
+    let mut path = String::from("target/renderer-rays");
+    for (bit, name) in [
+        (1, "-full-trace"),
+        (2, "-no-far-field"),
+        (4, "-rk4"),
+        (256, "-no-analytic-legs"),
+        (512, "-band-legs"),
+    ] {
+        if experiments & bit != 0 {
+            path.push_str(name);
+        }
+    }
+    path.push_str(".csv");
+    let mut file = BufWriter::new(File::create(&path)?);
     writeln!(
         file,
         "x,y,iterations,steps,rejected_attempts,near_horizon_steps,far_field_steps,disk_limited_steps,controller_limited_steps,exit,wide_steps,sky_x,sky_y,sky_z,plasma_steps,vacuum_disk_steps,stokes_i,stokes_q,stokes_u,stokes_v"
@@ -187,7 +196,7 @@ pub(super) fn write_ray_profile(
     {
         let x = pixel % width as usize;
         let y = pixel / width as usize;
-        let reason = reasons[exit as usize];
+        let reason = RAY_EXITS[exit as usize];
         let [sky_x, sky_y, sky_z] = [sky_x, sky_y, sky_z].map(f32::from_bits);
         let [stokes_i, stokes_q, stokes_u, stokes_v] =
             [stokes_i, stokes_q, stokes_u, stokes_v].map(f32::from_bits);

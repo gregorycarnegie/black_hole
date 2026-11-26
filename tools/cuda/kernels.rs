@@ -1219,13 +1219,13 @@ fn disk_radius(pos: Vec3, spin: f32, binary: bool) -> f32 {
     )
 }
 
+/// The scene metric and its inverse. Derivatives are not stored: `geodesic_rhs`
+/// contracts them per source (checklist P1.3), and `MetricJet` materializes them for
+/// the diagnostics that need whole matrices.
 #[derive(Clone, Copy, Default)]
 pub struct Metric {
     pub g: Mat4,
     pub inv: Mat4,
-    pub dx: Mat4,
-    pub dy: Mat4,
-    pub dz: Mat4,
     pub clearance: f32,
     pub valid: bool,
 }
@@ -1235,32 +1235,37 @@ fn flat_metric() -> Metric {
     Metric {
         g: ETA,
         inv: ETA,
-        dx: Mat4::default(),
-        dy: Mat4::default(),
-        dz: Mat4::default(),
         clearance: ESCAPE_R,
         valid: true,
     }
 }
 
-#[cuda_device::device]
-fn add_kerr(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
-    add_kerr_fields::<true>(base, x, mass, spin)
+/// One Kerr–Schild source at offset `x`: g += 2h l l with covariant l = (1, ell).
+#[derive(Clone, Copy, Default)]
+struct KerrSource {
+    a: Vec3,
+    a2: f32,
+    ax: f32,
+    raw_r: f32,
+    horizon: f32,
+    r: f32,
+    r2: f32,
+    inv_den: f32,
+    inv_r: f32,
+    inv_r2: f32,
+    inv_r2_a2: f32,
+    h: f32,
+    ell: Vec3,
 }
 
 #[inline(always)]
-fn add_kerr_fields<const DERIVATIVES: bool>(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
-    let mut m = base;
-    if mass <= 0.0 {
-        return m;
-    }
+fn kerr_source(x: Vec3, mass: f32, spin: Vec3) -> KerrSource {
     let inv_spin_scale = 1.0 / (spin.length() / 0.999).max(1.0);
     let a = mass * spin * inv_spin_scale;
     let a2 = a.dot(a);
     let ax = a.dot(x);
     let raw_r = kerr_radius(x, a);
     let horizon = mass + sqrt((mass * mass - a2).max(0.0));
-    m.clearance = m.clearance.min(raw_r - horizon);
     let r = raw_r.max(0.8 * horizon);
     let r2 = r * r;
     let den = r2 * r2 + ax * ax;
@@ -1270,61 +1275,105 @@ fn add_kerr_fields<const DERIVATIVES: bool>(base: Metric, x: Vec3, mass: f32, sp
     let inv_r2_a2 = 1.0 / (r2 + a2);
     let h = mass * r * r2 * inv_den;
     let numerator = r * x - a.cross(x) + (ax * inv_r) * a;
-    let ell = vec4_f_v3(1.0, numerator * inv_r2_a2);
-    let ll = outer(ell, ell);
-    m.g += 2.0 * h * ll;
-    if DERIVATIVES {
-        let inv_dr = 1.0 / (2.0 * r2 - x.dot(x) + a2).max(1.0e-12);
-        let dr = (r * x + (ax * inv_r) * a) * inv_dr;
-        // Constant axes keep the derivative matrices in registers instead of local memory.
-        let derivative = |ej: Vec3, dr_j: f32, a_j: f32| {
-            let dh = h * (3.0 * dr_j * inv_r - (4.0 * r * r2 * dr_j + 2.0 * ax * a_j) * inv_den);
-            let dn = dr_j * x + r * ej - a.cross(ej) + (a_j * inv_r - ax * dr_j * inv_r2) * a;
-            let dl = vec4_f_v3(0.0, (dn - ell.yzw() * 2.0 * r * dr_j) * inv_r2_a2);
-            2.0 * dh * ll + 2.0 * h * (outer(dl, ell) + outer(ell, dl))
-        };
-        m.dx += derivative(vec3(1.0, 0.0, 0.0), dr.x, a.x);
-        m.dy += derivative(vec3(0.0, 1.0, 0.0), dr.y, a.y);
-        m.dz += derivative(vec3(0.0, 0.0, 1.0), dr.z, a.z);
+    KerrSource {
+        a, a2, ax, raw_r, horizon, r, r2, inv_den, inv_r, inv_r2, inv_r2_a2, h,
+        ell: numerator * inv_r2_a2,
     }
+}
+
+/// Gradient of the source's Kerr radius (with r clamped as in `kerr_source`).
+#[inline(always)]
+fn kerr_radius_gradient(s: KerrSource, x: Vec3) -> Vec3 {
+    let inv_dr = 1.0 / (2.0 * s.r2 - x.dot(x) + s.a2).max(1.0e-12);
+    (s.r * x + (s.ax * s.inv_r) * s.a) * inv_dr
+}
+
+#[cuda_device::device]
+fn add_kerr(base: Metric, x: Vec3, mass: f32, spin: Vec3) -> Metric {
+    if mass <= 0.0 {
+        return base;
+    }
+    add_kerr_source(base, kerr_source(x, mass, spin))
+}
+
+#[inline(always)]
+fn add_kerr_source(base: Metric, s: KerrSource) -> Metric {
+    let mut m = base;
+    m.clearance = m.clearance.min(s.raw_r - s.horizon);
+    let ell = vec4_f_v3(1.0, s.ell);
+    m.g += 2.0 * s.h * outer(ell, ell);
     let raised = m.inv * ell;
-    let divisor = 1.0 + 2.0 * h * ell.dot(raised);
+    let divisor = 1.0 + 2.0 * s.h * ell.dot(raised);
     if divisor <= 1.0e-6 {
         m.valid = false;
         return m;
     }
-    m.inv -= (2.0 * h / divisor) * outer(raised, raised);
+    m.inv -= (2.0 * s.h / divisor) * outer(raised, raised);
     m.valid = m.valid && m.inv[0][0] < -1.0e-6;
     m
 }
 
-#[cuda_device::device]
-fn scene_metric(pos: Vec3, objects: &Objects) -> Metric {
-    scene_metric_fields::<true>(pos, objects)
+/// The source's metric derivatives d_x g, d_y g, d_z g as whole matrices.
+#[inline(always)]
+fn kerr_metric_derivatives(x: Vec3, mass: f32, spin: Vec3) -> [Mat4; 3] {
+    if mass <= 0.0 {
+        return [Mat4::default(); 3];
+    }
+    let s = kerr_source(x, mass, spin);
+    let (a, r, h) = (s.a, s.r, s.h);
+    let ell = vec4_f_v3(1.0, s.ell);
+    let ll = outer(ell, ell);
+    let dr = kerr_radius_gradient(s, x);
+    let derivative = |ej: Vec3, dr_j: f32, a_j: f32| {
+        let dh = h * (3.0 * dr_j * s.inv_r - (4.0 * r * s.r2 * dr_j + 2.0 * s.ax * a_j) * s.inv_den);
+        let dn = dr_j * x + r * ej - a.cross(ej) + (a_j * s.inv_r - s.ax * dr_j * s.inv_r2) * a;
+        let dl = vec4_f_v3(0.0, (dn - s.ell * 2.0 * r * dr_j) * s.inv_r2_a2);
+        2.0 * dh * ll + 2.0 * h * (outer(dl, ell) + outer(ell, dl))
+    };
+    [
+        derivative(vec3(1.0, 0.0, 0.0), dr.x, a.x),
+        derivative(vec3(0.0, 1.0, 0.0), dr.y, a.y),
+        derivative(vec3(0.0, 0.0, 1.0), dr.z, a.z),
+    ]
 }
 
-#[inline(always)]
-fn scene_metric_fields<const DERIVATIVES: bool>(pos: Vec3, objects: &Objects) -> Metric {
+#[cuda_device::device]
+fn scene_metric(pos: Vec3, objects: &Objects) -> Metric {
     let mut m = flat_metric();
     let mut i = 0i32;
     while i < objects.num_objects {
         let idx = i as usize;
         let x = pos - objects.pos_radius[idx].xyz();
-        let mass = objects.mass[idx].x.max(0.0);
-        let spin = objects.spin[idx].xyz();
-        m = if DERIVATIVES {
-            add_kerr(m, x, mass, spin)
-        } else {
-            add_kerr_fields::<false>(m, x, mass, spin)
-        };
+        m = add_kerr(m, x, objects.mass[idx].x.max(0.0), objects.spin[idx].xyz());
         i += 1;
     }
     m
 }
 
+/// A metric with its first derivatives as whole matrices, for diagnostics and the
+/// reference `geodesic_rhs_matrix`.
+#[derive(Clone, Copy, Default)]
+pub struct MetricJet {
+    pub m: Metric,
+    pub dx: Mat4,
+    pub dy: Mat4,
+    pub dz: Mat4,
+}
+
+#[inline(always)]
+fn add_kerr_jet(base: MetricJet, x: Vec3, mass: f32, spin: Vec3) -> MetricJet {
+    let [dx, dy, dz] = kerr_metric_derivatives(x, mass, spin);
+    MetricJet {
+        m: add_kerr(base.m, x, mass, spin),
+        dx: base.dx + dx,
+        dy: base.dy + dy,
+        dz: base.dz + dz,
+    }
+}
+
 #[cuda_device::device]
 fn plasma_metric(pos: Vec3, objects: &Objects) -> (Mat4, Mat4) {
-    let m = scene_metric_fields::<false>(pos, objects);
+    let m = scene_metric(pos, objects);
     (m.g, m.inv)
 }
 
@@ -1381,9 +1430,12 @@ pub struct Derivs {
     pub screen: Vec4,
 }
 
-#[cuda_device::device]
-fn geodesic_rhs(ray: Ray, m: Metric) -> Derivs {
-    let k = m.inv * ray.p;
+/// Reference right-hand side from whole derivative matrices. Its arithmetic is the
+/// program `CudaGeodesic.geodesic_rhs_exact_inputs` bounds; `geodesic_rhs` must agree
+/// with it (`bh_test_rhs_forms`).
+#[inline(always)]
+fn geodesic_rhs_matrix(ray: Ray, m: MetricJet) -> Derivs {
+    let k = m.m.inv * ray.p;
     let dx_k = m.dx * k;
     let dy_k = m.dy * k;
     let dz_k = m.dz * k;
@@ -1400,11 +1452,96 @@ fn geodesic_rhs(ray: Ray, m: Metric) -> Derivs {
         pos: k.yzw(),
         p: 0.5 * vec4(0.0, k.dot(dx_k), k.dot(dy_k), k.dot(dz_k)),
         screen: -0.5
-            * (m.inv
+            * (m.m.inv
                 * ((k.y * dx_f + k.z * dy_f + k.w * dz_f)
                     + (ray.screen.y * dx_k + ray.screen.z * dy_k + ray.screen.w * dz_k)
                     - contracted)),
     }
+}
+
+/// Geodesic and screen-transport right-hand side (checklist P1.3). Each source adds
+/// d_i g = 2 d_i h l l + 2h (d_i l l + l d_i l) with l = (1, ell); only the contractions
+/// with k = g^-1 p and the screen vector f are formed, never the matrices. The sum over
+/// sources is the derivative of the superposed metric, and the inverse stays generic.
+#[cuda_device::device]
+fn geodesic_rhs(ray: Ray, m: Metric, objects: &Objects) -> Derivs {
+    let k = m.inv * ray.p;
+    // k . d_i g . k, and sum_i (k^i d_i g f + f^i d_i g k) - (0, k . d_i g . f).
+    let mut force = vec3_splat(0.0);
+    let mut transport = vec4_splat(0.0);
+    let mut i = 0i32;
+    while i < objects.num_objects {
+        let idx = i as usize;
+        let mass = objects.mass[idx].x.max(0.0);
+        if mass > 0.0 {
+            let x = ray.pos - objects.pos_radius[idx].xyz();
+            let s = kerr_source(x, mass, objects.spin[idx].xyz());
+            source_terms(s, x, k, ray.screen, &mut force, &mut transport);
+        }
+        i += 1;
+    }
+    rhs_from_terms(k, m, force, transport)
+}
+
+#[inline(always)]
+fn rhs_from_terms(k: Vec4, m: Metric, force: Vec3, transport: Vec4) -> Derivs {
+    Derivs {
+        pos: k.yzw(),
+        p: 0.5 * vec4_f_v3(0.0, force),
+        screen: -0.5 * (m.inv * transport),
+    }
+}
+
+/// The gradient of the source's h.
+#[inline(always)]
+fn kerr_h_gradient(s: KerrSource, dr: Vec3) -> Vec3 {
+    s.h * (3.0 * s.inv_r * dr - (4.0 * s.r * s.r2 * dr + 2.0 * s.ax * s.a) * s.inv_den)
+}
+
+/// The gradient of ell . v at fixed v.
+#[inline(always)]
+fn ell_gradient(s: KerrSource, x: Vec3, dr: Vec3, v: Vec3) -> Vec3 {
+    let av = s.a.dot(v);
+    let grad_n = (x.dot(v) - s.ax * av * s.inv_r2) * dr + s.r * v - v.cross(s.a)
+        + (av * s.inv_r) * s.a;
+    (grad_n - (2.0 * s.r * s.ell.dot(v)) * dr) * s.inv_r2_a2
+}
+
+/// `source_terms`' force alone, for paths without screen transport.
+#[inline(always)]
+fn source_force(s: KerrSource, x: Vec3, k: Vec4) -> Vec3 {
+    let ks = k.yzw();
+    let dr = kerr_radius_gradient(s, x);
+    let dh = kerr_h_gradient(s, dr);
+    let u = k.x + s.ell.dot(ks);
+    let gk = ell_gradient(s, x, dr, ks);
+    2.0 * u * u * dh + 2.0 * (2.0 * s.h) * u * gk
+}
+
+/// One source's share of `geodesic_rhs`'s contractions.
+#[inline(always)]
+fn source_terms(s: KerrSource, x: Vec3, k: Vec4, f: Vec4, force: &mut Vec3, transport: &mut Vec4) {
+    let (ks, fs) = (k.yzw(), f.yzw());
+    let dr = kerr_radius_gradient(s, x);
+    let dh = kerr_h_gradient(s, dr);
+    // sum_j v_j d_j ell, with n = r x - a × x + (a.x / r) a = (r² + a²) ell.
+    let along = |v: Vec3| {
+        let dv_r = dr.dot(v);
+        let dn = dv_r * x + s.r * v - s.a.cross(v)
+            + (s.a.dot(v) * s.inv_r - s.ax * dv_r * s.inv_r2) * s.a;
+        (dn - s.ell * (2.0 * s.r * dv_r)) * s.inv_r2_a2
+    };
+    let gradient = |v: Vec3| ell_gradient(s, x, dr, v);
+    let u = k.x + s.ell.dot(ks);
+    let w = f.x + s.ell.dot(fs);
+    let (dk_l, df_l) = (along(ks), along(fs));
+    let (gk, gf) = (gradient(ks), gradient(fs));
+    let h2 = 2.0 * s.h;
+    *force += 2.0 * u * u * dh + 2.0 * h2 * u * gk;
+    let on_l = 2.0 * (w * dh.dot(ks) + u * dh.dot(fs) + s.h * (fs.dot(dk_l) + ks.dot(df_l)));
+    let spatial = on_l * s.ell + h2 * (w * dk_l + u * df_l)
+        - (2.0 * u * w * dh + h2 * (w * gk + u * gf));
+    *transport += vec4_f_v3(on_l, spatial);
 }
 
 #[inline(always)]
@@ -1433,14 +1570,18 @@ fn ray_valid(ray: Ray, m: Metric) -> bool {
 
 #[cuda_device::device]
 fn ray_endpoint_valid(ray: Ray, objects: &Objects) -> bool {
-    ray_valid(ray, scene_metric_fields::<false>(ray.pos, objects))
+    ray_valid(ray, scene_metric(ray.pos, objects))
 }
 
 #[inline(always)]
-fn ray_rhs(ray: Ray, m: Metric, gauged: bool) -> Derivs {
-    let mut result = geodesic_rhs(ray, m);
+fn ray_rhs(ray: Ray, m: Metric, gauged: bool, objects: &Objects) -> Derivs {
+    gauge(geodesic_rhs(ray, m, objects), m.inv * ray.p, gauged)
+}
+
+#[inline(always)]
+fn gauge(d: Derivs, k: Vec4, gauged: bool) -> Derivs {
+    let mut result = d;
     if gauged {
-        let k = m.inv * ray.p;
         if k.x.abs() > 1.0e-20 {
             result.screen -= k * (result.screen.x / k.x);
             result.screen.x = 0.0;
@@ -1456,19 +1597,19 @@ fn rk4_stages(ray: Ray, h: f32, k1: Derivs, gauged: bool, objects: &Objects) -> 
     if !ray_valid(r2, m2) {
         return None;
     }
-    let k2 = ray_rhs(r2, m2, gauged);
+    let k2 = ray_rhs(r2, m2, gauged, objects);
     let r3 = rk_state(ray, k2, 0.5 * h);
     let m3 = scene_metric(r3.pos, objects);
     if !ray_valid(r3, m3) {
         return None;
     }
-    let k3 = ray_rhs(r3, m3, gauged);
+    let k3 = ray_rhs(r3, m3, gauged, objects);
     let r4 = rk_state(ray, k3, h);
     let m4 = scene_metric(r4.pos, objects);
     if !ray_valid(r4, m4) {
         return None;
     }
-    let k4 = ray_rhs(r4, m4, gauged);
+    let k4 = ray_rhs(r4, m4, gauged, objects);
     Some(rk_state(
         ray,
         Derivs {
@@ -1483,7 +1624,7 @@ fn rk4_stages(ray: Ray, h: f32, k1: Derivs, gauged: bool, objects: &Objects) -> 
 #[inline(always)]
 fn step_ray(ray: Ray, h: f32, m: Metric, objects: &Objects) -> RayStep {
     if ray_valid(ray, m)
-        && let Some(next) = rk4_stages(ray, h, ray_rhs(ray, m, false), false, objects)
+        && let Some(next) = rk4_stages(ray, h, ray_rhs(ray, m, false, objects), false, objects)
     {
         return RayStep {
             ray: next,
@@ -1505,6 +1646,9 @@ pub struct AdaptiveStep {
     pub h: f32,
     pub error: f32,
     pub accepted: bool,
+    /// d/dλ of the state at the start and end of an accepted Dormand–Prince step, for
+    /// Hermite dense output; zero from the other controllers.
+    pub rates: [Derivs; 2],
 }
 
 #[cuda_device::device]
@@ -1533,10 +1677,11 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
             h: 0.0,
             error: 1.0e30,
             accepted: false,
+            rates: [Derivs::default(); 2],
         };
     }
     // The coarse step, the first half step and every retry start from the same state.
-    let initial_rhs = ray_rhs(ray, *m, gauged);
+    let initial_rhs = ray_rhs(ray, *m, gauged, objects);
     let mut next_h = requested_h;
     for retry in 0..12 {
         let h = next_h;
@@ -1554,7 +1699,7 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
         if !ray_valid(half, half_metric) {
             continue;
         }
-        let half_rhs = ray_rhs(half, half_metric, gauged);
+        let half_rhs = ray_rhs(half, half_metric, gauged, objects);
         let Some(fine) = rk4_stages(half, next_h, half_rhs, gauged, objects) else {
             continue;
         };
@@ -1582,6 +1727,7 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
                 h,
                 error,
                 accepted: true,
+                rates: [Derivs::default(); 2],
             };
         }
     }
@@ -1593,8 +1739,339 @@ fn advance_ray_counting<const DIAGNOSTICS: bool>(
         h: 0.0,
         error: 1.0e30,
         accepted: false,
+        rates: [Derivs::default(); 2],
     }
 }
+
+#[inline(always)]
+fn add_derivs(a: Derivs, w: f32, k: Derivs) -> Derivs {
+    Derivs {
+        pos: a.pos + w * k.pos,
+        p: a.p + w * k.p,
+        screen: a.screen + w * k.screen,
+    }
+}
+
+#[inline(always)]
+fn scale_derivs(w: f32, k: Derivs) -> Derivs {
+    Derivs {
+        pos: w * k.pos,
+        p: w * k.p,
+        screen: w * k.screen,
+    }
+}
+
+/// The metric at `r` and, when the ray is valid there, its right-hand side. With one or
+/// two holes each source is computed once for both (checklist P1.3); the metric is
+/// built in `scene_metric`'s order, so it is the same bits.
+#[cuda_device::device]
+fn metric_and_rhs(r: Ray, gauged: bool, objects: &Objects) -> (Metric, Option<Derivs>) {
+    if objects.num_objects <= 2 {
+        let slot = |i: usize| {
+            let live = objects.num_objects > i as i32 && objects.mass[i].x > 0.0;
+            let x = r.pos - objects.pos_radius[i].xyz();
+            let s = if live {
+                kerr_source(x, objects.mass[i].x, objects.spin[i].xyz())
+            } else {
+                KerrSource::default()
+            };
+            (live, x, s)
+        };
+        let (live0, x0, s0) = slot(0);
+        let (live1, x1, s1) = slot(1);
+        let mut m = flat_metric();
+        if live0 {
+            m = add_kerr_source(m, s0);
+        }
+        if live1 {
+            m = add_kerr_source(m, s1);
+        }
+        if !ray_valid(r, m) {
+            return (m, None);
+        }
+        let k = m.inv * r.p;
+        let (mut force, mut transport) = (vec3_splat(0.0), vec4_splat(0.0));
+        if live0 {
+            source_terms(s0, x0, k, r.screen, &mut force, &mut transport);
+        }
+        if live1 {
+            source_terms(s1, x1, k, r.screen, &mut force, &mut transport);
+        }
+        return (m, Some(gauge(rhs_from_terms(k, m, force, transport), k, gauged)));
+    }
+    let m = scene_metric(r.pos, objects);
+    if !ray_valid(r, m) {
+        return (m, None);
+    }
+    (m, Some(ray_rhs(r, m, gauged, objects)))
+}
+
+/// Render paths (checklist P1.2). `SINGLE`: exactly one source. `SINGLE_SCALAR`: one
+/// source and thermal intensity alone, which never reads the screen vector, so it is
+/// not transported and the step error omits it.
+const GENERIC: u8 = 0;
+const SINGLE: u8 = 1;
+const SINGLE_SCALAR: u8 = 2;
+
+/// `metric_and_rhs` for exactly one source: the operations of its two-slot path with
+/// slot 1 empty, so the same bits, without slot 1's live state.
+#[cuda_device::device]
+fn metric_and_rhs_one(r: Ray, gauged: bool, objects: &Objects) -> (Metric, Option<Derivs>) {
+    single_metric_and_rhs::<false>(r, gauged, objects)
+}
+
+/// `metric_and_rhs_one` without screen transport: the screen derivative is zero.
+#[cuda_device::device]
+fn metric_and_rhs_scalar(r: Ray, objects: &Objects) -> (Metric, Option<Derivs>) {
+    single_metric_and_rhs::<true>(r, false, objects)
+}
+
+#[inline(always)]
+fn single_metric_and_rhs<const SCALAR: bool>(r: Ray, gauged: bool, objects: &Objects) -> (Metric, Option<Derivs>) {
+    let live = objects.mass[0].x > 0.0;
+    let x = r.pos - objects.pos_radius[0].xyz();
+    let s = if live {
+        kerr_source(x, objects.mass[0].x, objects.spin[0].xyz())
+    } else {
+        KerrSource::default()
+    };
+    let mut m = flat_metric();
+    if live {
+        m = add_kerr_source(m, s);
+    }
+    if !ray_valid(r, m) {
+        return (m, None);
+    }
+    let k = m.inv * r.p;
+    if SCALAR {
+        let force = if live { source_force(s, x, k) } else { vec3_splat(0.0) };
+        return (m, Some(scalar_rhs(k, force)));
+    }
+    let (mut force, mut transport) = (vec3_splat(0.0), vec4_splat(0.0));
+    if live {
+        source_terms(s, x, k, r.screen, &mut force, &mut transport);
+    }
+    (m, Some(gauge(rhs_from_terms(k, m, force, transport), k, gauged)))
+}
+
+#[inline(always)]
+fn scalar_rhs(k: Vec4, force: Vec3) -> Derivs {
+    Derivs {
+        pos: k.yzw(),
+        p: 0.5 * vec4_f_v3(0.0, force),
+        screen: vec4_splat(0.0),
+    }
+}
+
+#[inline(always)]
+fn stage_metric_and_rhs<const PATH: u8>(r: Ray, gauged: bool, objects: &Objects) -> (Metric, Option<Derivs>) {
+    match PATH {
+        SINGLE => metric_and_rhs_one(r, gauged, objects),
+        SINGLE_SCALAR => metric_and_rhs_scalar(r, objects),
+        _ => metric_and_rhs(r, gauged, objects),
+    }
+}
+
+/// The right-hand side at a ray whose metric `m` is already known.
+#[inline(always)]
+fn first_stage<const PATH: u8>(ray: Ray, m: Metric, gauged: bool, objects: &Objects) -> Derivs {
+    if PATH == SINGLE_SCALAR {
+        let k = m.inv * ray.p;
+        let mass = objects.mass[0].x.max(0.0);
+        let force = if mass > 0.0 {
+            let x = ray.pos - objects.pos_radius[0].xyz();
+            source_force(kerr_source(x, mass, objects.spin[0].xyz()), x, k)
+        } else {
+            vec3_splat(0.0)
+        };
+        return scalar_rhs(k, force);
+    }
+    ray_rhs(ray, m, gauged, objects)
+}
+
+#[inline(always)]
+fn dp_stage<const PATH: u8>(ray: Ray, d: Derivs, h: f32, gauged: bool, objects: &Objects) -> Option<Derivs> {
+    stage_metric_and_rhs::<PATH>(rk_state(ray, d, h), gauged, objects).1
+}
+
+#[inline(always)]
+fn relative_size(e: Vec4, y: Vec4) -> f32 {
+    let d = e.abs() / vec4_splat(1.0).max(y.abs());
+    d.x.max(d.y).max(d.z.max(d.w))
+}
+
+/// Dormand–Prince 5(4) tableau: stage rows, fifth-order weights over k1–k6 and error
+/// weights (fifth minus fourth order) over k1–k7. `verification/BlackHole/DormandPrince.lean`
+/// proves the order conditions; `tests/dormand_prince_tableau.rs` checks these literals
+/// against it.
+const DP_A: [[f32; 5]; 5] = [
+    [1.0 / 5.0, 0.0, 0.0, 0.0, 0.0],
+    [3.0 / 40.0, 9.0 / 40.0, 0.0, 0.0, 0.0],
+    [44.0 / 45.0, -56.0 / 15.0, 32.0 / 9.0, 0.0, 0.0],
+    [19372.0 / 6561.0, -25360.0 / 2187.0, 64448.0 / 6561.0, -212.0 / 729.0, 0.0],
+    [9017.0 / 3168.0, -355.0 / 33.0, 46732.0 / 5247.0, 49.0 / 176.0, -5103.0 / 18656.0],
+];
+const DP_B: [f32; 6] = [35.0 / 384.0, 0.0, 500.0 / 1113.0, 125.0 / 192.0, -2187.0 / 6784.0, 11.0 / 84.0];
+const DP_E: [f32; 7] = [
+    71.0 / 57600.0, 0.0, -71.0 / 16695.0, 71.0 / 1920.0, -17253.0 / 339200.0, 22.0 / 525.0, -1.0 / 40.0,
+];
+
+/// The renderer's controller (checklist P1.1/P1.1b): embedded Dormand–Prince 5(4), advancing the fifth-order
+/// solution. Six metric evaluations per first-try step against eleven for step doubling.
+/// No FSAL: callers rewrite `screen` between steps, and the endpoint metric is reused anyway.
+#[inline(always)]
+fn advance_ray_dp45<const DIAGNOSTICS: bool, const PATH: u8>(
+    ray: Ray,
+    requested_h: f32,
+    m: &mut Metric,
+    gauged: bool,
+    objects: &Objects,
+    rejected: &mut u32,
+) -> AdaptiveStep {
+    if !(requested_h > 0.0 && requested_h < 1.0e8 && ray_valid(ray, *m)) {
+        return AdaptiveStep {
+            ray,
+            h: 0.0,
+            error: 1.0e30,
+            accepted: false,
+            rates: [Derivs::default(); 2],
+        };
+    }
+    let k1 = first_stage::<PATH>(ray, *m, gauged, objects);
+    let mut next_h = requested_h;
+    for retry in 0..12 {
+        let h = next_h;
+        next_h = 0.5 * h;
+        let Some(k2) = dp_stage::<PATH>(ray, scale_derivs(DP_A[0][0], k1), h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(scale_derivs(DP_A[1][0], k1), DP_A[1][1], k2);
+        let Some(k3) = dp_stage::<PATH>(ray, d, h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(
+            add_derivs(scale_derivs(DP_A[2][0], k1), DP_A[2][1], k2),
+            DP_A[2][2],
+            k3,
+        );
+        let Some(k4) = dp_stage::<PATH>(ray, d, h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(
+            add_derivs(
+                add_derivs(scale_derivs(DP_A[3][0], k1), DP_A[3][1], k2),
+                DP_A[3][2],
+                k3,
+            ),
+            DP_A[3][3],
+            k4,
+        );
+        let Some(k5) = dp_stage::<PATH>(ray, d, h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(
+            add_derivs(
+                add_derivs(
+                    add_derivs(scale_derivs(DP_A[4][0], k1), DP_A[4][1], k2),
+                    DP_A[4][2],
+                    k3,
+                ),
+                DP_A[4][3],
+                k4,
+            ),
+            DP_A[4][4],
+            k5,
+        );
+        let Some(k6) = dp_stage::<PATH>(ray, d, h, gauged, objects) else {
+            continue;
+        };
+        let d = add_derivs(
+            add_derivs(
+                add_derivs(
+                    add_derivs(scale_derivs(DP_B[0], k1), DP_B[2], k3),
+                    DP_B[3],
+                    k4,
+                ),
+                DP_B[4],
+                k5,
+            ),
+            DP_B[5],
+            k6,
+        );
+        let next = rk_state(ray, d, h);
+        let (metric, k7) = stage_metric_and_rhs::<PATH>(next, gauged, objects);
+        let Some(k7) = k7 else {
+            continue;
+        };
+        // Difference between the fifth- and fourth-order solutions, formed directly
+        // from the stages so it is not lost to binary32 rounding of the two states.
+        let e = scale_derivs(
+            h,
+            add_derivs(
+                add_derivs(
+                    add_derivs(
+                        add_derivs(
+                            add_derivs(scale_derivs(DP_E[0], k1), DP_E[2], k3),
+                            DP_E[3],
+                            k4,
+                        ),
+                        DP_E[4],
+                        k5,
+                    ),
+                    DP_E[5],
+                    k6,
+                ),
+                DP_E[6],
+                k7,
+            ),
+        );
+        let error = relative_size(vec4_v3_f(e.pos, 0.0), vec4_v3_f(next.pos, 0.0))
+            .max(relative_size(e.p, next.p).max(relative_size(e.screen, next.screen)));
+        let null_error = next.p.dot(metric.inv * next.p).abs() / next.p.dot(next.p).max(1.0e-10);
+        if error <= STEP_TOLERANCE
+            && null_error < 2.0e-4
+            && (next.pos.x != ray.pos.x || next.pos.y != ray.pos.y || next.pos.z != ray.pos.z)
+        {
+            if DIAGNOSTICS {
+                *rejected += retry;
+            }
+            *m = metric;
+            return AdaptiveStep {
+                ray: next,
+                h,
+                error,
+                accepted: true,
+                rates: [k1, k7],
+            };
+        }
+    }
+    if DIAGNOSTICS {
+        *rejected += 12;
+    }
+    AdaptiveStep {
+        ray,
+        h: 0.0,
+        error: 1.0e30,
+        accepted: false,
+        rates: [Derivs::default(); 2],
+    }
+}
+
+/// Angle between two positions as seen from the origin.
+#[inline(always)]
+fn swept_angle(a: Vec3, b: Vec3) -> f32 {
+    atan2_arith(a.cross(b).length(), a.dot(b))
+}
+
+/// Unresolved band (checklist P1.6): a ray that has swept more than this angle around
+/// the origin ends unresolved rather than captured or escaped. Near the photon sphere
+/// the winding grows like -ln|margin|, where margin = (E² - V_max)/E², so the band is
+/// about |margin| < 6e-5 for escapes and 1.5e-5 for captures, whatever the controller.
+/// In the Schwarzschild classification test, every wrong answer from either controller
+/// at step factors 0.11-0.13 had swept at least 16.1 rad: e^2.1 ≈ 8 times inside the band.
+/// shortcut: winding is measured about the origin, the hole in the single-source scenes
+/// it was validated on; binaries get no calibrated band.
+const UNRESOLVED_WINDING: f32 = 14.0;
 
 #[inline(always)]
 fn advance_ray(ray: Ray, requested_h: f32, mut m: Metric, objects: &Objects) -> AdaptiveStep {
@@ -1723,7 +2200,8 @@ fn absorption_integral(alpha: f32, ds: f32) -> f32 {
 fn polarized_cell(j: Vec4, alpha: f32, rho: Vec3, ds: f32) -> Vec4 {
     let integral = absorption_integral(alpha, ds);
     let w = rho.length();
-    if w * ds < 1.0e-5 {
+    // Skipping the in-cell turn costs w ds / 2 of the polarized emission.
+    if w * ds < 1.0e-7 {
         return j * integral;
     }
     let axis = rho * (1.0 / w);
@@ -1736,6 +2214,52 @@ fn polarized_cell(j: Vec4, alpha: f32, rho: Vec3, ds: f32) -> Vec4 {
         j.x * integral,
         integral * parallel + ic * perpendicular + is * axis.cross(perpendicular),
     )
+}
+
+/// Decoupled transfer (checklist P1.9): most constant cells one geodesic step's plasma
+/// is split into. Longer steps through the slab left the thin-disk Stokes error twice
+/// the coupled scheme's at 32 cells; at 8 it matches, for 3% more steps.
+const MAX_TRANSFER_CELLS: u32 = 8;
+
+/// Longest decoupled transfer cell as a fraction of the radius, for emissivity and
+/// Doppler variation along the orbit: the hot flow's quarter scale height (0.125 r) left
+/// a p99 relative intensity error of 2.4e-4; 0.05 r brings it to 8.9e-5.
+const ORBIT_CELL: f32 = 0.05;
+
+/// Cubic Hermite dense output at fraction `u` of an accepted step of length `h`.
+#[inline(always)]
+fn hermite_ray(a: Ray, b: Ray, rates: [Derivs; 2], h: f32, u: f32) -> Ray {
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let (w0, w1) = (2.0 * u3 - 3.0 * u2 + 1.0, h * (u3 - 2.0 * u2 + u));
+    let (w2, w3) = (3.0 * u2 - 2.0 * u3, h * (u3 - u2));
+    let [r0, r1] = rates;
+    Ray {
+        pos: w0 * a.pos + w1 * r0.pos + w2 * b.pos + w3 * r1.pos,
+        p: w0 * a.p + w1 * r0.p + w2 * b.p + w3 * r1.p,
+        screen: w0 * a.screen + w1 * r0.screen + w2 * b.screen + w3 * r1.screen,
+    }
+}
+
+/// Adds one constant-coefficient plasma cell of length `ds` behind the accumulated
+/// foreground (front to back along the backward ray).
+#[inline(always)]
+fn composite_plasma(
+    plasma: &Plasma,
+    ds: f32,
+    polarized: bool,
+    rgb: &mut Vec3,
+    stokes: &mut Vec4,
+    transmission: &mut f32,
+    foreground: &mut Mat3,
+) {
+    if polarized {
+        let cell = polarized_cell(plasma.j, plasma.alpha, plasma.rho, ds);
+        *stokes += *transmission * vec4_f_v3(cell.x, *foreground * cell.yzw());
+        *foreground = *foreground * faraday_rotation(plasma.rho, ds);
+    }
+    *rgb += *transmission * plasma.rgb * absorption_integral(plasma.alpha, ds);
+    *transmission *= exp(-plasma.alpha * ds);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2273,10 +2797,91 @@ fn pack_rgba8(c: Vec4) -> u32 {
 
 // -- Production Kernels ------------------------------------------------------
 
-const EARLY_CAPTURE_CLEARANCE: f32 = 0.5;
+/// The horizon clearance at which the early-capture guard is first tried: where the
+/// ray comes within 0.05 of the disk's inner edge, the outermost place it can pass.
+/// Each later try waits until the clearance has halved.
+#[inline(always)]
+fn capture_entry_clearance(disk_inner: f32, spin: f32) -> f32 {
+    disk_inner - 0.05 - (1.0 + sqrt((1.0 - spin * spin).max(0.0)))
+}
+
+/// Most pieces of [horizon, r] on which the early-capture guard bounds the radial
+/// potential. It tries 1, 2, 4 and then 8 equal pieces, so a ray far from a turning
+/// point pays for one.
+const CAPTURE_PIECES: u32 = 8;
+
+/// Relative margin the fast capture estimate demands before the interval certificate.
+const CAPTURE_MARGIN: f64 = 1.0e-3;
+
+/// Lower bound on R(s) = (s^2 + A)^2 - Delta(s) K, with A = a^2 - a lambda, for
+/// |s - c| <= w and c >= 0, from its exact Taylor expansion about c: the larger of
+/// the two bounds of `null_radial_positive_near` (KerrCapture.lean).
+#[inline(always)]
+fn radial_piece_bound(c: f64, w: f64, aa: f64, k: f64, a2: f64) -> f64 {
+    let p = c * c + aa;
+    let r0 = p * p - (c * c - 2.0 * c + a2) * k;
+    let r1 = 4.0 * c * p - (2.0 * c - 2.0) * k;
+    let h = 6.0 * c * c + 2.0 * aa - k;
+    let low = r0 - 4.0 * c * w * w * w;
+    let linear = low - r1.abs() * w + h.min(0.0) * w * w;
+    if h > 0.0 { linear.max(low - r1 * r1 / (4.0 * h)) } else { linear }
+}
+
+/// Whether `radial_piece_bound` exceeds `floor` on each of `n` equal pieces of [lo, hi].
+#[inline(always)]
+fn radial_pieces_exceed(lo: f64, hi: f64, n: u32, aa: f64, k: f64, a2: f64, floor: f64) -> bool {
+    let width = (hi - lo) / f64::from(n);
+    let mut j = 0u32;
+    while j < n {
+        let c = lo + (f64::from(j) + 0.5) * width;
+        if !(radial_piece_bound(c, 0.5 * width, aa, k, a2) > floor) {
+            return false;
+        }
+        j += 1;
+    }
+    true
+}
+
+/// Whether `radial_piece_certified` holds on each of `n` pieces of [lo, hi]. The
+/// pieces share their knots, so they cover [lo, hi].
+#[inline(always)]
+fn radial_pieces_certified(lo: f64, hi: f64, n: u32, aa: Bound, k: Bound, a2: Bound) -> bool {
+    let mut s0 = lo;
+    let mut j = 1u32;
+    while j <= n {
+        let s1 = if j == n { hi } else { lo + (hi - lo) * (f64::from(j) / f64::from(n)) };
+        if !radial_piece_certified(s0, s1, aa, k, a2) {
+            return false;
+        }
+        s0 = s1;
+        j += 1;
+    }
+    true
+}
+
+/// Interval twin of `radial_piece_bound` on the piece [s0, s1]: whether either bound
+/// of `null_radial_positive_near` is certainly positive there.
+#[inline(always)]
+fn radial_piece_certified(s0: f64, s1: f64, aa: Bound, k: Bound, a2: Bound) -> bool {
+    let half = Bound::point(0.5);
+    let two = Bound::point(2.0);
+    let four = Bound::point(4.0);
+    let c = Bound::point(s0).add(Bound::point(s1)).mul(half);
+    let w = Bound::point(s1).sub(Bound::point(s0)).mul(half);
+    let c2 = c.sq();
+    let p = c2.add(aa);
+    let r0 = p.sq().sub(c2.sub(two.mul(c)).add(a2).mul(k));
+    let r1 = four.mul(c).mul(p).sub(two.mul(c).sub(two).mul(k));
+    let h = Bound::point(6.0).mul(c2).add(two.mul(aa)).sub(k);
+    let w2 = w.sq();
+    let low = r0.sub(four.mul(c).mul(w2.mul(w)));
+    let linear = low.sub(r1.abs().mul(w)).add(h.min_zero().mul(w2));
+    linear.lo > 0.0 || (h.lo > 0.0 && four.mul(h).mul(low).sub(r1.sq()).lo > 0.0)
+}
 
 #[inline(always)]
-fn vacuum_radius_sq(objects: &Objects, disk: &Disk) -> f32 {
+/// Squared radius of a sphere enclosing the disk and the hole, at least `floor`.
+fn vacuum_radius_sq(objects: &Objects, disk: &Disk, floor: f32) -> f32 {
     let body = objects.pos_radius[0];
     if objects.num_objects != 1 || disk.binary_enabled != 0 || objects.mass[0].x != 1.0
         || body.x != 0.0 || body.y != 0.0 || body.z != 0.0
@@ -2292,7 +2897,7 @@ fn vacuum_radius_sq(objects: &Objects, disk: &Disk) -> f32 {
     };
     let warp = if disk.model == 3 { 1.01 * disk.r2 } else { 0.0 };
     let height = 4.0 * (aspect * disk.r2).max(1.0e-4) + warp;
-    (1.02 * (radius_sq + height * height)).max(body.w * body.w).max(64.0 * 64.0)
+    (1.02 * (radius_sq + height * height)).max(body.w * body.w).max(floor * floor)
 }
 
 #[inline(always)]
@@ -2323,9 +2928,127 @@ fn supports_early_capture(objects: &Objects, disk: &Disk) -> bool {
         && disk.spin.abs() <= 0.995
 }
 
+/// The next binary64 value above `x`; NaN and +inf are returned unchanged.
+#[inline(always)]
+fn ulp_up(x: f64) -> f64 {
+    if !(x < f64::INFINITY) {
+        x
+    } else if x == 0.0 {
+        f64::from_bits(1)
+    } else if x > 0.0 {
+        f64::from_bits(x.to_bits() + 1)
+    } else {
+        f64::from_bits(x.to_bits() - 1)
+    }
+}
+
+#[inline(always)]
+fn ulp_down(x: f64) -> f64 {
+    -ulp_up(-x)
+}
+
+/// Closed binary64 interval for the early-capture guard. Each operation rounds to
+/// nearest with an explicit `_rn` intrinsic, so nothing is contracted into an FMA,
+/// then steps one ulp outward. IEEE 754 round-to-nearest is within half an ulp, so
+/// the result encloses the exact real value. `src/certified/capture.rs` repeats the
+/// guard with exact-dyadic-checked intervals on the CPU.
+#[derive(Clone, Copy)]
+struct Bound {
+    lo: f64,
+    hi: f64,
+}
+
+impl Bound {
+    #[inline(always)]
+    fn point(x: f64) -> Self {
+        Bound { lo: x, hi: x }
+    }
+
+    #[inline(always)]
+    fn add(self, o: Self) -> Self {
+        Bound {
+            lo: ulp_down(cuda_device::float::add_rn_f64(self.lo, o.lo)),
+            hi: ulp_up(cuda_device::float::add_rn_f64(self.hi, o.hi)),
+        }
+    }
+
+    #[inline(always)]
+    fn sub(self, o: Self) -> Self {
+        self.add(Bound { lo: -o.hi, hi: -o.lo })
+    }
+
+    #[inline(always)]
+    fn hull(p: [f64; 4]) -> Self {
+        Bound {
+            lo: ulp_down(p[0].min(p[1]).min(p[2].min(p[3]))),
+            hi: ulp_up(p[0].max(p[1]).max(p[2].max(p[3]))),
+        }
+    }
+
+    #[inline(always)]
+    fn mul(self, o: Self) -> Self {
+        use cuda_device::float::mul_rn_f64 as m;
+        Self::hull([m(self.lo, o.lo), m(self.lo, o.hi), m(self.hi, o.lo), m(self.hi, o.hi)])
+    }
+
+    /// Requires a divisor that excludes zero; the guard checks that first.
+    #[inline(always)]
+    fn div(self, o: Self) -> Self {
+        use cuda_device::float::div_rn_f64 as d;
+        // n / d = (-n) / (-d), so take a positive divisor; then two quotients suffice.
+        let (n, o) = if o.lo > 0.0 { (self, o) } else { (Bound { lo: -self.hi, hi: -self.lo }, Bound { lo: -o.hi, hi: -o.lo }) };
+        let lo = if n.lo >= 0.0 { d(n.lo, o.hi) } else { d(n.lo, o.lo) };
+        let hi = if n.hi >= 0.0 { d(n.hi, o.lo) } else { d(n.hi, o.hi) };
+        Bound { lo: ulp_down(lo), hi: ulp_up(hi) }
+    }
+
+    #[inline(always)]
+    fn sq(self) -> Self {
+        let a = cuda_device::float::mul_rn_f64(self.lo, self.lo);
+        let b = cuda_device::float::mul_rn_f64(self.hi, self.hi);
+        if self.lo >= 0.0 {
+            Bound { lo: ulp_down(a).max(0.0), hi: ulp_up(b) }
+        } else if self.hi <= 0.0 {
+            Bound { lo: ulp_down(b).max(0.0), hi: ulp_up(a) }
+        } else {
+            Bound { lo: 0.0, hi: ulp_up(a.max(b)) }
+        }
+    }
+
+    /// Exact: no rounding.
+    #[inline(always)]
+    fn abs(self) -> Self {
+        if self.lo >= 0.0 {
+            self
+        } else if self.hi <= 0.0 {
+            Bound { lo: -self.hi, hi: -self.lo }
+        } else {
+            Bound { lo: 0.0, hi: (-self.lo).max(self.hi) }
+        }
+    }
+
+    /// min(x, 0); exact.
+    #[inline(always)]
+    fn min_zero(self) -> Self {
+        Bound { lo: self.lo.min(0.0), hi: self.hi.min(0.0) }
+    }
+
+    /// For an argument whose exact value is nonnegative.
+    #[inline(always)]
+    fn sqrt(self) -> Self {
+        Bound {
+            lo: ulp_down(cuda_device::float::sqrt_rn_f64(self.lo.max(0.0))).max(0.0),
+            hi: ulp_up(cuda_device::float::sqrt_rn_f64(self.hi.max(0.0))),
+        }
+    }
+}
+
+// Kept out of line: inlined into the render loop it costs about 0.8 ms per frame.
 #[cuda_device::device]
+#[inline(never)]
 fn inward_kerr_capture(ray: Ray, velocity: Vec3, spin: f32, disk_inner: f32) -> bool {
-    // Use binary64 for the guard. The incoming integrated state is binary32.
+    // Fast binary64 estimate with margins; a ray it accepts must then pass the interval
+    // certificate, which runs once per captured ray (f64 is slow on consumer GPUs).
     let a = f64::from(spin);
     let a2 = a * a;
     let horizon = 1.0 + cuda_device::float::sqrt_rn_f64(1.0 - a2);
@@ -2358,17 +3081,545 @@ fn inward_kerr_capture(ray: Ray, velocity: Vec3, spin: f32, disk_inner: f32) -> 
     let sigma_dr = r
         * (x * f64::from(velocity.x) + (1.0 + a2 / r2) * y * f64::from(velocity.y)
             + z * f64::from(velocity.z)) / energy.abs();
-    let horizon_p = horizon * horizon + a2 - a * lambda;
-    let here_p = r2 + a2 - a * lambda;
+    let aa = a2 - a * lambda;
+    let here_p = r2 + aa;
     let barrier = (r - horizon) * (r + horizon - 2.0) * carter;
     let scale = 1.0 + here_p * here_p + barrier;
     let radial = here_p * here_p - barrier;
-    // P(s) increases and Delta(s) <= Delta(r) for horizon <= s <= r.
-    // Require a positive lower bound on R throughout that interval and a consistent inward tangent.
-    horizon_p > 0.0
-        && horizon_p * horizon_p - barrier > 0.02 * scale
-        && sigma_dr < -0.05 * r2
-        && (sigma_dr * sigma_dr - radial).abs() < 0.004 * scale
+    // Require a consistent inward tangent, then a positive lower bound on R on each
+    // piece of [horizon, r].
+    if !(sigma_dr < -0.05 * r2 && (sigma_dr * sigma_dr - radial).abs() < 0.004 * scale) {
+        return false;
+    }
+    let mut pieces = 1u32;
+    while !radial_pieces_exceed(horizon, r, pieces, aa, carter, a2, CAPTURE_MARGIN * scale) {
+        if pieces == CAPTURE_PIECES {
+            return false;
+        }
+        pieces *= 2;
+    }
+    kerr_capture_certified(ray, spin, disk_inner)
+}
+
+/// Gauss–Legendre nodes and weights on [-1, 1], positive half, for the vacuum legs.
+const LEG_GL_NODES: [f64; 4] = [
+    0.183_434_642_495_649_8,
+    0.525_532_409_916_329,
+    0.796_666_477_413_626_7,
+    0.960_289_856_497_536_3,
+];
+const LEG_GL_WEIGHTS: [f64; 4] = [
+    0.362_683_783_378_362,
+    0.313_706_645_877_887_3,
+    0.222_381_034_453_374_5,
+    0.101_228_536_290_376_3,
+];
+const LEG_POLAR_STEPS: u32 = 16;
+const LEG_RADIAL_FLOOR: f64 = 0.5;
+const LEG_POLAR_FLOOR: f64 = 1.0e-6;
+const LEG_INNER_MIN: f64 = 12.0;
+const LEG_BAND_MARGIN: f32 = 2.0;
+
+
+/// sin x and cos x in binary64 for |x| up to about 1e9 (`separated::sin_cos`).
+#[inline(always)]
+fn sin_cos_f64(x: f64) -> (f64, f64) {
+    const PIO2_LO: f64 = 6.123_233_995_736_766e-17;
+    let k = (x * core::f64::consts::FRAC_2_PI + if x >= 0.0 { 0.5 } else { -0.5 }) as i64;
+    let kf = k as f64;
+    let r = (x - kf * core::f64::consts::FRAC_PI_2) - kf * PIO2_LO;
+    let r2 = r * r;
+    let s = r
+        * (1.0
+            + r2 * (-1.0 / 6.0
+                + r2 * (1.0 / 120.0
+                    + r2 * (-1.0 / 5040.0
+                        + r2 * (1.0 / 362_880.0
+                            + r2 * (-1.0 / 39_916_800.0
+                                + r2 * (1.0 / 6_227_020_800.0
+                                    + r2 * (-1.0 / 1_307_674_368_000.0
+                                        + r2 / 355_687_428_096_000.0))))))));
+    let c = 1.0
+        + r2 * (-0.5
+            + r2 * (1.0 / 24.0
+                + r2 * (-1.0 / 720.0
+                    + r2 * (1.0 / 40_320.0
+                        + r2 * (-1.0 / 3_628_800.0
+                            + r2 * (1.0 / 479_001_600.0
+                                + r2 * (-1.0 / 87_178_291_200.0
+                                    + r2 / 20_922_789_888_000.0)))))));
+    match k & 3 {
+        0 => (s, c),
+        1 => (c, -s),
+        2 => (-s, -c),
+        _ => (-c, s),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LegEnd {
+    ok: bool,
+    /// Reached `ESCAPE_R` going out, rather than the inner sphere going in or the band.
+    escaped: bool,
+    /// Angle swept by the polar direction.
+    arc: f32,
+    pos: Vec3,
+    p: Vec4,
+}
+
+#[inline(always)]
+fn det3_f64(m: [[f64; 3]; 3]) -> f64 {
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+}
+
+/// The radial integrands at piece coordinate x (`separated::escape::radial_rate`):
+/// x = u, or with `substituted` x = t and u = u1 - t². Returns u, dτ/dx and the
+/// quantity that must stay above `LEG_RADIAL_FLOOR`.
+#[inline(always)]
+fn leg_radial_rate(x: f32, substituted: bool, u1: f32, q: [f32; 4], f: [f32; 3]) -> (f32, f32, f32) {
+    if substituted {
+        let u = u1 - x * x;
+        let g = -(q[0] + u * (q[1] + u * (q[2] + u * q[3])));
+        (u, 2.0 / sqrt(g), g * u1)
+    } else {
+        let fu = 1.0 + x * x * (f[0] + x * (f[1] + x * f[2]));
+        (x, 1.0 / sqrt(fu), fu)
+    }
+}
+
+/// Mino time and ∫ a(2r - aλ)/Δ dτ over piece coordinates `from` to `to`
+/// (`separated::escape::piece_sum`).
+#[inline(always)]
+fn leg_piece_sum(
+    from: f64,
+    to: f64,
+    substituted: bool,
+    u1: f32,
+    q: [f32; 4],
+    f: [f32; 3],
+    a: f32,
+    lambda: f32,
+) -> (bool, f64, f64) {
+    let (mid, half) = (0.5 * (to + from), 0.5 * (to - from).abs());
+    let (mid32, half32) = (mid as f32, half as f32);
+    let (mut mino, mut phi, mut floor) = (0.0_f32, 0.0_f32, 1.0_f32);
+    let mut i = 0;
+    while i < 8 {
+        let node = LEG_GL_NODES[i / 2] as f32;
+        let x = mid32 + if i % 2 == 0 { -1.0 } else { 1.0 } * half32 * node;
+        let (u, rate, size) = leg_radial_rate(x, substituted, u1, q, f);
+        floor = floor.min(size);
+        let w = LEG_GL_WEIGHTS[i / 2] as f32 * rate;
+        mino += w;
+        phi += w * a * u * (2.0 - a * lambda * u) / (1.0 - 2.0 * u + a * a * u * u);
+        i += 1;
+    }
+    (f64::from(floor) > LEG_RADIAL_FLOOR, f64::from(mino) * half, f64::from(phi) * half)
+}
+
+/// Mino time until |cos θ| first falls to `band` (`separated::escape::band_time`);
+/// negative where that function returns `None`.
+#[inline(always)]
+fn leg_band_time(cos: f64, rate: f64, band: f64, a2: f64, lambda: f64, eta: f64) -> f64 {
+    use cuda_device::float::sqrt_rn_f64 as sqrt64;
+    let beta = eta + lambda * lambda - a2;
+    if !(eta > 0.0) {
+        let root = sqrt64(beta * beta + 4.0 * a2 * eta);
+        let low = -2.0 * eta / (root - beta);
+        return if low >= band * band { f64::INFINITY } else { -1.0 };
+    }
+    let up = 2.0 * eta / (beta + sqrt64(beta * beta + 4.0 * a2 * eta));
+    let top = sqrt64(up);
+    let start = cos.abs().min(top);
+    if !(start > band) {
+        return -1.0;
+    }
+    let (scale, top32, a2_32) = ((eta / up) as f32, top as f32, a2 as f32);
+    // ∫ dμ / √M from |cos θ| = lo to hi, as one or two pieces.
+    let toward = cos * rate <= 0.0;
+    let mut total = 0.0_f64;
+    let mut piece = 0;
+    while piece < if toward { 1 } else { 2 } {
+        let (lo, hi) = if toward { (band, start) } else if piece == 0 { (start, top) } else { (band, top) };
+        let (t_lo, t_hi) = (sqrt64((top - hi).max(0.0)), sqrt64(top - lo));
+        let (mid, half) = ((0.5 * (t_hi + t_lo)) as f32, (0.5 * (t_hi - t_lo)) as f32);
+        let mut sum = 0.0_f32;
+        let mut i = 0;
+        while i < 8 {
+            let t = mid + if i % 2 == 0 { -1.0 } else { 1.0 } * half * LEG_GL_NODES[i / 2] as f32;
+            let mu = top32 - t * t;
+            sum += LEG_GL_WEIGHTS[i / 2] as f32 * 2.0 / sqrt((top32 + mu) * (scale + a2_32 * mu * mu));
+            i += 1;
+        }
+        total += f64::from(sum * half);
+        piece += 1;
+    }
+    total
+}
+
+/// The polar perturbation's rates (`separated::escape::vacuum_leg`): with
+/// n = (n0 + da) c + (dn0 + db) s, F = a² (n_z ẑ - (2 n_z² - n_z0²) n), the rates of
+/// da and db are -F s and F c.
+#[inline(always)]
+fn leg_polar_rates(
+    da: [f32; 3],
+    db: [f32; 3],
+    c: f32,
+    s: f32,
+    n0: [f32; 3],
+    dn0: [f32; 3],
+    a2: f32,
+    nz0_2: f32,
+) -> ([f32; 3], [f32; 3]) {
+    let n = [
+        (n0[0] + da[0]) * c + (dn0[0] + db[0]) * s,
+        (n0[1] + da[1]) * c + (dn0[1] + db[1]) * s,
+        (n0[2] + da[2]) * c + (dn0[2] + db[2]) * s,
+    ];
+    let k = a2 * (2.0 * n[2] * n[2] - nz0_2);
+    let force = [-k * n[0], -k * n[1], a2 * n[2] - k * n[2]];
+    (
+        [-force[0] * s, -force[1] * s, -force[2] * s],
+        [force[0] * c, force[1] * c, force[2] * c],
+    )
+}
+
+#[inline(always)]
+fn vacuum_leg<const BAND: bool>(ray: Ray, spin: f32, inner: f32, band: f32) -> LegEnd {
+    use cuda_device::float::sqrt_rn_f64 as sqrt64;
+    let fail = LegEnd { ok: false, escaped: false, arc: 0.0, pos: ray.pos, p: ray.p };
+    let target = ESCAPE_R as f64;
+    let inner = f64::from(inner);
+    let a = f64::from(spin);
+    let a2 = a * a;
+    let (x, y, z) = (f64::from(ray.pos.x), f64::from(ray.pos.y), f64::from(ray.pos.z));
+    let (big_x, big_y, big_z) = (z, x, y);
+    let (p_x, p_y, p_z) = (f64::from(ray.p.w), f64::from(ray.p.y), f64::from(ray.p.z));
+    let rho2 = big_x * big_x + big_y * big_y;
+    let q = rho2 + big_z * big_z - a2;
+    let r2 = 0.5 * (q + sqrt64(q * q + 4.0 * a2 * big_z * big_z));
+    let r = sqrt64(r2);
+    let cos = big_z / r;
+    let sin2 = rho2 / (r2 + a2);
+    if !(inner >= LEG_INNER_MIN && inner < r && r < target && sin2 > LEG_POLAR_FLOOR && a2 < 1.0) {
+        return fail;
+    }
+    let sin = sqrt64(sin2);
+    let norm = 1.0 / ((r2 + a2) * sin);
+    let (cp, sp) = ((big_x * r + big_y * a) * norm, (big_y * r - big_x * a) * norm);
+    let p_r = sin * (cp * p_x + sp * p_y) + cos * p_z;
+    let p_theta = cos / sin * (big_x * p_x + big_y * p_y) - r * sin * p_z;
+    let energy = -f64::from(ray.p.x);
+    let angular = z * f64::from(ray.p.y) - x * f64::from(ray.p.w);
+    let carter = p_theta * p_theta + cos * cos * (angular * angular / sin2 - a2 * energy * energy);
+    let lambda = angular / energy;
+    let eta = carter / (energy * energy);
+    let e_abs = energy.abs();
+    let delta = r2 - 2.0 * r + a2;
+    let outward = p_r - (2.0 * r * energy - a * angular) / delta > 0.0;
+
+    let (fa, fb, fc) = (a2 - eta - lambda * lambda, 2.0 * (eta + (lambda - a) * (lambda - a)), -a2 * eta);
+    let (u_sky, u_start, u_inner) = (1.0 / target, 1.0 / r, 1.0 / inner);
+    let f_inner = 1.0 + u_inner * u_inner * (fa + u_inner * (fb + u_inner * fc));
+    let turning = !outward && !(f_inner > 0.0);
+    let escaped = outward || turning;
+    let hi = if outward { u_start } else { u_inner };
+    let f_hi = 1.0 + hi * hi * (fa + hi * (fb + hi * fc));
+    let substituted = turning || !(f_hi > LEG_RADIAL_FLOOR);
+    let mut u1 = 0.0_f64;
+    let mut q32 = [0.0_f32; 4];
+    if substituted {
+        let start = if turning { u_start } else { hi };
+        let (fa32, fb32, fc32) = (fa as f32, fb as f32, fc as f32);
+        let mut v = (1.0 / sqrt64((-fa).max(1.0e-30))).max(start) as f32;
+        let mut k = 0;
+        while k < 8 {
+            let value = 1.0 + v * v * (fa32 + v * (fb32 + v * fc32));
+            let slope = v * (2.0 * fa32 + v * (3.0 * fb32 + 4.0 * fc32 * v));
+            v -= value / slope;
+            k += 1;
+        }
+        u1 = f64::from(v);
+        let mut k = 0;
+        let mut f_u1 = 0.0;
+        while k < 3 {
+            f_u1 = 1.0 + u1 * u1 * (fa + u1 * (fb + u1 * fc));
+            if k < 2 {
+                u1 -= f_u1 / (u1 * (2.0 * fa + u1 * (3.0 * fb + 4.0 * fc * u1)));
+            }
+            k += 1;
+        }
+        let bracket = if turning { u_start <= u1 && u1 <= u_inner } else { hi < u1 };
+        if !(bracket && f_u1.abs() < 1.0e-12) {
+            return fail;
+        }
+        let q3 = fc;
+        let q2 = fb + u1 * q3;
+        let q1 = fa + u1 * q2;
+        let q0 = u1 * q1;
+        q32 = [q0 as f32, q1 as f32, q2 as f32, q3 as f32];
+    }
+    let f32s = [fa as f32, fb as f32, fc as f32];
+    let (a32, lambda32, u1_32) = (a as f32, lambda as f32, u1 as f32);
+    let coordinate = |u: f64| if substituted { sqrt64((u1 - u).max(0.0)) } else { u };
+    // One piece, or in to the turning point (t = 0) and back out to the sky; scalars,
+    // not arrays, which would go to local memory.
+    let first_from = coordinate(u_start);
+    let first_to = if turning { 0.0 } else { coordinate(if outward { u_sky } else { u_inner }) };
+    let (ok, first_time, first_phi) =
+        leg_piece_sum(first_from, first_to, substituted, u1_32, q32, f32s, a32, lambda32);
+    if !ok {
+        return fail;
+    }
+    let second_to = if turning { coordinate(u_sky) } else { 0.0 };
+    let (mut second_time, mut second_phi) = (0.0, 0.0);
+    if turning {
+        let (ok, time, phi) = leg_piece_sum(0.0, second_to, substituted, u1_32, q32, f32s, a32, lambda32);
+        if !ok {
+            return fail;
+        }
+        (second_time, second_phi) = (time, phi);
+    }
+    let theta_rate = p_theta / e_abs;
+    let band = f64::from(band);
+    let polar = if BAND && band > 0.0 {
+        leg_band_time(cos, -sin * theta_rate, band, a2, lambda, eta)
+    } else {
+        f64::INFINITY
+    };
+    if !(polar >= 0.0) {
+        return fail;
+    }
+    let mut mino = first_time + second_time;
+    let mut phi_radial = first_phi + second_phi;
+    let mut u_end = if escaped { u_sky } else { u_inner };
+    let mut outgoing_end = escaped;
+    let mut at_band = false;
+    if BAND && polar < mino {
+        // The band comes first: Newton's method on the partial sums for the piece
+        // coordinate where the Mino time is `polar`.
+        let second = turning && polar > first_time;
+        let (from, to) = if second { (0.0, second_to) } else { (first_from, first_to) };
+        let wanted = polar - if second { first_time } else { 0.0 };
+        let direction = if to > from { 1.0 } else { -1.0 };
+        let mut x = from + (to - from) * (wanted / if second { second_time } else { first_time });
+        let mut iteration = 0;
+        while iteration < 4 {
+            let (ok, time, _) = leg_piece_sum(from, x, substituted, u1_32, q32, f32s, a32, lambda32);
+            if !ok {
+                return fail;
+            }
+            let (_, rate, _) = leg_radial_rate(x as f32, substituted, u1_32, q32, f32s);
+            x = (x - direction * (time - wanted) / f64::from(rate)).clamp(from.min(to), from.max(to));
+            iteration += 1;
+        }
+        let (ok, _, phi) = leg_piece_sum(from, x, substituted, u1_32, q32, f32s, a32, lambda32);
+        if !ok {
+            return fail;
+        }
+        at_band = true;
+        mino = polar;
+        phi_radial = if second { first_phi } else { 0.0 } + phi;
+        u_end = if substituted { u1 - x * x } else { x };
+        outgoing_end = second || (outward && !turning);
+    }
+    let (mid, half) = ((0.5 * (u_start + u_end)) as f32, (0.5 * (u_start - u_end)) as f32);
+    let mut ks_shift = 0.0_f32;
+    let mut i = 0;
+    while i < 8 {
+        let u = mid + if i % 2 == 0 { -1.0 } else { 1.0 } * half * LEG_GL_NODES[i / 2] as f32;
+        ks_shift += LEG_GL_WEIGHTS[i / 2] as f32 * a32 / (1.0 - 2.0 * u + (a2 as f32) * u * u);
+        i += 1;
+    }
+    let ks_shift = f64::from(ks_shift * half);
+
+    let n0 = [sin, 0.0, cos];
+    let dn0 = [cos * theta_rate, angular / (e_abs * sin), -sin * theta_rate];
+    let omega = sqrt64(dn0[0] * dn0[0] + dn0[1] * dn0[1] + dn0[2] * dn0[2]).max(1.0e-30);
+    let h = mino / LEG_POLAR_STEPS as f64;
+    let (step_s, step_c) = sin_cos_f64(0.5 * omega * h);
+    let (step_c, step_s) = (step_c as f32, (step_s / omega) as f32);
+    let (omega2, a2_32, nz0_2) = ((omega * omega) as f32, a2 as f32, (cos * cos) as f32);
+    let n0_32 = [n0[0] as f32, n0[1] as f32, n0[2] as f32];
+    let dn0_32 = [dn0[0] as f32, dn0[1] as f32, dn0[2] as f32];
+    let h32 = h as f32;
+    let mut da = [0.0_f32; 3];
+    let mut db = [0.0_f32; 3];
+    let (mut c0, mut s0) = (1.0_f32, 0.0_f32);
+    let mut step = 0;
+    while step < LEG_POLAR_STEPS {
+        let (c1, s1) = (c0 * step_c - omega2 * s0 * step_s, s0 * step_c + c0 * step_s);
+        let (c2, s2) = (c1 * step_c - omega2 * s1 * step_s, s1 * step_c + c1 * step_s);
+        let (ka1, kb1) = leg_polar_rates(da, db, c0, s0, n0_32, dn0_32, a2_32, nz0_2);
+        let (ka2, kb2) = leg_polar_rates(
+            [da[0] + 0.5 * h32 * ka1[0], da[1] + 0.5 * h32 * ka1[1], da[2] + 0.5 * h32 * ka1[2]],
+            [db[0] + 0.5 * h32 * kb1[0], db[1] + 0.5 * h32 * kb1[1], db[2] + 0.5 * h32 * kb1[2]],
+            c1, s1, n0_32, dn0_32, a2_32, nz0_2,
+        );
+        let (ka3, kb3) = leg_polar_rates(
+            [da[0] + 0.5 * h32 * ka2[0], da[1] + 0.5 * h32 * ka2[1], da[2] + 0.5 * h32 * ka2[2]],
+            [db[0] + 0.5 * h32 * kb2[0], db[1] + 0.5 * h32 * kb2[1], db[2] + 0.5 * h32 * kb2[2]],
+            c1, s1, n0_32, dn0_32, a2_32, nz0_2,
+        );
+        let (ka4, kb4) = leg_polar_rates(
+            [da[0] + h32 * ka3[0], da[1] + h32 * ka3[1], da[2] + h32 * ka3[2]],
+            [db[0] + h32 * kb3[0], db[1] + h32 * kb3[1], db[2] + h32 * kb3[2]],
+            c2, s2, n0_32, dn0_32, a2_32, nz0_2,
+        );
+        let mut j = 0;
+        while j < 3 {
+            da[j] += h32 / 6.0 * (ka1[j] + 2.0 * ka2[j] + 2.0 * ka3[j] + ka4[j]);
+            db[j] += h32 / 6.0 * (kb1[j] + 2.0 * kb2[j] + 2.0 * kb3[j] + kb4[j]);
+            j += 1;
+        }
+        c0 = c2;
+        s0 = s2;
+        step += 1;
+    }
+    let arc = omega * mino;
+    let (big_s, big_c) = sin_cos_f64(arc);
+    let (s_end, w_s) = (big_s / omega, omega * big_s);
+    let mut n = [0.0_f64; 3];
+    let mut dn = [0.0_f64; 3];
+    let mut j = 0;
+    while j < 3 {
+        let (base, rate) = (n0[j] + f64::from(da[j]), dn0[j] + f64::from(db[j]));
+        n[j] = base * big_c + rate * s_end;
+        dn[j] = -base * w_s + rate * big_c;
+        j += 1;
+    }
+    let length = sqrt64(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    let c = n[2] / length;
+    let rho = sqrt64(n[0] * n[0] + n[1] * n[1]);
+    let sin = rho / length;
+    // At the band, the polar sums and the RK4 motion must agree.
+    if !(sin * sin > LEG_POLAR_FLOOR && (!at_band || (c.abs() - band).abs() < 1.0e-5)) {
+        return fail;
+    }
+    let sign_e = if energy < 0.0 { -1.0 } else { 1.0 };
+    let (sd, cd) = sin_cos_f64(sign_e * phi_radial + ks_shift);
+    let (cp, sp) = (cp * cd - sp * sd, sp * cd + cp * sd);
+    let (cpsi, spsi) = (n[0] / rho, n[1] / rho);
+    let (cp, sp) = (cp * cpsi - sp * spsi, sp * cpsi + cp * spsi);
+
+    let r = 1.0 / u_end;
+    let v = dn[2] / length;
+    let delta = r * r - 2.0 * r + a2;
+    let f_end = 1.0 + u_end * u_end * (fa + u_end * (fb + u_end * fc));
+    let radial = r * r * r * r * f_end.max(0.0);
+    let p_theta = -e_abs * v / sin;
+    let sign_r = if outgoing_end { 1.0 } else { -1.0 };
+    let p_r = (sign_r * e_abs * sqrt64(radial) + 2.0 * r * energy - a * angular) / delta;
+    let big_x = (r * cp - a * sp) * sin;
+    let big_y = (r * sp + a * cp) * sin;
+    let big_z = r * c;
+    let j = [
+        [cp * sin, sp * sin, c],
+        [(r * cp - a * sp) * c, (r * sp + a * cp) * c, -r * sin],
+        [-(r * sp + a * cp) * sin, (r * cp - a * sp) * sin, 0.0],
+    ];
+    let inv_det = 1.0 / det3_f64(j);
+    let solve = |col: usize| {
+        let mut m = j;
+        m[0][col] = p_r;
+        m[1][col] = p_theta;
+        m[2][col] = angular;
+        det3_f64(m) * inv_det
+    };
+    let (p_x, p_y, p_z) = (solve(0), solve(1), solve(2));
+    LegEnd {
+        ok: true,
+        escaped: escaped && !at_band,
+        arc: arc as f32,
+        pos: vec3(big_y as f32, big_z as f32, big_x as f32),
+        p: vec4(-energy as f32, p_y as f32, p_z as f32, p_x as f32),
+    }
+}
+
+/// Analytic vacuum leg (checklist P1.8): from a single-hole state outside the sphere of
+/// radius `inner` and, when `band` > 0, outside the polar band |cos θ| <= `band`, the
+/// state where the separated solution first reaches Kerr–Schild radius `ESCAPE_R`
+/// going out, `inner` going in, or the band, with only square roots. A line-for-line twin of `separated::vacuum_leg`, which is tested
+/// against the binary64 reference; `ok` is false where its guards fail. Kept out of
+/// line: it runs at most a few times per ray. Production kernels take only the legs
+/// outside the sphere; `analytic_band_leg` is compiled into the experiment kernels.
+#[cuda_device::device]
+#[inline(never)]
+fn analytic_vacuum_leg(ray: Ray, spin: f32, inner: f32) -> LegEnd {
+    vacuum_leg::<false>(ray, spin, inner, 0.0)
+}
+
+#[cuda_device::device]
+#[inline(never)]
+fn analytic_band_leg(ray: Ray, spin: f32, inner: f32, band: f32) -> LegEnd {
+    vacuum_leg::<true>(ray, spin, inner, band)
+}
+
+/// The capture guard's hypotheses for the exact real values of the stored binary32
+/// state, in interval binary64: r between the horizon and `disk_inner`, a positive
+/// radial potential on every piece of [horizon, r] (`null_radial_positive_near` in
+/// KerrCapture.lean, on pieces that cover [horizon.lo, r.hi]) and an inward tangent
+/// computed from the state's own momentum. Mirrors
+/// `black_hole::certified::capture_certified`. Finite f32 inputs, with p_t > 1e-5,
+/// sine > 0.1 and r > 1 before their divisions, keep every intermediate below 1e300,
+/// so no endpoint overflows.
+#[cuda_device::device]
+fn kerr_capture_certified(ray: Ray, spin: f32, disk_inner: f32) -> bool {
+    let finite = |v: f32| v.abs() < f32::INFINITY;
+    if !(finite(ray.pos.x) && finite(ray.pos.y) && finite(ray.pos.z)
+        && finite(ray.p.y) && finite(ray.p.z) && finite(ray.p.w) && finite(disk_inner)
+        && ray.p.x < f32::INFINITY && ray.p.x > 1.0e-5)
+    {
+        return false;
+    }
+    let point = |v: f32| Bound::point(f64::from(v));
+    let one = Bound::point(1.0);
+    let a = point(spin);
+    let a2 = a.sq();
+    let horizon = one.add(one.sub(a2).sqrt());
+    let (x, y, z) = (point(ray.pos.x), point(ray.pos.y), point(ray.pos.z));
+    let rho2 = x.sq().add(z.sq());
+    let y2 = y.sq();
+    let q = rho2.add(y2).sub(a2);
+    let r2 = q.add(q.sq().add(Bound::point(4.0).mul(a2).mul(y2)).sqrt()).mul(Bound::point(0.5));
+    let r = r2.sqrt();
+    if !(r.lo > horizon.hi && r.hi < f64::from(disk_inner)) {
+        return false;
+    }
+    let r2a2 = r2.add(a2);
+    let sine = rho2.div(r2a2).sqrt();
+    if !(sine.lo > 0.1) {
+        return false;
+    }
+    // E = -p_t < 0 for the backward ray, and |E| = p_t.
+    let pt = point(ray.p.x);
+    let energy = Bound::point(-f64::from(ray.p.x));
+    let (px, py, pz) = (point(ray.p.y), point(ray.p.z), point(ray.p.w));
+    let lambda = z.mul(px).sub(x.mul(pz)).div(energy);
+    let polar = y.div(r).div(sine).mul(x.mul(px).add(z.mul(pz))).sub(r.mul(sine).mul(py)).div(energy);
+    let azimuthal = lambda.div(sine).sub(a.mul(sine));
+    let carter = polar.sq().add(azimuthal.sq());
+    let aa = a2.sub(a.mul(lambda));
+    // Pieces that cover [horizon.lo, r.hi] contain [horizon, r].
+    let mut pieces = 1u32;
+    let mut covered = radial_pieces_certified(horizon.lo, r.hi, 1, aa, carter, a2);
+    while !covered && pieces < CAPTURE_PIECES {
+        pieces *= 2;
+        covered = radial_pieces_certified(horizon.lo, r.hi, pieces, aa, carter, a2);
+    }
+    // Sigma dr/dlambda: g^-1 = eta - 2h l#l#^T with l# = (-1, l), exact for the null l of
+    // add_kerr with spin along +y.
+    let h = r.mul(r2).div(r2.sq().add(a.mul(y).sq()));
+    let lx = r.mul(x).sub(a.mul(z)).div(r2a2);
+    let ly = y.div(r);
+    let lz = r.mul(z).add(a.mul(x)).div(r2a2);
+    let k = Bound::point(2.0).mul(h).mul(lx.mul(px).add(ly.mul(py)).add(lz.mul(pz)).sub(pt));
+    let (vx, vy, vz) = (px.sub(k.mul(lx)), py.sub(k.mul(ly)), pz.sub(k.mul(lz)));
+    let sigma_dr =
+        r.mul(x.mul(vx).add(one.add(a2.div(r2)).mul(y).mul(vy)).add(z.mul(vz))).div(pt);
+    covered && sigma_dr.hi < 0.0
 }
 
 #[cuda_device::kernel]
@@ -2460,16 +3711,16 @@ pub unsafe fn bh_geodesic(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, _>(
+        render_geodesic::<false, false, GENERIC, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), false, false,
+            core::ptr::null_mut(), true, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
 }
 
 #[cuda_device::kernel]
-pub unsafe fn bh_geodesic_early_capture(
+pub unsafe fn bh_geodesic_full_trace(
     out_image: *mut Vec4,
     cam: *const Camera,
     disk: *const Disk,
@@ -2481,16 +3732,21 @@ pub unsafe fn bh_geodesic_early_capture(
     sky_h: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, _>(
+        render_geodesic::<false, false, GENERIC, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), true, false,
+            core::ptr::null_mut(), false, true, true, true, true, 0,
             gid_x(), gid_y(), no_swarm,
         );
     }
 }
 
+/// `bh_geodesic` for a scene with exactly one source (checklist P1.2). With `order` not
+/// null, block b (row-major) renders tile `order[b]` of the grid, so the costliest tiles
+/// can start first (checklist P1.5); null renders block b's own tile. With `costs` not
+/// null, each tile's most iterations go to `costs` (by `red.max`, so the caller zeroes
+/// it) for `bh_tile_histogram` and `bh_tile_order`. Blocks must be 32 threads wide.
 #[cuda_device::kernel]
-pub unsafe fn bh_geodesic_far_field(
+pub unsafe fn bh_geodesic_single(
     out_image: *mut Vec4,
     cam: *const Camera,
     disk: *const Disk,
@@ -2500,14 +3756,180 @@ pub unsafe fn bh_geodesic_far_field(
     height: u32,
     sky_w: u32,
     sky_h: u32,
-    early_capture: u32,
+    order: *const u32,
+    costs: *mut u32,
+) {
+    let (tile, pix_x, pix_y) = ordered_pixel(order, width);
+    let iterations = unsafe {
+        render_geodesic::<false, false, SINGLE, false, _>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+            core::ptr::null_mut(), true, true, true, true, true, 0,
+            pix_x, pix_y, no_swarm,
+        )
+    };
+    record_tile_cost(costs, tile, iterations);
+}
+
+/// `bh_geodesic_single` for thermal intensity alone: no polarization view and no hot
+/// flow, so `sample_plasma` never reads the screen vector (checklist P1.2).
+#[cuda_device::kernel]
+pub unsafe fn bh_geodesic_scalar(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+    order: *const u32,
+    costs: *mut u32,
+) {
+    let (tile, pix_x, pix_y) = ordered_pixel(order, width);
+    let iterations = unsafe {
+        render_geodesic::<false, false, SINGLE_SCALAR, false, _>(
+            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+            core::ptr::null_mut(), true, true, true, true, true, 0,
+            pix_x, pix_y, no_swarm,
+        )
+    };
+    record_tile_cost(costs, tile, iterations);
+}
+
+/// The tile block b (row-major) renders, `order[b]` (b itself when `order` is null),
+/// and this thread's pixel in it.
+#[inline(always)]
+fn ordered_pixel(order: *const u32, width: u32) -> (u32, u32, u32) {
+    use cuda_device::thread::*;
+    let tiles_x = width.div_ceil(blockDim_x());
+    let block = blockIdx_y() * tiles_x + blockIdx_x();
+    let tile = if order.is_null() { block } else { unsafe { *order.add(block as usize) } };
+    (
+        tile,
+        (tile % tiles_x) * blockDim_x() + threadIdx_x(),
+        (tile / tiles_x) * blockDim_y() + threadIdx_y(),
+    )
+}
+
+/// Raises `costs[tile]` to the warp's most iterations, unless `costs` is null; the warp
+/// is one 32-wide row of the tile.
+#[inline(always)]
+fn record_tile_cost(costs: *mut u32, tile: u32, iterations: u32) {
+    if costs.is_null() {
+        return;
+    }
+    // cuda-oxide refuses `redux.sync` below sm_100a, so reduce by butterfly shuffles.
+    let mut most = iterations;
+    let mut lane_mask = 16u32;
+    while lane_mask > 0 {
+        let other: u32;
+        unsafe {
+            cuda_device::ptx_asm!(
+                "shfl.sync.bfly.b32 %0, %1, %2, 31, 0xffffffff;",
+                out("=r") other, in("r") most, in("r") lane_mask
+            )
+        };
+        most = most.max(other);
+        lane_mask >>= 1;
+    }
+    if cuda_device::thread::threadIdx_x() == 0 {
+        atomic_max_u32(unsafe { costs.add(tile as usize) }, most);
+    }
+}
+
+/// Tile cost buckets, costliest first: half octaves of iterations, the last for none.
+const TILE_BUCKETS: u32 = 32;
+
+#[inline(always)]
+fn tile_bucket(cost: u32) -> u32 {
+    if cost == 0 {
+        return TILE_BUCKETS - 1;
+    }
+    let octave = 31 - cost.leading_zeros();
+    // The upper half of the octave starts at 1.5 * 2^octave.
+    let upper = (octave > 0 && cost >= 3 << (octave - 1)) as u32;
+    (TILE_BUCKETS - 2).saturating_sub(2 * octave + upper)
+}
+
+/// Counts the tiles in each cost bucket into `histogram` (zeroed by the caller).
+#[cuda_device::kernel]
+pub unsafe fn bh_tile_histogram(costs: *const u32, histogram: *mut u32, tiles: u32) {
+    let tile = gid_x();
+    if tile >= tiles {
+        return;
+    }
+    let bucket = tile_bucket(unsafe { *costs.add(tile as usize) });
+    atomic_add_u32(unsafe { histogram.add(bucket as usize) }, 1);
+}
+
+/// Orders the tiles costliest bucket first from `bh_tile_histogram`'s counts, using
+/// `cursors` (zeroed by the caller) to place tiles within a bucket, and zeroes `costs`
+/// for the next frame. Order within a bucket follows the atomics, not the tile index.
+#[cuda_device::kernel]
+pub unsafe fn bh_tile_order(
+    costs: *mut u32,
+    histogram: *const u32,
+    cursors: *mut u32,
+    order: *mut u32,
+    tiles: u32,
+) {
+    let tile = gid_x();
+    if tile >= tiles {
+        return;
+    }
+    let bucket = tile_bucket(unsafe { *costs.add(tile as usize) });
+    let mut start = 0u32;
+    let mut b = 0u32;
+    while b < bucket {
+        start += unsafe { *histogram.add(b as usize) };
+        b += 1;
+    }
+    let slot = start + atomic_add_u32(unsafe { cursors.add(bucket as usize) }, 1);
+    unsafe {
+        *order.add(slot as usize) = tile;
+        *costs.add(tile as usize) = 0;
+    }
+}
+
+/// Any combination of the ray options: bit 0 the full trace instead of guarded early
+/// capture, bit 1 capped steps instead of far-field steps and analytic vacuum legs
+/// (checklist P1.8), bit 2 the legacy step-doubling RK4 controller
+/// instead of Dormand–Prince, bit 3 the legacy coupled transfer (one midpoint cell per
+/// geodesic step, the step limited by the disk) instead of decoupled transfer (checklist
+/// P1.9), bits 4-7 a shift that divides the disk transfer cell length by 2^shift, bit 8
+/// numerical steps instead of analytic vacuum legs, bit 9 band legs inside the disk's
+/// enclosing sphere as well (checklist P1.8).
+#[cuda_device::kernel]
+pub unsafe fn bh_geodesic_experiments(
+    out_image: *mut Vec4,
+    cam: *const Camera,
+    disk: *const Disk,
+    objects: *const Objects,
+    skybox: *const Vec4,
+    width: u32,
+    height: u32,
+    sky_w: u32,
+    sky_h: u32,
+    experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<false, false, _>(
-            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), early_capture != 0, true,
-            gid_x(), gid_y(), no_swarm,
-        );
+        // Bit 9: band legs as well, compiled only into the experiment kernels.
+        if experiments & 512 != 0 {
+            render_geodesic::<false, false, GENERIC, true, _>(
+                out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+                core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
+                experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
+                gid_x(), gid_y(), no_swarm,
+            );
+        } else {
+            render_geodesic::<false, false, GENERIC, false, _>(
+                out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
+                core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
+                experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
+                gid_x(), gid_y(), no_swarm,
+            );
+        }
     }
 }
 
@@ -2535,9 +3957,10 @@ pub unsafe fn bh_geodesic_swarm(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<false, true, _>(
+        render_geodesic::<false, true, GENERIC, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, gid_x(), gid_y(),
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, false, 0,
+            gid_x(), gid_y(),
             |start, end, t0, t1, _| swarm_bvh_hit(
                 start, end, t0, t1, swarm, swarm_count, bvh_nodes, bvh_items, bvh_roots, bvh_slices,
                 (belt_inner, belt_outer, belt_spread),
@@ -2596,9 +4019,10 @@ pub unsafe fn bh_geodesic_swarm_record(
     let (x, y) = (gid_x(), gid_y() + row0);
     let pixel = y * width + x;
     unsafe {
-        render_geodesic::<false, true, _>(
+        render_geodesic::<false, true, GENERIC, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
-            core::ptr::null_mut(), experiments & 1 != 0, experiments & 2 != 0, x, y,
+            core::ptr::null_mut(), experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0, experiments & 8 == 0, false, 0,
+            x, y,
             |start, end, t0, t1, state| {
                 if beyond_belt(swarm_query(start, end, t0, t1), belt_inner, belt_outer, belt_spread) {
                     return vec4_splat(0.0);
@@ -2721,6 +4145,8 @@ enum RayExit {
     Escaped,
     Opaque,
     EarlyCapture,
+    /// Captured or escaped inside the unresolved band.
+    NearCritical,
 }
 
 #[cuda_device::kernel]
@@ -2738,18 +4164,32 @@ pub unsafe fn bh_geodesic_diagnostics(
     experiments: u32,
 ) {
     unsafe {
-        render_geodesic::<true, false, _>(
-            out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
-            experiments & 1 != 0, experiments & 2 != 0, gid_x(), gid_y(), no_swarm,
-        );
+        if experiments & 512 != 0 {
+            render_geodesic::<true, false, GENERIC, true, _>(
+                out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
+                experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
+                experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
+                gid_x(), gid_y(), no_swarm,
+            );
+        } else {
+            render_geodesic::<true, false, GENERIC, false, _>(
+                out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h, diagnostics,
+                experiments & 1 == 0, experiments & 2 == 0, experiments & 4 == 0,
+                experiments & 8 == 0, experiments & 256 == 0, (experiments >> 4) & 15,
+                gid_x(), gid_y(), no_swarm,
+            );
+        }
     }
 }
 
 #[inline(always)]
-fn advance_render_ray<const DIAGNOSTICS: bool>(
+fn advance_render_ray<const DIAGNOSTICS: bool, const PATH: u8>(
     ray: Ray, h: f32, metric: &mut Metric, objects: &Objects, stats: &mut RayDiagnostics,
+    dormand_prince: bool,
 ) -> AdaptiveStep {
-    if DIAGNOSTICS {
+    if dormand_prince {
+        advance_ray_dp45::<DIAGNOSTICS, PATH>(ray, h, metric, false, objects, &mut stats.rejected_attempts)
+    } else if DIAGNOSTICS {
         advance_ray_counting::<true>(ray, h, metric, false, objects, &mut stats.rejected_attempts)
     } else {
         advance_ray_gauge(ray, h, metric, false, objects)
@@ -2784,12 +4224,106 @@ fn pixel_output(rgb: Vec3, stokes: Vec4, iterations: u32, cam: &Camera) -> Vec3 
     output
 }
 
-/// Renders pixel (`pix_x`, `pix_y`). With SWARM, `swarm_hit(start, end, t0, t1, state)`
-/// tests each accepted step against the swarm, as `swarm_segment_hit` does.
+/// The coordinate direction of pixel (`pix_x`, `pix_y`) before the camera tetrad.
+#[inline(always)]
+fn pixel_direction(cam: &Camera, pix_x: u32, pix_y: u32, width: u32, height: u32) -> Vec3 {
+    let u = (2.0 * (pix_x as f32 + 0.5 + cam.jitter_x) / width as f32 - 1.0)
+        * cam.aspect
+        * cam.tan_half_fov;
+    let v = (1.0 - 2.0 * (pix_y as f32 + 0.5 + cam.jitter_y) / height as f32) * cam.tan_half_fov;
+    (u * cam.right - v * cam.up + cam.forward).normalize()
+}
+
+/// The initial ray `render_geodesic` traces for pixel (`x`, `y`) of a `z`×`w` image:
+/// position, momentum and screen vector, so host references can start from it.
+#[cuda_device::kernel]
+pub unsafe fn bh_test_pixel_ray(
+    cam: *const Camera,
+    objects: *const Objects,
+    pixels: *const Vec4,
+    results: *mut Vec4,
+    count: u32,
+) {
+    let id = gid_x();
+    if id >= count {
+        return;
+    }
+    let cam = unsafe { &*cam };
+    let objects = unsafe { &*objects };
+    let c = unsafe { *pixels.add(id as usize) };
+    let dir = pixel_direction(cam, c.x as u32, c.y as u32, c.z as u32, c.w as u32);
+    let ray = init_ray(cam.pos, dir, scene_metric(cam.pos, objects), cam);
+    let base = (3 * id) as usize;
+    unsafe {
+        *results.add(base) = vec4_v3_f(ray.pos, 0.0);
+        *results.add(base + 1) = ray.p;
+        *results.add(base + 2) = ray.screen;
+    }
+}
+
+/// Runs `inward_kerr_capture` on arbitrary states around a unit-mass Kerr hole at the
+/// origin, two `Vec4` per case: (position, spin) and p. Writes 1 where it captures.
+#[cuda_device::kernel]
+pub unsafe fn bh_test_capture_guard(
+    cases: *const Vec4,
+    disk_inner: f32,
+    results: *mut u32,
+    count: u32,
+) {
+    let id = gid_x();
+    if id >= count {
+        return;
+    }
+    let base = (2 * id) as usize;
+    let (head, p) = unsafe { (*cases.add(base), *cases.add(base + 1)) };
+    let ray = Ray { pos: head.xyz(), p, screen: vec4(0.0, 0.0, 0.0, 0.0) };
+    let metric = add_kerr(flat_metric(), ray.pos, 1.0, vec3(0.0, head.w, 0.0));
+    let velocity = (metric.inv * ray.p).yzw();
+    unsafe {
+        *results.add(id as usize) =
+            if inward_kerr_capture(ray, velocity, head.w, disk_inner) { 1 } else { 0 };
+    }
+}
+
+/// The inner radius and band of the analytic leg to take from `ray`, or zero for none:
+/// outside the disk's enclosing sphere (squared radius `leg_sq`) a leg to that sphere
+/// or the sky, and with `BAND` inside it, beyond r = 12 and clear of the band, a leg to
+/// r = 12, the band or the sky. r² >= |x|² - a², so the margins keep the Kerr–Schild
+/// radius outside the sphere, and a leg that ends on the sphere going in leaves
+/// |x|² - a² <= r², below them. Recomputed after the loop rather than carried in
+/// registers through it.
+#[inline(always)]
+fn leg_bounds<const BAND: bool>(ray: Ray, metric: &Metric, spin_sq: f32, leg_sq: f32, leg_band: f32) -> (f32, f32) {
+    let length_sq = ray.pos.dot(ray.pos);
+    let beyond = length_sq - spin_sq;
+    if !(beyond < ESCAPE_R * ESCAPE_R) {
+        return (0.0, 0.0);
+    }
+    if beyond > 1.0001 * leg_sq {
+        let outward = ray.pos.dot((metric.inv * ray.p).yzw()) > 0.0;
+        if outward || beyond > 1.0201 * leg_sq {
+            return (sqrt(leg_sq), 0.0);
+        }
+    }
+    // |cos θ| >= |y| / |x| clears the band by `LEG_BAND_MARGIN`.
+    if BAND && leg_band > 0.0
+        && beyond > 1.0201 * (LEG_INNER_MIN * LEG_INNER_MIN) as f32
+        && ray.pos.y * ray.pos.y > (LEG_BAND_MARGIN * LEG_BAND_MARGIN * leg_band * leg_band) * length_sq
+    {
+        return (LEG_INNER_MIN as f32, leg_band);
+    }
+    (0.0, 0.0)
+}
+
+/// Renders pixel (`pix_x`, `pix_y`) and returns its iterations (0 outside the image or
+/// for an invalid camera). With SWARM, `swarm_hit(start, end, t0, t1, state)` tests
+/// each accepted step against the swarm, as `swarm_segment_hit` does.
 #[inline(always)]
 unsafe fn render_geodesic<
     const DIAGNOSTICS: bool,
     const SWARM: bool,
+    const PATH: u8,
+    const BAND: bool,
     F: Fn(Vec3, Vec3, f32, f32, PixelState) -> Vec4,
 >(
     out_image: *mut Vec4,
@@ -2804,23 +4338,25 @@ unsafe fn render_geodesic<
     diagnostics: *mut RayDiagnostics,
     early_capture: bool,
     far_field: bool,
+    dormand_prince: bool,
+    decoupled: bool,
+    analytic_leg: bool,
+    refine: u32,
     pix_x: u32,
     pix_y: u32,
     swarm_hit: F,
-) {
+) -> u32 {
     if pix_x >= width || pix_y >= height {
-        return;
+        return 0;
     }
     let cam = unsafe { &*cam };
     let disk = unsafe { &*disk };
     let objects = unsafe { &*objects };
     let idx = (pix_y * width + pix_x) as usize;
+    // Hermite dense output needs the Dormand–Prince stage rates.
+    let decoupled = decoupled && dormand_prince;
 
-    let u = (2.0 * (pix_x as f32 + 0.5 + cam.jitter_x) / width as f32 - 1.0)
-        * cam.aspect
-        * cam.tan_half_fov;
-    let v = (1.0 - 2.0 * (pix_y as f32 + 0.5 + cam.jitter_y) / height as f32) * cam.tan_half_fov;
-    let dir = (u * cam.right - v * cam.up + cam.forward).normalize();
+    let dir = pixel_direction(cam, pix_x, pix_y, width, height);
     let mut metric = scene_metric(cam.pos, objects);
     let mut stats = RayDiagnostics::default();
     let mut exit = RayExit::IterationLimit;
@@ -2830,7 +4366,7 @@ unsafe fn render_geodesic<
             unsafe { *diagnostics.add(idx) = stats };
         }
         unsafe { *out_image.add(idx) = vec4(0.0, 0.0, 0.0, 1.0) };
-        return;
+        return 0;
     }
     let mut ray = init_ray(cam.pos, dir, metric, cam);
     let mut rgb = vec3_splat(0.0);
@@ -2841,158 +4377,274 @@ unsafe fn render_geodesic<
     let mut affine = 0.0_f32;
     let mut next_h = 1.0e8_f32;
     let mut capture_clearance = if early_capture && supports_early_capture(objects, disk) {
-        EARLY_CAPTURE_CLEARANCE
+        capture_entry_clearance(disk.r1, disk.spin)
     } else {
         0.0
     };
-    let vacuum_sq = if far_field { vacuum_radius_sq(objects, disk) } else { f32::INFINITY };
+    let vacuum_sq = if far_field { vacuum_radius_sq(objects, disk, 64.0) } else { f32::INFINITY };
+    // Analytic vacuum legs need an isolated Kerr hole with spin along +y, and no swarm.
+    // They run outside a sphere enclosing the disk, of Kerr–Schild radius at least 16
+    // (the CPU twin is tested from 12).
+    let leg_sq = if far_field { vacuum_radius_sq(objects, disk, 16.0) } else { f32::INFINITY };
+    let hole_spin = objects.spin[0];
+    let mut analytic = analytic_leg && !SWARM && leg_sq < f32::INFINITY && hole_spin.x == 0.0 && hole_spin.z == 0.0;
+    let spin_sq = hole_spin.y * hole_spin.y;
+    // Inside the sphere, legs end where |cos θ| falls to `leg_band`, which contains the
+    // emitting slab |y - mid| < 4H when H/R <= `aspect` and the midplane is flat.
+    // Thick flows fill most polar angles, so legs would rarely save steps there.
+    let aspect = match disk.model {
+        0 => disk.h_thin,
+        1 | 2 => disk.h_thin.max(disk.h_hot),
+        _ => 0.0,
+    };
+    let aspect = if BAND && aspect <= 0.1 { aspect } else { 0.0 };
+    let leg_band = 4.0 * aspect * inverse_sqrt(1.0 + 16.0 * aspect * aspect);
     // Coordinate time relative to the camera; it decreases along the backward ray.
     let mut ray_time = 0.0_f32;
+    let mut winding = 0.0_f32;
     let mut i = 0u32;
-    while i < cam.max_iter {
-        iterations = i + 1;
-        if metric.clearance < 0.002 || !metric.valid {
-            if DIAGNOSTICS {
-                exit = if metric.valid { RayExit::Horizon } else { RayExit::InvalidMetric };
+    let mut sky = false;
+    loop {
+        let mut pending = false;
+        while i < cam.max_iter {
+            iterations = i + 1;
+            if analytic && leg_bounds::<BAND>(ray, &metric, spin_sq, leg_sq, leg_band).0 > 0.0 {
+                // Leave the loop so the warp's lanes run the f64 leg together.
+                pending = true;
+                break;
             }
-            break;
-        }
-        let velocity = (metric.inv * ray.p).yzw();
-        let start_dt = if SWARM { (metric.inv * ray.p).x } else { 0.0 };
-        if early_capture && metric.clearance < capture_clearance {
-            // A tighter interval may rule out a turn even if the first check could not.
-            capture_clearance = 0.5 * metric.clearance;
-            if inward_kerr_capture(ray, velocity, disk.spin, disk.r1) {
+            if metric.clearance < 0.002 || !metric.valid {
                 if DIAGNOSTICS {
-                    exit = RayExit::EarlyCapture;
+                    exit = if !metric.valid {
+                        RayExit::InvalidMetric
+                    } else if winding > UNRESOLVED_WINDING {
+                        RayExit::NearCritical
+                    } else {
+                        RayExit::Horizon
+                    };
                 }
                 break;
             }
-        }
-        let mut distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
-        let clearance_limited_distance = distance;
-        let radius = disk_radius(ray.pos, disk.spin, disk.binary_enabled != 0);
-        if radius > disk.r1 - distance && radius < disk.r2 + distance {
-            let r_clamped = radius.max(disk.r1);
-            let height_d = (get_h_over_r(r_clamped, disk) * r_clamped).max(0.001);
-            let mid = disk_midplane_y(radius.max(0.001), ray.pos.xz(), disk);
-            let to_disk = ((ray.pos.y - mid).abs() - 4.0 * height_d).max(0.0);
-            distance = distance.min((0.25 * height_d).max(0.5 * to_disk));
-        }
-        let near_horizon = DIAGNOSTICS && metric.clearance < 1.0;
-        let speed = velocity.length().max(1.0e-6);
-        let geometric_h = distance / speed;
-        let ordinary_h = geometric_h.min(next_h);
-        let proposed_h = if far_field {
-            let far_distance = far_field_distance(ray.pos, velocity, speed, vacuum_sq);
-            ordinary_h.max((far_distance / speed).min(next_h))
-        } else {
-            ordinary_h
-        };
-        let mut step = advance_render_ray::<DIAGNOSTICS>(ray, proposed_h, &mut metric, objects, &mut stats);
-        if far_field && proposed_h > ordinary_h
-            && (!step.accepted || ray.pos.dot(step.ray.pos - ray.pos) < 0.0)
-        {
-            // An outward chord stays outside the sphere, including its transfer midpoint.
-            if step.accepted {
-                metric = scene_metric(ray.pos, objects);
+            let velocity = (metric.inv * ray.p).yzw();
+            let start_dt = if SWARM { (metric.inv * ray.p).x } else { 0.0 };
+            if early_capture && metric.clearance < capture_clearance {
+                // A tighter interval may rule out a turn even if the first check could not.
+                capture_clearance = 0.5 * metric.clearance;
+                if inward_kerr_capture(ray, velocity, disk.spin, disk.r1) {
+                    if DIAGNOSTICS {
+                        exit = if winding > UNRESOLVED_WINDING {
+                            RayExit::NearCritical
+                        } else {
+                            RayExit::EarlyCapture
+                        };
+                    }
+                    break;
+                }
             }
-            step = advance_render_ray::<DIAGNOSTICS>(ray, ordinary_h, &mut metric, objects, &mut stats);
-        }
-        // Stop when the affine parameter can no longer advance in binary32.
-        if !step.accepted || affine + step.h == affine {
+            let mut distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
+            let clearance_limited_distance = distance;
+            let radius = disk_radius(ray.pos, disk.spin, disk.binary_enabled != 0);
+            // Decoupled transfer: the length of the constant cells this step's plasma is
+            // split into, or zero for one midpoint cell.
+            let mut cell_length = 0.0_f32;
+            if radius > disk.r1 - distance && radius < disk.r2 + distance {
+                let r_clamped = radius.max(disk.r1);
+                let height_d = (get_h_over_r(r_clamped, disk) * r_clamped).max(0.001);
+                let mid = disk_midplane_y(radius.max(0.001), ray.pos.xz(), disk);
+                let to_disk = ((ray.pos.y - mid).abs() - 4.0 * height_d).max(0.0);
+                let refinement = 1.0 / (1u32 << refine) as f32;
+                let cell = 0.25 * height_d * refinement;
+                if !decoupled {
+                    distance = distance.min(cell.max(0.5 * to_disk));
+                } else if 0.5 * to_disk < distance {
+                    // The coupled scheme's margin: a chord shorter than half the vertical
+                    // distance `to_disk` does not reach the emitting slab, tilted or not.
+                    let length = cell.min(ORBIT_CELL * r_clamped * refinement);
+                    distance = distance.min((MAX_TRANSFER_CELLS as f32 * length).max(0.5 * to_disk));
+                    if distance > 0.5 * to_disk {
+                        cell_length = length;
+                    }
+                }
+            }
+            let near_horizon = DIAGNOSTICS && metric.clearance < 1.0;
+            let speed = velocity.length().max(1.0e-6);
+            let geometric_h = distance / speed;
+            let ordinary_h = geometric_h.min(next_h);
+            let proposed_h = if far_field {
+                let far_distance = far_field_distance(ray.pos, velocity, speed, vacuum_sq);
+                ordinary_h.max((far_distance / speed).min(next_h))
+            } else {
+                ordinary_h
+            };
+            let mut step = advance_render_ray::<DIAGNOSTICS, PATH>(ray, proposed_h, &mut metric, objects, &mut stats, dormand_prince);
+            if far_field && proposed_h > ordinary_h
+                && (!step.accepted || ray.pos.dot(step.ray.pos - ray.pos) < 0.0)
+            {
+                // An outward chord stays outside the sphere, including its transfer midpoint.
+                if step.accepted {
+                    metric = scene_metric(ray.pos, objects);
+                }
+                step = advance_render_ray::<DIAGNOSTICS, PATH>(ray, ordinary_h, &mut metric, objects, &mut stats, dormand_prince);
+            }
+            // Stop when the affine parameter can no longer advance in binary32.
+            if !step.accepted || affine + step.h == affine {
+                if DIAGNOSTICS {
+                    exit = if step.accepted { RayExit::AffineStagnation } else { RayExit::StepRejected };
+                }
+                break;
+            }
+            let disk_limited = DIAGNOSTICS && geometric_h <= next_h
+                && distance < clearance_limited_distance && step.h <= ordinary_h;
             if DIAGNOSTICS {
-                exit = if step.accepted { RayExit::AffineStagnation } else { RayExit::StepRejected };
+                stats.steps += 1;
+                stats.near_horizon_steps += near_horizon as u32;
+                stats.far_field_steps += (ray.pos.dot(ray.pos) >= 64.0 * 64.0) as u32;
+                stats.disk_limited_steps += disk_limited as u32;
+                stats.controller_limited_steps += (next_h < geometric_h) as u32;
+                stats.wide_steps += (step.h > ordinary_h) as u32;
             }
-            break;
-        }
-        let disk_limited = DIAGNOSTICS && geometric_h <= next_h
-            && distance < clearance_limited_distance && step.h <= ordinary_h;
-        if DIAGNOSTICS {
-            stats.steps += 1;
-            stats.near_horizon_steps += near_horizon as u32;
-            stats.far_field_steps += (ray.pos.dot(ray.pos) >= 64.0 * 64.0) as u32;
-            stats.disk_limited_steps += disk_limited as u32;
-            stats.controller_limited_steps += (next_h < geometric_h) as u32;
-            stats.wide_steps += (step.h > ordinary_h) as u32;
-        }
-        affine += step.h;
-        let h = step.h;
-        let next = step.ray;
-        next_h = h * clamp_f32(0.9 * pow(STEP_TOLERANCE / step.error.max(1.0e-20), 0.2), 0.5, 2.0);
-        let hit = intersect_objects_segment(ray.pos, next.pos, objects);
-        if hit.hit {
-            let intensity = hit.color.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
-            rgb += transmission * hit.color.xyz();
-            stokes.x += transmission * intensity;
-            if DIAGNOSTICS {
-                exit = RayExit::ObjectHit;
-            }
-            break;
-        }
-        if SWARM {
-            // Trapezoidal dt/dλ; `metric` now holds the accepted endpoint's metric.
-            let end_time = ray_time + 0.5 * h * (start_dt + (metric.inv * next.p).x);
-            let state = PixelState { rgb, transmission, stokes, iterations };
-            let body = swarm_hit(ray.pos, next.pos, ray_time, end_time, state);
-            ray_time = end_time;
-            if body.w > 0.0 {
-                rgb += transmission * body.xyz();
-                stokes.x += transmission * body.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
+            affine += step.h;
+            let h = step.h;
+            let next = step.ray;
+            next_h = h * clamp_f32(0.9 * pow(STEP_TOLERANCE / step.error.max(1.0e-20), 0.2), 0.5, 2.0);
+            let hit = intersect_objects_segment(ray.pos, next.pos, objects);
+            if hit.hit {
+                let intensity = hit.color.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
+                rgb += transmission * hit.color.xyz();
+                stokes.x += transmission * intensity;
                 if DIAGNOSTICS {
                     exit = RayExit::ObjectHit;
                 }
                 break;
             }
-        }
-        let middle = Ray {
-            pos: 0.5 * (ray.pos + next.pos),
-            p: 0.5 * (ray.p + next.p),
-            screen: 0.5 * (ray.screen + next.screen),
-        };
-        let plasma = sample_plasma(middle, objects, cam, disk);
-        let ds = h * plasma.energy;
-        if DIAGNOSTICS {
-            stats.plasma_steps += (ds > 0.0) as u32;
-            stats.vacuum_disk_steps += (disk_limited && ds <= 0.0) as u32;
-        }
-        if ds > 0.0 {
-            if cam.polarization_view != 0 {
-                let cell = polarized_cell(plasma.j, plasma.alpha, plasma.rho, ds);
-                stokes += transmission * vec4_f_v3(cell.x, foreground * cell.yzw());
-                foreground = foreground * faraday_rotation(plasma.rho, ds);
+            if SWARM {
+                // Trapezoidal dt/dλ; `metric` now holds the accepted endpoint's metric.
+                let end_time = ray_time + 0.5 * h * (start_dt + (metric.inv * next.p).x);
+                let state = PixelState { rgb, transmission, stokes, iterations };
+                let body = swarm_hit(ray.pos, next.pos, ray_time, end_time, state);
+                ray_time = end_time;
+                if body.w > 0.0 {
+                    rgb += transmission * body.xyz();
+                    stokes.x += transmission * body.xyz().dot(vec3(0.2126, 0.7152, 0.0722));
+                    if DIAGNOSTICS {
+                        exit = RayExit::ObjectHit;
+                    }
+                    break;
+                }
             }
-            rgb += transmission * plasma.rgb * absorption_integral(plasma.alpha, ds);
-            transmission *= exp(-plasma.alpha * ds);
-        }
-        ray = next;
-        let frame = screen_frame(ray, metric);
-        ray.screen = vec4_f_v3(0.0, frame[0]);
-        if ray.pos.length() > ESCAPE_R {
-            let direction = (metric.inv * ray.p).yzw().normalize();
-            let sky = unsafe {
-                sample_skybox(
-                    direction,
-                    skybox,
-                    sky_w as i32,
-                    sky_h as i32,
-                )
+            let cells = if cell_length > 0.0 {
+                clamp_f32(-floor_f32(-h * speed / cell_length), 1.0, MAX_TRANSFER_CELLS as f32) as u32
+            } else {
+                1
             };
-            rgb += transmission * sky;
-            stokes.x += transmission * sky.dot(vec3(0.2126, 0.7152, 0.0722));
-            if DIAGNOSTICS {
-                exit = RayExit::Escaped;
-                stats.sky_direction = [direction.x, direction.y, direction.z];
+            let mut sampled = false;
+            let mut cell = 0u32;
+            while cell < cells {
+                let middle = if decoupled {
+                    hermite_ray(ray, next, step.rates, h, (cell as f32 + 0.5) / cells as f32)
+                } else {
+                    Ray {
+                        pos: 0.5 * (ray.pos + next.pos),
+                        p: 0.5 * (ray.p + next.p),
+                        screen: 0.5 * (ray.screen + next.screen),
+                    }
+                };
+                let plasma = sample_plasma(middle, objects, cam, disk);
+                let ds = h / cells as f32 * plasma.energy;
+                if ds > 0.0 {
+                    sampled = true;
+                    composite_plasma(
+                        &plasma,
+                        ds,
+                        cam.polarization_view != 0,
+                        &mut rgb,
+                        &mut stokes,
+                        &mut transmission,
+                        &mut foreground,
+                    );
+                }
+                cell += 1;
             }
-            break;
-        }
-        if transmission < 0.001 {
             if DIAGNOSTICS {
-                exit = RayExit::Opaque;
+                stats.plasma_steps += sampled as u32;
+                stats.vacuum_disk_steps += (disk_limited && !sampled) as u32;
             }
-            break;
+            winding += swept_angle(ray.pos, next.pos);
+            ray = next;
+            if PATH != SINGLE_SCALAR {
+                let frame = screen_frame(ray, metric);
+                ray.screen = vec4_f_v3(0.0, frame[0]);
+            }
+            if ray.pos.length() > ESCAPE_R && winding > UNRESOLVED_WINDING {
+                // Unresolved: no sky, as for the iteration limit; captures already add none.
+                if DIAGNOSTICS {
+                    exit = RayExit::NearCritical;
+                }
+                break;
+            }
+            if ray.pos.length() > ESCAPE_R {
+                sky = true;
+                break;
+            }
+            if transmission < 0.001 {
+                if DIAGNOSTICS {
+                    exit = RayExit::Opaque;
+                }
+                break;
+            }
+            i += 1;
         }
-        i += 1;
+        if pending {
+            let (leg_inner, leg_polar) = leg_bounds::<BAND>(ray, &metric, spin_sq, leg_sq, leg_band);
+            let end = if BAND && leg_polar > 0.0 {
+                analytic_band_leg(ray, hole_spin.y, leg_inner, leg_polar)
+            } else {
+                analytic_vacuum_leg(ray, hole_spin.y, leg_inner)
+            };
+            if !end.ok {
+                // Resume the numerical trace; the guards rarely fail.
+                analytic = false;
+                continue;
+            }
+            winding += end.arc;
+            ray.pos = end.pos;
+            ray.p = end.p;
+            metric = scene_metric(ray.pos, objects);
+            if !end.escaped {
+                // On the sphere going in, or at the band: trace on from there.
+                next_h = 1.0e8;
+                if PATH != SINGLE_SCALAR {
+                    let frame = screen_frame(ray, metric);
+                    ray.screen = vec4_f_v3(0.0, frame[0]);
+                }
+                continue;
+            }
+            if winding > UNRESOLVED_WINDING {
+                if DIAGNOSTICS {
+                    exit = RayExit::NearCritical;
+                }
+            } else {
+                sky = true;
+            }
+        }
+        break;
+    }
+    if sky {
+        let direction = (metric.inv * ray.p).yzw().normalize();
+        let sample = unsafe {
+            sample_skybox(
+                direction,
+                skybox,
+                sky_w as i32,
+                sky_h as i32,
+            )
+        };
+        rgb += transmission * sample;
+        stokes.x += transmission * sample.dot(vec3(0.2126, 0.7152, 0.0722));
+        if DIAGNOSTICS {
+            exit = RayExit::Escaped;
+            stats.sky_direction = [direction.x, direction.y, direction.z];
+        }
     }
     let output = pixel_output(rgb, stokes, iterations, cam);
     if DIAGNOSTICS {
@@ -3004,6 +4656,7 @@ unsafe fn render_geodesic<
     unsafe {
         *out_image.add(idx) = vec4_v3_f(output, 1.0);
     }
+    iterations
 }
 
 #[cuda_device::kernel]
@@ -3055,11 +4708,12 @@ fn norm4(v: Vec4) -> f32 {
 }
 
 #[inline(always)]
-fn verification_metric(pos: Vec3, binary: bool) -> Metric {
+fn verification_metric(pos: Vec3, binary: bool) -> MetricJet {
+    let flat = MetricJet { m: flat_metric(), ..MetricJet::default() };
     if binary {
-        return add_kerr(
-            add_kerr(
-                flat_metric(),
+        return add_kerr_jet(
+            add_kerr_jet(
+                flat,
                 pos + vec3(7.0, 0.0, 0.0),
                 0.5,
                 vec3_splat(0.0),
@@ -3069,8 +4723,8 @@ fn verification_metric(pos: Vec3, binary: bool) -> Metric {
             vec3_splat(0.0),
         );
     }
-    add_kerr(
-        flat_metric(),
+    add_kerr_jet(
+        flat,
         pos + vec3(7.0, 0.0, 0.0),
         1.0,
         vec3_splat(0.0),
@@ -3078,7 +4732,7 @@ fn verification_metric(pos: Vec3, binary: bool) -> Metric {
 }
 
 #[inline(always)]
-fn metric_derivative(m: Metric, i: u32) -> Mat4 {
+fn metric_derivative(m: MetricJet, i: u32) -> Mat4 {
     if i == 1 {
         return m.dx;
     }
@@ -3092,14 +4746,14 @@ fn metric_derivative(m: Metric, i: u32) -> Mat4 {
 }
 
 #[inline(always)]
-fn connection(m: Metric, a: u32, b: u32, c: u32) -> f32 {
+fn connection(m: MetricJet, a: u32, b: u32, c: u32) -> f32 {
     let db = metric_derivative(m, b);
     let dc = metric_derivative(m, c);
     let mut value = 0.0_f32;
     let mut d = 0u32;
     while d < 4 {
         let dd = metric_derivative(m, d);
-        value += 0.5 * m.inv[d][a] * (db[c][d] + dc[b][d] - dd[c][b]);
+        value += 0.5 * m.m.inv[d][a] * (db[c][d] + dc[b][d] - dd[c][b]);
         d += 1;
     }
     value
@@ -3371,7 +5025,8 @@ pub unsafe fn bh_check_relativity(
     let identity = ETA * ETA;
     let x = vec3(3.0, 2.0, 4.0);
     let spin = vec3(0.4, -0.5, 0.6);
-    let m = add_kerr(flat_metric(), x, 0.7, spin);
+    let jet = add_kerr_jet(MetricJet { m: flat_metric(), ..MetricJet::default() }, x, 0.7, spin);
+    let m = jet.m;
     let j = vec4(1.0, 0.7, 0.1, 0.05);
     if i == 0 {
         passed = matrix_error(flat_metric().g, ETA) == 0.0;
@@ -3400,12 +5055,12 @@ pub unsafe fn bh_check_relativity(
         delta[i - 4] = 0.002;
         let plus = add_kerr(flat_metric(), x + delta, 0.7, spin);
         let minus = add_kerr(flat_metric(), x - delta, 0.7, spin);
-        let mut analytic = m.dx;
+        let mut analytic = jet.dx;
         if i == 5 {
-            analytic = m.dy;
+            analytic = jet.dy;
         }
         if i == 6 {
-            analytic = m.dz;
+            analytic = jet.dz;
         }
         passed = matrix_error((plus.g - minus.g) * 250.0, analytic) < 6.0e-5;
     }
@@ -3591,13 +5246,13 @@ pub unsafe fn bh_test_geodesic_rhs(inputs: *const f32, values: *mut f32, count: 
         return;
     }
     let b = (id * 72) as usize;
-    let mut m = Metric::default();
+    let mut m = MetricJet::default();
     unsafe {
-        m.inv = read_matrix(inputs, b);
+        m.m.inv = read_matrix(inputs, b);
         m.dx = read_matrix(inputs, b + 16);
         m.dy = read_matrix(inputs, b + 32);
         m.dz = read_matrix(inputs, b + 48);
-        let d = geodesic_rhs(
+        let d = geodesic_rhs_matrix(
             Ray {
                 pos: vec3_splat(0.0),
                 p: read_vec4(inputs, b + 64),
@@ -3615,6 +5270,71 @@ pub unsafe fn bh_test_geodesic_rhs(inputs: *const f32, values: *mut f32, count: 
             *values.add(o + 7 + i as usize) = d.screen[i];
             i += 1;
         }
+    }
+}
+
+/// Per state (pos, p, screen at stride 12): the matrix reference, the structured
+/// `geodesic_rhs` and the fused `metric_and_rhs`, 11 values each, then 1 when the fused
+/// metric has `scene_metric`'s bits (0 if not, -1 if the ray is invalid there).
+#[cuda_device::kernel]
+pub unsafe fn bh_test_rhs_forms(objects: *const Objects, inputs: *const f32, values: *mut f32, count: u32) {
+    let id = gid_x();
+    if id >= count {
+        return;
+    }
+    let objects = unsafe { &*objects };
+    let b = (id * 12) as usize;
+    unsafe {
+        let ray = Ray {
+            pos: read_vec4(inputs, b).xyz(),
+            p: read_vec4(inputs, b + 4),
+            screen: read_vec4(inputs, b + 8),
+        };
+        let mut jet = MetricJet { m: flat_metric(), ..MetricJet::default() };
+        let mut i = 0i32;
+        while i < objects.num_objects {
+            let idx = i as usize;
+            let x = ray.pos - objects.pos_radius[idx].xyz();
+            jet = add_kerr_jet(jet, x, objects.mass[idx].x.max(0.0), objects.spin[idx].xyz());
+            i += 1;
+        }
+        let m = scene_metric(ray.pos, objects);
+        let (fused_m, fused) = metric_and_rhs(ray, false, objects);
+        let o = (id * 34) as usize;
+        let forms = [
+            geodesic_rhs_matrix(ray, jet),
+            geodesic_rhs(ray, m, objects),
+            fused.unwrap_or_default(),
+        ];
+        let mut f = 0usize;
+        while f < 3 {
+            let d = forms[f];
+            let base = o + 11 * f;
+            let mut j = 0u32;
+            while j < 4 {
+                if j < 3 {
+                    *values.add(base + j as usize) = d.pos[j];
+                }
+                *values.add(base + 3 + j as usize) = d.p[j];
+                *values.add(base + 7 + j as usize) = d.screen[j];
+                j += 1;
+            }
+            f += 1;
+        }
+        let mut same = true;
+        let mut r = 0u32;
+        while r < 4 {
+            let mut c = 0u32;
+            while c < 4 {
+                same = same
+                    && fused_m.g[r][c].to_bits() == m.g[r][c].to_bits()
+                    && fused_m.inv[r][c].to_bits() == m.inv[r][c].to_bits();
+                c += 1;
+            }
+            r += 1;
+        }
+        same = same && fused_m.clearance.to_bits() == m.clearance.to_bits() && fused_m.valid == m.valid;
+        *values.add(o + 33) = if fused.is_none() { -1.0 } else if same { 1.0 } else { 0.0 };
     }
 }
 
@@ -3730,10 +5450,13 @@ pub unsafe fn bh_test_controller_classify(
     let mut ray = controller_initial_ray(c.x, objects);
     let start = ray;
     let mut metric = scene_metric(ray.pos, objects);
-    let mut capture_clearance = if c.y != 0.0 { EARLY_CAPTURE_CLEARANCE } else { 0.0 };
+    let mut capture_clearance = if c.y != 0.0 { capture_entry_clearance(c.y, objects.spin[0].y) } else { 0.0 };
     let mut next_h = 1.0e8_f32;
     let mut status = 0.0_f32;
     let mut steps = 0u32;
+    let mut winding = 0.0_f32;
+    // cases.w overrides the geometric step factor, for robustness sweeps.
+    let step_factor = if c.w != 0.0 { c.w } else { 0.12 };
     let mut i = 0u32;
     while i < 10000 {
         if metric.clearance < 0.002 || !metric.valid {
@@ -3748,13 +5471,15 @@ pub unsafe fn bh_test_controller_classify(
                 break;
             }
         }
-        let distance = clamp_f32(0.12 * metric.clearance, 0.0002, 32.0);
-        let step = advance_ray(
-            ray,
-            (distance / velocity.length().max(1.0e-6)).min(next_h),
-            metric,
-            objects,
-        );
+        let distance = clamp_f32(step_factor * metric.clearance, 0.0002, 32.0);
+        let wanted = (distance / velocity.length().max(1.0e-6)).min(next_h);
+        // cases.z != 0 selects the Dormand–Prince controller.
+        let step = if c.z != 0.0 {
+            let mut m = metric;
+            advance_ray_dp45::<false, GENERIC>(ray, wanted, &mut m, false, objects, &mut 0)
+        } else {
+            advance_ray(ray, wanted, metric, objects)
+        };
         if !step.accepted {
             status = 3.0;
             break;
@@ -3765,6 +5490,7 @@ pub unsafe fn bh_test_controller_classify(
                 0.5,
                 2.0,
             );
+        winding += swept_angle(ray.pos, step.ray.pos);
         ray = step.ray;
         metric = scene_metric(ray.pos, objects);
         ray.screen = vec4_f_v3(0.0, screen_frame(ray, metric)[0]);
@@ -3775,12 +5501,16 @@ pub unsafe fn bh_test_controller_classify(
         }
         i += 1;
     }
+    // Captured (1), escaped (2) or early capture (4) inside the band: unresolved (5).
+    if (status == 1.0 || status == 2.0 || status == 4.0) && winding > UNRESOLVED_WINDING {
+        status = 5.0;
+    }
     let base = (4 * id) as usize;
     unsafe {
         *results.add(base) = vec4_v3_f(start.pos, status);
         *results.add(base + 1) = start.p;
         *results.add(base + 2) = vec4_v3_f(ray.pos, steps as f32);
-        *results.add(base + 3) = vec4_v3_f(ray.p.yzw(), 0.0);
+        *results.add(base + 3) = vec4_v3_f(ray.p.yzw(), winding);
     }
 }
 
@@ -3803,6 +5533,7 @@ pub unsafe fn bh_test_controller_trace(
     let mut affine = 0.0_f32;
     let mut next_h = 1.0e8_f32;
     let mut steps = 0u32;
+    let mut rejected = 0u32;
     let mut status = 1.0_f32;
     let mut i = 0u32;
     while i < 200000 && affine < c.y {
@@ -3815,7 +5546,13 @@ pub unsafe fn bh_test_controller_trace(
         let wanted = (distance / velocity.length().max(1.0e-6))
             .min(next_h)
             .min(c.y - affine);
-        let step = advance_ray(ray, wanted, metric, objects);
+        // cases.z != 0 selects the production Dormand–Prince controller; zero the legacy RK4 one.
+        let mut m = metric;
+        let step = if c.z != 0.0 {
+            advance_ray_dp45::<true, GENERIC>(ray, wanted, &mut m, false, objects, &mut rejected)
+        } else {
+            advance_ray_counting::<true>(ray, wanted, &mut m, false, objects, &mut rejected)
+        };
         if !step.accepted {
             status = 3.0;
             break;
@@ -3833,12 +5570,13 @@ pub unsafe fn bh_test_controller_trace(
         steps += 1;
         i += 1;
     }
-    let base = (4 * id) as usize;
+    let base = (5 * id) as usize;
     unsafe {
         *results.add(base) = vec4_v3_f(start.pos, status);
         *results.add(base + 1) = start.p;
         *results.add(base + 2) = vec4_v3_f(ray.pos, affine);
         *results.add(base + 3) = vec4_v3_f(ray.p.yzw(), steps as f32);
+        *results.add(base + 4) = vec4(rejected as f32, 0.0, 0.0, 0.0);
     }
 }
 
@@ -3922,6 +5660,41 @@ pub unsafe fn bh_test_transfer(cases: *const Vec4, results: *mut Vec4, count: u3
     }
 }
 
+const TEST_PATH_CELLS: usize = 8;
+
+/// Checklist P1.9: composites a fixed path of constant-coefficient cells, camera side
+/// first, with the renderer's own cell routine. Each cell is three vectors: the Stokes
+/// emissivity, (alpha, rho) and (ds, scalar emissivity, -, -).
+#[cuda_device::kernel]
+pub unsafe fn bh_test_transfer_path(cases: *const Vec4, results: *mut Vec4, count: u32) {
+    let id = gid_x();
+    if id >= count {
+        return;
+    }
+    let mut rgb = vec3_splat(0.0);
+    let mut stokes = vec4_splat(0.0);
+    let mut transmission = 1.0_f32;
+    let mut foreground = faraday_rotation(vec3_splat(0.0), 0.0);
+    let mut cell = 0usize;
+    while cell < TEST_PATH_CELLS {
+        let base = id as usize * 3 * TEST_PATH_CELLS + 3 * cell;
+        let (j, k, extent) = unsafe { (*cases.add(base), *cases.add(base + 1), *cases.add(base + 2)) };
+        let plasma = Plasma {
+            rgb: vec3_splat(extent.y),
+            j,
+            alpha: k.x,
+            rho: k.yzw(),
+            energy: 1.0,
+        };
+        composite_plasma(&plasma, extent.x, true, &mut rgb, &mut stokes, &mut transmission, &mut foreground);
+        cell += 1;
+    }
+    unsafe {
+        *results.add(2 * id as usize) = stokes;
+        *results.add(2 * id as usize + 1) = vec4(rgb.x, transmission, 0.0, 0.0);
+    }
+}
+
 #[inline(always)]
 fn radius_rate(pos: Vec3, k: Vec3, r: f32) -> f32 {
     let a = vec3(0.0, 0.9375, 0.0);
@@ -3989,6 +5762,7 @@ pub unsafe fn bh_test_image(
     seeds: *const ImageSeed,
     settings: *const Vec4,
     pixels: *mut Vec4,
+    dormand_prince: u32,
 ) {
     let id = gid_x();
     let settings = unsafe { *settings };
@@ -4043,7 +5817,11 @@ pub unsafe fn bh_test_image(
             h = h.min(0.5_f32.max((r - 100.0) / dr.abs().max(1.0e-8)));
         }
         last_h = h;
-        let step = advance_ray_gauge(ray, h, &mut m, true, objects);
+        let step = if dormand_prince != 0 {
+            advance_ray_dp45::<false, GENERIC>(ray, h, &mut m, true, objects, &mut 0)
+        } else {
+            advance_ray_gauge(ray, h, &mut m, true, objects)
+        };
         last_actual = step.h;
         last_error = step.error;
         if !step.accepted {

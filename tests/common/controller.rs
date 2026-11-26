@@ -1,6 +1,7 @@
 //! Production adaptive stepping against the trajectory targets (obligation N3).
 //!
-//! The `bh_test_controller_trace` CUDA kernel traces Schwarzschild rays with `advance_ray` and the
+//! The `bh_test_controller_trace` CUDA kernel traces Schwarzschild rays with the legacy RK4 controller (and, with `cases.z`
+//! set, the production Dormand–Prince controller of checklist P1.1b) and the
 //! renderer's step-size rule up to a fixed affine parameter. Two independent
 //! measures of the error at the end point are compared with TARGETS.md:
 //!
@@ -85,19 +86,24 @@ fn adaptive_controller_misses_trajectory_targets() {
     // (impact parameter, affine span): a wide deflection, two near-critical
     // passes around the photon sphere, and a direct long ray.
     let cases: [(f32, f32); 4] = [(10.0, 220.0), (5.3, 220.0), (5.25, 260.0), (30.0, 400.0)];
+    // Each case runs with the legacy RK4 controller, then with the production
+    // Dormand–Prince one; both are held to the counterexample.
     let mut input = Vec::new();
-    for (impact, span) in cases {
-        for value in [impact, span, 0.0, 0.0] {
-            input.extend_from_slice(&value.to_le_bytes());
+    for dormand_prince in [0.0, 1.0] {
+        for (impact, span) in cases {
+            for value in [impact, span, dormand_prince, 0.0] {
+                input.extend_from_slice(&value.to_le_bytes());
+            }
         }
     }
     let mut objects = vec![0u8; 1040];
     objects[..4].copy_from_slice(&1i32.to_le_bytes());
     objects[528..532].copy_from_slice(&1f32.to_le_bytes());
-    let values = crate::gpu::controller_trace(&objects, &input, cases.len() as u32);
-    let mut failures = 0;
-    for (n, (impact, _)) in cases.iter().enumerate() {
-        let v: Vec<f64> = values[16 * n..16 * n + 16].iter().map(|&x| f64::from(x)).collect();
+    let values = crate::gpu::controller_trace(&objects, &input, 2 * cases.len() as u32);
+    let mut failures = [0; 2];
+    for (n, (impact, _)) in cases.iter().cycle().take(2 * cases.len()).enumerate() {
+        let (label, evaluations) = if n < cases.len() { ("rk4", 11.0) } else { ("dp45", 6.0) };
+        let v: Vec<f64> = values[20 * n..20 * n + 20].iter().map(|&x| f64::from(x)).collect();
         assert_eq!(v[3], 1.0, "ray {impact} did not reach its affine span: status {}", v[3]);
         let span = v[11];
         let start = [v[0], v[1], v[2], v[4], v[5], v[6], v[7]];
@@ -121,19 +127,22 @@ fn adaptive_controller_misses_trajectory_targets() {
             + 2.0 * max_abs(&gpu_pos) * p_target
             + 2.0 * pos_target * p_target;
         println!(
-            "impact {impact}: affine {span}, {} accepted steps; position error {pos_error:.3e} \
+            "{label} impact {impact}: affine {span}, {} accepted steps, {} rejected \
+             (at most {} metric evaluations); position error {pos_error:.3e} \
              (target {pos_target:.3e}), momentum error {p_error:.3e} (target {p_target:.3e}), \
              |ΔL| {drift:.3e} (targets allow {allowed:.3e}); reference agreement {agreement:.1e}",
-            v[15]
+            v[15],
+            v[16],
+            (v[15] + v[16]) * evaluations
         );
         if pos_error > pos_target || p_error > p_target {
-            failures += 1;
+            failures[n / cases.len()] += 1;
         }
     }
-    // Records the counterexample: at least one accepted trajectory exceeds the
-    // TARGETS.md position or momentum error. Remove this assertion once the
-    // controller is certified.
-    assert!(failures > 0, "every traced ray met the trajectory targets");
+    // Records the counterexample: for each controller, at least one accepted trajectory
+    // exceeds the TARGETS.md position or momentum error. Remove this assertion once
+    // the controller is certified.
+    assert!(failures.iter().all(|&f| f > 0), "a controller met every trajectory target: {failures:?}");
 }
 
 /// Schwarzschild classification (obligation N4). A geodesic with conserved
@@ -144,15 +153,20 @@ fn adaptive_controller_misses_trajectory_targets() {
 /// in binary64 from the GPU's own binary32 initial state, so the binary32
 /// null residual is accounted for exactly (for a null ray this reduces to
 /// `b = |L|/E` versus `3√3 M`). The renderer's rules must never return the
-/// opposite class; critical rays may only end unresolved.
+/// opposite class; critical rays may only end unresolved, which the unresolved
+/// band (`UNRESOLVED_WINDING`, checklist P1.6) does for rays that wound around the
+/// photon sphere. Both controllers run at geometric step factors 0.11, 0.12 and
+/// 0.13, so a pass cannot hinge on one factor's rounding.
 #[test]
-#[ignore = "requires a GPU; run with --release -- --ignored"]
+#[ignore = "requires a GPU; run with --release -- --ignored --nocapture"]
 fn classification_against_the_critical_impact_parameter() {
     let critical = 27.0_f64.sqrt() * MASS;
-    let run = |impacts: &[f32], disk_inner: f32| {
+    // (b, status, steps, margin, winding) per ray. Status: 1 captured, 2 escaped,
+    // 4 early capture, 5 unresolved band, 0 or 3 unresolved otherwise.
+    let run = |impacts: &[f32], disk_inner: f32, dormand_prince: f32, step_factor: f32| {
         let mut input = Vec::new();
         for &impact in impacts {
-            for value in [impact, disk_inner, 0.0, 0.0] {
+            for value in [impact, disk_inner, dormand_prince, step_factor] {
                 input.extend_from_slice(&value.to_le_bytes());
             }
         }
@@ -188,58 +202,74 @@ fn classification_against_the_critical_impact_parameter() {
                     if potential(a) < potential(c) { lo = a } else { hi = c }
                 }
                 let margin = (energy * energy - potential(0.5 * (lo + hi))) / (energy * energy);
-                (b, v[3] as u32, v[11] as u32, margin)
+                (b, v[3] as u32, v[11] as u32, margin, v[15])
             })
             .collect::<Vec<_>>()
     };
-    // Coarse pass to locate the critical impact, then every binary32 impact in
-    // a window around it.
+    // Coarse pass to locate the critical impact, then every binary32 impact in a
+    // window around it, and a wide sweep for rays safely away from it.
     let coarse: Vec<f32> = (0..64).map(|i| 5.0 + 0.4 * i as f32 / 63.0).collect();
-    let rays = run(&coarse, 0.0);
+    let rays = run(&coarse, 0.0, 0.0, 0.0);
     let index = rays.iter().position(|r| r.3 < 0.0).unwrap();
     let centre = coarse[index - 1] + (coarse[index] - coarse[index - 1])
         * (rays[index - 1].3 / (rays[index - 1].3 - rays[index].3)) as f32;
-    let mut fine = Vec::new();
+    let mut impacts = Vec::new();
     let mut impact = f32::from_bits(centre.to_bits() - 128);
     for _ in 0..256 {
-        fine.push(impact);
+        impacts.push(impact);
         impact = f32::from_bits(impact.to_bits() + 1);
     }
+    impacts.extend((0..256).map(|i| 4.0 + 2.5 * i as f32 / 255.0));
+    // Rays at least this far from the critical margin must resolve.
+    const SAFE_MARGIN: f64 = 1.0e-4;
+
     let mut wrong = Vec::new();
-    for disk_inner in [0.0, 4.0] {
-        let mut counts = [0; 5];
-        for (impact, (b, status, steps, margin)) in fine.iter().zip(run(&fine, disk_inner)) {
-            counts[status as usize] += 1;
-            // Positive margin: E² exceeds the potential barrier, so the ray is captured.
-            let exact = if margin > 0.0 { 1 } else { 2 };
-            let result = if status == 4 { 1 } else { status };
-            if (result == 1 || result == 2) && result != exact {
-                wrong.push((*impact, b - critical, margin, status, steps));
+    let mut unresolved_safe = Vec::new();
+    for dormand_prince in [0.0, 1.0] {
+        let name = if dormand_prince != 0.0 { "dp45" } else { "rk4" };
+        for step_factor in [0.11, 0.12, 0.13] {
+            for disk_inner in [0.0, 4.0] {
+                let mut counts = [0; 6];
+                // Smallest |margin| among definitive answers.
+                let mut closest = f64::INFINITY;
+                for (impact, (b, status, steps, margin, winding)) in
+                    impacts.iter().zip(run(&impacts, disk_inner, dormand_prince, step_factor))
+                {
+                    counts[status as usize] += 1;
+                    // Positive margin: E² exceeds the potential barrier, so the ray is captured.
+                    let exact = if margin > 0.0 { 1 } else { 2 };
+                    let result = if status == 4 { 1 } else { status };
+                    if result == 1 || result == 2 {
+                        closest = closest.min(margin.abs());
+                        if result != exact {
+                            wrong.push((name, step_factor, *impact, b - critical, margin, status, steps, winding));
+                        }
+                    } else if margin.abs() > SAFE_MARGIN {
+                        unresolved_safe.push((name, step_factor, *impact, margin, status, winding));
+                    }
+                }
+                println!(
+                    "{name} step factor {step_factor} disk inner {disk_inner}: captured/escaped/early/band/other unresolved {}/{}/{}/{}/{}; closest definitive |margin| {closest:.2e}",
+                    counts[1], counts[2], counts[4], counts[5], counts[0] + counts[3]
+                );
             }
         }
+    }
+    for (name, factor, impact, offset, margin, status, steps, winding) in wrong.iter().take(8) {
         println!(
-            "critical b = {critical}; window {:?}..{:?}; statuses captured/escaped/unresolved/early: {}/{}/{}/{}",
-            fine[0], fine[255], counts[1], counts[2], counts[0] + counts[3], counts[4]
+            "{name} {factor}: misclassified impact {impact}: b - b_c = {offset:.3e}, (E² - V_max)/E² = {margin:.3e}, status {status}, {steps} steps, winding {winding:.2} rad"
         );
     }
-    for (impact, offset, margin, status, steps) in wrong.iter().take(8) {
-        println!(
-            "misclassified impact {impact}: b - b_c = {offset:.3e}, (E² - V_max)/E² = {margin:.3e}, \
-             status {status}, {steps} steps"
-        );
-    }
-    println!("{} disagreements across the two 256-ray runs", wrong.len());
-    assert!(
-        wrong.is_empty(),
-        "resolved near-critical rays must match the reference"
-    );
+    assert!(wrong.is_empty(), "{} definitive answers contradict the reference", wrong.len());
+    assert!(unresolved_safe.is_empty(), "rays away from the critical margin left unresolved: {unresolved_safe:?}");
 }
 
 #[test]
 #[ignore = "requires a CUDA GPU"]
 fn kerr_early_capture_matches_the_equatorial_radial_potential() {
     const CASES: usize = 801;
-    for spin in [-0.99_f32, -0.82, 0.0, 0.82, 0.99] {
+    // ±0.995 is the guard's edge.
+    for spin in [-0.995_f32, -0.99, -0.82, 0.0, 0.82, 0.99, 0.995] {
         let a = f64::from(spin);
         let horizon = 1.0 + (1.0 - a * a).sqrt();
         let mut objects = vec![0u8; 1040];
@@ -280,6 +310,16 @@ fn kerr_early_capture_matches_the_equatorial_radial_potential() {
                     minimum > 0.0,
                     "early capture with an exterior radial turn at spin {a}, λ {lambda}, minimum {minimum}"
                 );
+                // The capture state: position, conserved p_t and spatial momentum.
+                assert!(
+                    black_hole::certified::capture_certified(
+                        spin,
+                        4.0,
+                        [new[8], new[9], new[10]],
+                        [new[4], new[12], new[13], new[14]],
+                    ),
+                    "GPU early capture not certified on the CPU at spin {a}, λ {lambda}"
+                );
                 early += 1;
                 saved_steps += old[11] as u32 - new[11] as u32;
             }
@@ -288,3 +328,4 @@ fn kerr_early_capture_matches_the_equatorial_radial_potential() {
         assert!(early > 0 && saved_steps > 0);
     }
 }
+

@@ -80,6 +80,7 @@ public import BlackHole.DirectionError
 public import BlackHole.CheckedData
 public import BlackHole.RayCertificate
 public import BlackHole.RK4Order
+public import BlackHole.DormandPrince
 public import BlackHole.TaylorLine
 public import BlackHole.WgslTransferPhi
 public import BlackHole.WgslTransferCell
@@ -90,6 +91,7 @@ public import BlackHole.WgslCounterexamples
 public import BlackHole.WgslAtan2
 public import BlackHole.KernelFixture
 public import BlackHole.CudaGeodesic
+public import BlackHole.CudaStructuredRhs
 public import BlackHole.WgslRAChk
 public import BlackHole.NagaFixture
 public import BlackHole.NagaFixtureSmall
