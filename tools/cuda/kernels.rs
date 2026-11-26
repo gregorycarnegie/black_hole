@@ -2797,7 +2797,87 @@ fn pack_rgba8(c: Vec4) -> u32 {
 
 // -- Production Kernels ------------------------------------------------------
 
-const EARLY_CAPTURE_CLEARANCE: f32 = 0.5;
+/// The horizon clearance at which the early-capture guard is first tried: where the
+/// ray comes within 0.05 of the disk's inner edge, the outermost place it can pass.
+/// Each later try waits until the clearance has halved.
+#[inline(always)]
+fn capture_entry_clearance(disk_inner: f32, spin: f32) -> f32 {
+    disk_inner - 0.05 - (1.0 + sqrt((1.0 - spin * spin).max(0.0)))
+}
+
+/// Most pieces of [horizon, r] on which the early-capture guard bounds the radial
+/// potential. It tries 1, 2, 4 and then 8 equal pieces, so a ray far from a turning
+/// point pays for one.
+const CAPTURE_PIECES: u32 = 8;
+
+/// Relative margin the fast capture estimate demands before the interval certificate.
+const CAPTURE_MARGIN: f64 = 1.0e-3;
+
+/// Lower bound on R(s) = (s^2 + A)^2 - Delta(s) K, with A = a^2 - a lambda, for
+/// |s - c| <= w and c >= 0, from its exact Taylor expansion about c: the larger of
+/// the two bounds of `null_radial_positive_near` (KerrCapture.lean).
+#[inline(always)]
+fn radial_piece_bound(c: f64, w: f64, aa: f64, k: f64, a2: f64) -> f64 {
+    let p = c * c + aa;
+    let r0 = p * p - (c * c - 2.0 * c + a2) * k;
+    let r1 = 4.0 * c * p - (2.0 * c - 2.0) * k;
+    let h = 6.0 * c * c + 2.0 * aa - k;
+    let low = r0 - 4.0 * c * w * w * w;
+    let linear = low - r1.abs() * w + h.min(0.0) * w * w;
+    if h > 0.0 { linear.max(low - r1 * r1 / (4.0 * h)) } else { linear }
+}
+
+/// Whether `radial_piece_bound` exceeds `floor` on each of `n` equal pieces of [lo, hi].
+#[inline(always)]
+fn radial_pieces_exceed(lo: f64, hi: f64, n: u32, aa: f64, k: f64, a2: f64, floor: f64) -> bool {
+    let width = (hi - lo) / f64::from(n);
+    let mut j = 0u32;
+    while j < n {
+        let c = lo + (f64::from(j) + 0.5) * width;
+        if !(radial_piece_bound(c, 0.5 * width, aa, k, a2) > floor) {
+            return false;
+        }
+        j += 1;
+    }
+    true
+}
+
+/// Whether `radial_piece_certified` holds on each of `n` pieces of [lo, hi]. The
+/// pieces share their knots, so they cover [lo, hi].
+#[inline(always)]
+fn radial_pieces_certified(lo: f64, hi: f64, n: u32, aa: Bound, k: Bound, a2: Bound) -> bool {
+    let mut s0 = lo;
+    let mut j = 1u32;
+    while j <= n {
+        let s1 = if j == n { hi } else { lo + (hi - lo) * (f64::from(j) / f64::from(n)) };
+        if !radial_piece_certified(s0, s1, aa, k, a2) {
+            return false;
+        }
+        s0 = s1;
+        j += 1;
+    }
+    true
+}
+
+/// Interval twin of `radial_piece_bound` on the piece [s0, s1]: whether either bound
+/// of `null_radial_positive_near` is certainly positive there.
+#[inline(always)]
+fn radial_piece_certified(s0: f64, s1: f64, aa: Bound, k: Bound, a2: Bound) -> bool {
+    let half = Bound::point(0.5);
+    let two = Bound::point(2.0);
+    let four = Bound::point(4.0);
+    let c = Bound::point(s0).add(Bound::point(s1)).mul(half);
+    let w = Bound::point(s1).sub(Bound::point(s0)).mul(half);
+    let c2 = c.sq();
+    let p = c2.add(aa);
+    let r0 = p.sq().sub(c2.sub(two.mul(c)).add(a2).mul(k));
+    let r1 = four.mul(c).mul(p).sub(two.mul(c).sub(two).mul(k));
+    let h = Bound::point(6.0).mul(c2).add(two.mul(aa)).sub(k);
+    let w2 = w.sq();
+    let low = r0.sub(four.mul(c).mul(w2.mul(w)));
+    let linear = low.sub(r1.abs().mul(w)).add(h.min_zero().mul(w2));
+    linear.lo > 0.0 || (h.lo > 0.0 && four.mul(h).mul(low).sub(r1.sq()).lo > 0.0)
+}
 
 #[inline(always)]
 /// Squared radius of a sphere enclosing the disk and the hole, at least `floor`.
@@ -2935,6 +3015,24 @@ impl Bound {
         }
     }
 
+    /// Exact: no rounding.
+    #[inline(always)]
+    fn abs(self) -> Self {
+        if self.lo >= 0.0 {
+            self
+        } else if self.hi <= 0.0 {
+            Bound { lo: -self.hi, hi: -self.lo }
+        } else {
+            Bound { lo: 0.0, hi: (-self.lo).max(self.hi) }
+        }
+    }
+
+    /// min(x, 0); exact.
+    #[inline(always)]
+    fn min_zero(self) -> Self {
+        Bound { lo: self.lo.min(0.0), hi: self.hi.min(0.0) }
+    }
+
     /// For an argument whose exact value is nonnegative.
     #[inline(always)]
     fn sqrt(self) -> Self {
@@ -2983,18 +3081,24 @@ fn inward_kerr_capture(ray: Ray, velocity: Vec3, spin: f32, disk_inner: f32) -> 
     let sigma_dr = r
         * (x * f64::from(velocity.x) + (1.0 + a2 / r2) * y * f64::from(velocity.y)
             + z * f64::from(velocity.z)) / energy.abs();
-    let horizon_p = horizon * horizon + a2 - a * lambda;
-    let here_p = r2 + a2 - a * lambda;
+    let aa = a2 - a * lambda;
+    let here_p = r2 + aa;
     let barrier = (r - horizon) * (r + horizon - 2.0) * carter;
     let scale = 1.0 + here_p * here_p + barrier;
     let radial = here_p * here_p - barrier;
-    // P(s) increases and Delta(s) <= Delta(r) for horizon <= s <= r.
-    // Require a positive lower bound on R throughout that interval and a consistent inward tangent.
-    horizon_p > 0.0
-        && horizon_p * horizon_p - barrier > 0.02 * scale
-        && sigma_dr < -0.05 * r2
-        && (sigma_dr * sigma_dr - radial).abs() < 0.004 * scale
-        && kerr_capture_certified(ray, spin, disk_inner)
+    // Require a consistent inward tangent, then a positive lower bound on R on each
+    // piece of [horizon, r].
+    if !(sigma_dr < -0.05 * r2 && (sigma_dr * sigma_dr - radial).abs() < 0.004 * scale) {
+        return false;
+    }
+    let mut pieces = 1u32;
+    while !radial_pieces_exceed(horizon, r, pieces, aa, carter, a2, CAPTURE_MARGIN * scale) {
+        if pieces == CAPTURE_PIECES {
+            return false;
+        }
+        pieces *= 2;
+    }
+    kerr_capture_certified(ray, spin, disk_inner)
 }
 
 /// Gauss–Legendre nodes and weights on [-1, 1], positive half, for the vacuum legs.
@@ -3454,9 +3558,10 @@ fn analytic_band_leg(ray: Ray, spin: f32, inner: f32, band: f32) -> LegEnd {
 }
 
 /// The capture guard's hypotheses for the exact real values of the stored binary32
-/// state, in interval binary64: r between the horizon and `disk_inner`, P(h) > 0,
-/// P(h)^2 - Delta(r) K > 0 (`null_radial_positive_below` in KerrCapture.lean) and an
-/// inward tangent computed from the state's own momentum. Mirrors
+/// state, in interval binary64: r between the horizon and `disk_inner`, a positive
+/// radial potential on every piece of [horizon, r] (`null_radial_positive_near` in
+/// KerrCapture.lean, on pieces that cover [horizon.lo, r.hi]) and an inward tangent
+/// computed from the state's own momentum. Mirrors
 /// `black_hole::certified::capture_certified`. Finite f32 inputs, with p_t > 1e-5,
 /// sine > 0.1 and r > 1 before their divisions, keep every intermediate below 1e300,
 /// so no endpoint overflows.
@@ -3496,8 +3601,14 @@ fn kerr_capture_certified(ray: Ray, spin: f32, disk_inner: f32) -> bool {
     let polar = y.div(r).div(sine).mul(x.mul(px).add(z.mul(pz))).sub(r.mul(sine).mul(py)).div(energy);
     let azimuthal = lambda.div(sine).sub(a.mul(sine));
     let carter = polar.sq().add(azimuthal.sq());
-    let horizon_p = horizon.sq().add(a2).sub(a.mul(lambda));
-    let barrier = r.sub(horizon).mul(r.add(horizon).sub(Bound::point(2.0))).mul(carter);
+    let aa = a2.sub(a.mul(lambda));
+    // Pieces that cover [horizon.lo, r.hi] contain [horizon, r].
+    let mut pieces = 1u32;
+    let mut covered = radial_pieces_certified(horizon.lo, r.hi, 1, aa, carter, a2);
+    while !covered && pieces < CAPTURE_PIECES {
+        pieces *= 2;
+        covered = radial_pieces_certified(horizon.lo, r.hi, pieces, aa, carter, a2);
+    }
     // Sigma dr/dlambda: g^-1 = eta - 2h l#l#^T with l# = (-1, l), exact for the null l of
     // add_kerr with spin along +y.
     let h = r.mul(r2).div(r2.sq().add(a.mul(y).sq()));
@@ -3508,7 +3619,7 @@ fn kerr_capture_certified(ray: Ray, spin: f32, disk_inner: f32) -> bool {
     let (vx, vy, vz) = (px.sub(k.mul(lx)), py.sub(k.mul(ly)), pz.sub(k.mul(lz)));
     let sigma_dr =
         r.mul(x.mul(vx).add(one.add(a2.div(r2)).mul(y).mul(vy)).add(z.mul(vz))).div(pt);
-    horizon_p.lo > 0.0 && horizon_p.sq().sub(barrier).lo > 0.0 && sigma_dr.hi < 0.0
+    covered && sigma_dr.hi < 0.0
 }
 
 #[cuda_device::kernel]
@@ -4266,7 +4377,7 @@ unsafe fn render_geodesic<
     let mut affine = 0.0_f32;
     let mut next_h = 1.0e8_f32;
     let mut capture_clearance = if early_capture && supports_early_capture(objects, disk) {
-        EARLY_CAPTURE_CLEARANCE
+        capture_entry_clearance(disk.r1, disk.spin)
     } else {
         0.0
     };
@@ -5339,7 +5450,7 @@ pub unsafe fn bh_test_controller_classify(
     let mut ray = controller_initial_ray(c.x, objects);
     let start = ray;
     let mut metric = scene_metric(ray.pos, objects);
-    let mut capture_clearance = if c.y != 0.0 { EARLY_CAPTURE_CLEARANCE } else { 0.0 };
+    let mut capture_clearance = if c.y != 0.0 { capture_entry_clearance(c.y, objects.spin[0].y) } else { 0.0 };
     let mut next_h = 1.0e8_f32;
     let mut status = 0.0_f32;
     let mut steps = 0u32;

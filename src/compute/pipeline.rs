@@ -3256,6 +3256,86 @@ fn long_tail_rays() {
     }
 }
 
+/// Near-critical tail: for the rays past 128 iterations in the default view, the minimum
+/// of the radial potential R(s) = P(s)^2 - Delta(s) K (E = 1) between the horizon and
+/// the early-capture entry radius r1 - 0.05, from each ray's initial state in binary64.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn near_critical_capture_margin() {
+    use crate::simulation::{DiskConfig, DiskModel, KERR_SPIN};
+    let cuda = shared_cuda();
+    let (width, height) = (400u32, 300u32);
+    let pixels = (width * height) as usize;
+    let cam = crate::camera::OrbitalCamera::default();
+    let mode = (KERR_SPIN, DiskModel::ThinNt, 0u32);
+    let (_, data) = diagnose_single_hole(0, mode.clone(), &cam, (width, height));
+    let rays = data.as_chunks::<RAY_FIELDS>().0;
+    let [d_camera, _, d_objects, _] = scene_buffers(mode, &cam, (width, height), false);
+    let config = DiskConfig::for_model(DiskModel::ThinNt, KERR_SPIN);
+    let r1 = f64::from(
+        build_disk_uniform(&DiskConfigUniform { spin: config.spin, binary_enabled: false, ..DiskConfigUniform::default() }).r1,
+    );
+    let input: Vec<f32> = (0..pixels as u32)
+        .flat_map(|i| [(i % width) as f32, (i / width) as f32, width as f32, height as f32])
+        .collect();
+    let d_pixels = cuda.clone_htod(&input);
+    let mut d_states = cuda.alloc_zeros::<f32>(pixels * 12);
+    let count = pixels as u32;
+    let kernel = cuda.module.load_function("bh_test_pixel_ray").unwrap();
+    let mut launch = cuda.stream.launch_builder(&kernel);
+    launch.arg(&d_camera);
+    launch.arg(&d_objects);
+    launch.arg(&d_pixels);
+    launch.arg(&mut d_states);
+    launch.arg(&count);
+    let cfg = LaunchConfig { grid_dim: (count.div_ceil(64), 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 };
+    unsafe { launch.launch(cfg).unwrap() };
+    drop(launch);
+    let states = cuda.clone_dtoh(&d_states);
+    let a = f64::from(KERR_SPIN);
+    let horizon = 1.0 + (1.0 - a * a).sqrt();
+    let entry = r1 - 0.05;
+    println!("r1 {r1:.4} horizon {horizon:.4}");
+    println!("x y | iterations exit | lambda K | s_min R_min R_min/P(s_min)^2 | R(entry) loose(entry)");
+    let mut slow: Vec<usize> = (0..pixels).filter(|&i| rays[i][0] > 128).collect();
+    slow.sort_unstable_by_key(|&i| std::cmp::Reverse(rays[i][0]));
+    let (mut positive, mut total) = (0, 0);
+    for &i in &slow {
+        let v: Vec<f64> = states[12 * i..12 * i + 12].iter().map(|&x| f64::from(x)).collect();
+        let c = black_hole::separated::constants(a, [v[0], v[1], v[2]], [v[4], v[5], v[6], v[7]]);
+        let lambda = c.angular / c.energy;
+        let k = c.carter / (c.energy * c.energy) + (lambda - a) * (lambda - a);
+        let radial = |s: f64| {
+            let p = s * s + a * a - a * lambda;
+            p * p - (s * s - 2.0 * s + a * a) * k
+        };
+        // The guard's bound P(horizon)^2 - Delta(s) K.
+        let loose = |s: f64| {
+            let p = horizon * horizon + a * a - a * lambda;
+            p * p - (s * s - 2.0 * s + a * a) * k
+        };
+        let (mut s_min, mut r_min) = (horizon, f64::INFINITY);
+        for j in 0..=100_000 {
+            let s = horizon + (entry - horizon) * f64::from(j) / 100_000.0;
+            if radial(s) < r_min {
+                (s_min, r_min) = (s, radial(s));
+            }
+        }
+        let p = s_min * s_min + a * a - a * lambda;
+        total += 1;
+        positive += usize::from(r_min > 0.0);
+        if total <= 40 || r_min <= 0.0 {
+            println!(
+                "{} {} | {} {} | {lambda:.5} {k:.5} | {s_min:.4} {r_min:.3e} {:.3e} | {:.3e} {:.3e}",
+                i % width as usize, i / width as usize, rays[i][0],
+                super::profile::RAY_EXITS[rays[i][7] as usize], r_min / (p * p), radial(entry), loose(entry)
+            );
+        }
+    }
+    println!("{positive} of {total} rays past 128 iterations have R > 0 below r1 - 0.05");
+}
+
 /// Checklist P1.5: the single-hole kernels in row order against costliest tiles first,
 /// as `dispatch_geodesic` runs them (the order from the previous launch's costs, and
 /// the reordering kernels timed with the frame). Images must be bit-identical and the
