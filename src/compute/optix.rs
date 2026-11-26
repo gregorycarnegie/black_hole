@@ -531,7 +531,11 @@ unsafe impl Sync for OptixRender {}
 impl OptixRender {
     pub(crate) fn new() -> Result<Self, String> {
         let module = &shared_cuda().module;
-        let load = |name: &str| module.load_function(name).map_err(|e| format!("{name}: {e}"));
+        let load = |name: &str| {
+            module
+                .load_function(name)
+                .map_err(|e| format!("{name}: {e}"))
+        };
         let entries = QUEUE_ENTRIES as usize;
         Ok(Self {
             pipeline: SegmentPipeline::new()?,
@@ -611,7 +615,9 @@ impl OptixRender {
             unsafe { builder.launch(cfg) }.expect("bh_geodesic_swarm_record launch failed");
             stream.synchronize().unwrap();
             let mut counted = [0u32];
-            unsafe { cudarc::driver::result::memcpy_dtoh_sync(&mut counted, self.counter.0).unwrap() };
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_sync(&mut counted, self.counter.0).unwrap()
+            };
             densest = densest.max(counted[0] as f32 / (rows * width) as f32);
             self.steps_per_pixel = self.steps_per_pixel.max(densest);
             let queued = counted[0].min(QUEUE_ENTRIES);
@@ -628,7 +634,11 @@ impl OptixRender {
                 memset(&self.first, pixels * 4);
                 let cfg = LaunchConfig::for_num_elems(queued);
                 let mut builder = stream.launch_builder(&self.first_hit);
-                builder.arg(&self.results.0).arg(&self.states.0).arg(&self.first.0).arg(&queued);
+                builder
+                    .arg(&self.results.0)
+                    .arg(&self.states.0)
+                    .arg(&self.first.0)
+                    .arg(&queued);
                 unsafe { builder.launch(cfg) }.expect("bh_swarm_first_hit launch failed");
                 let mut builder = stream.launch_builder(&self.apply);
                 builder
@@ -645,7 +655,10 @@ impl OptixRender {
             row0 += rows;
         }
         self.steps_per_pixel = densest.max(1.0);
-        RenderStats { build_ms, queued: queued_total }
+        RenderStats {
+            build_ms,
+            queued: queued_total,
+        }
     }
 }
 

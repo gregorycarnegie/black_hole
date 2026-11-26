@@ -37,8 +37,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev \
             libxkbcommon-x11-0 libwayland-dev libxkbcommon-dev
-      - name: Install stable Rust and Clippy
-        run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
+      - name: Install stable Rust, Clippy and rustfmt
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt --no-self-update
+      - name: Check formatting
+        # The tool crates are not in the workspace. kernels.rs is left alone: its hash pins the checked-in PTX.
+        # bash so a failing first command fails the step on Windows too.
+        shell: bash
+        run: |
+          cargo +stable fmt --check
+          rustfmt +stable --edition 2024 --check tools/optix/programs.rs tools/optix/src/main.rs tools/cuda/oxide/src/main.rs
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
@@ -55,13 +62,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@v10.4.0
         with:
           python-version: '3.14'
-          cache: pip
-          cache-dependency-path: verification/requirements-data.txt
-      - run: python -m pip install -r verification/requirements-data.txt
-      - run: python -m unittest discover -s verification -v
+          enable-cache: true
+          cache-dependency-glob: verification/requirements-data.txt
+      - run: uv run --no-project --with-requirements verification/requirements-data.txt python -m unittest discover -s verification -v
 
   release:
     name: Publish source release

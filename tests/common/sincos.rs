@@ -20,7 +20,11 @@ fn sincos_meets_the_wgsl_bound() {
     }
     for k in 1..2000 {
         let edge = k as f32 * std::f32::consts::FRAC_PI_4;
-        angles.extend([edge, f32::from_bits(edge.to_bits() + 1), f32::from_bits(edge.to_bits() - 1)]);
+        angles.extend([
+            edge,
+            f32::from_bits(edge.to_bits() + 1),
+            f32::from_bits(edge.to_bits() - 1),
+        ]);
     }
     angles.extend([f32::MAX, -f32::MAX, f32::MIN_POSITIVE, 0.0, -0.0]);
     let values = crate::gpu::sincos(&angles);
@@ -28,13 +32,19 @@ fn sincos_meets_the_wgsl_bound() {
     for (n, &a) in angles.iter().enumerate() {
         let [s_f32, c_f32] = values[n];
         let (s, c) = (f64::from(s_f32), f64::from(c_f32));
-        assert!(s.abs() <= 1.01 && c.abs() <= 1.01, "unbounded sincos({a}) = ({s}, {c})");
+        assert!(
+            s.abs() <= 1.01 && c.abs() <= 1.01,
+            "unbounded sincos({a}) = ({s}, {c})"
+        );
         let x = f64::from(a);
         if x.abs() <= 262_144.0 {
             let error = (s - x.sin()).abs().max((c - x.cos()).abs()) / (UNIT * (1.0 + x.abs()));
             worst = worst.max(error);
         }
     }
-    println!("sincos: {} angles, worst error {worst:.3} u (1 + |x|) for |x| <= 2^18", angles.len());
+    println!(
+        "sincos: {} angles, worst error {worst:.3} u (1 + |x|) for |x| <= 2^18",
+        angles.len()
+    );
     assert!(worst <= 128.0, "sincos error {worst} u (1 + |x|)");
 }

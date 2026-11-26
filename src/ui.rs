@@ -285,10 +285,17 @@ fn setup_panel(mut commands: Commands) {
                     ("Heatmap", UiAction::ToggleHeatmap, ToggleLabel::Heatmap),
                 ],
             );
-            let debug = ("Debug", UiAction::ToggleDebugBodies, ToggleLabel::DebugBodies);
+            let debug = (
+                "Debug",
+                UiAction::ToggleDebugBodies,
+                ToggleLabel::DebugBodies,
+            );
             // RT-core swarm tracing exists only in builds with the OptiX SDK.
             if cfg!(feature = "optix") {
-                spawn_toggle_row(root, &[debug, ("RTX", UiAction::ToggleRtx, ToggleLabel::Rtx)]);
+                spawn_toggle_row(
+                    root,
+                    &[debug, ("RTX", UiAction::ToggleRtx, ToggleLabel::Rtx)],
+                );
             } else {
                 spawn_toggle_row(root, &[debug]);
             }

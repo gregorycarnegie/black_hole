@@ -102,9 +102,20 @@ fn adaptive_controller_misses_trajectory_targets() {
     let values = crate::gpu::controller_trace(&objects, &input, 2 * cases.len() as u32);
     let mut failures = [0; 2];
     for (n, (impact, _)) in cases.iter().cycle().take(2 * cases.len()).enumerate() {
-        let (label, evaluations) = if n < cases.len() { ("rk4", 11.0) } else { ("dp45", 6.0) };
-        let v: Vec<f64> = values[20 * n..20 * n + 20].iter().map(|&x| f64::from(x)).collect();
-        assert_eq!(v[3], 1.0, "ray {impact} did not reach its affine span: status {}", v[3]);
+        let (label, evaluations) = if n < cases.len() {
+            ("rk4", 11.0)
+        } else {
+            ("dp45", 6.0)
+        };
+        let v: Vec<f64> = values[20 * n..20 * n + 20]
+            .iter()
+            .map(|&x| f64::from(x))
+            .collect();
+        assert_eq!(
+            v[3], 1.0,
+            "ray {impact} did not reach its affine span: status {}",
+            v[3]
+        );
         let span = v[11];
         let start = [v[0], v[1], v[2], v[4], v[5], v[6], v[7]];
         let coarse = reference(start, span, 200_000);
@@ -113,7 +124,9 @@ fn adaptive_controller_misses_trajectory_targets() {
         let gpu_pos = [v[8], v[9], v[10]];
         let gpu_p = [v[4], v[12], v[13], v[14]];
         let pos_error = max_abs(&std::array::from_fn::<f64, 3, _>(|i| gpu_pos[i] - fine[i]));
-        let p_error = max_abs(&std::array::from_fn::<f64, 4, _>(|i| gpu_p[i] - fine[i + 3]));
+        let p_error = max_abs(&std::array::from_fn::<f64, 4, _>(|i| {
+            gpu_p[i] - fine[i + 3]
+        }));
         let pos_target = 1e-6 * max_abs(&gpu_pos).max(1.0);
         let p_target = 1e-6 * max_abs(&gpu_p).max(1.0);
         assert!(
@@ -121,8 +134,8 @@ fn adaptive_controller_misses_trajectory_targets() {
             "reference not converged: {agreement}"
         );
         let angular = |x: [f64; 3], p: [f64; 4]| x[2] * p[1] - x[0] * p[3];
-        let drift = (angular(gpu_pos, gpu_p) - angular([v[0], v[1], v[2]], [v[4], v[5], v[6], v[7]]))
-            .abs();
+        let drift =
+            (angular(gpu_pos, gpu_p) - angular([v[0], v[1], v[2]], [v[4], v[5], v[6], v[7]])).abs();
         let allowed = 2.0 * pos_target * max_abs(&gpu_p)
             + 2.0 * max_abs(&gpu_pos) * p_target
             + 2.0 * pos_target * p_target;
@@ -142,7 +155,10 @@ fn adaptive_controller_misses_trajectory_targets() {
     // Records the counterexample: for each controller, at least one accepted trajectory
     // exceeds the TARGETS.md position or momentum error. Remove this assertion once
     // the controller is certified.
-    assert!(failures.iter().all(|&f| f > 0), "a controller met every trajectory target: {failures:?}");
+    assert!(
+        failures.iter().all(|&f| f > 0),
+        "a controller met every trajectory target: {failures:?}"
+    );
 }
 
 /// Schwarzschild classification (obligation N4). A geodesic with conserved
@@ -173,10 +189,11 @@ fn classification_against_the_critical_impact_parameter() {
         let mut objects = vec![0u8; 1040];
         objects[..4].copy_from_slice(&1i32.to_le_bytes());
         objects[528..532].copy_from_slice(&1f32.to_le_bytes());
-        let values: Vec<f64> = crate::gpu::controller_classify(&objects, &input, impacts.len() as u32)
-            .iter()
-            .map(|&x| f64::from(x))
-            .collect();
+        let values: Vec<f64> =
+            crate::gpu::controller_classify(&objects, &input, impacts.len() as u32)
+                .iter()
+                .map(|&x| f64::from(x))
+                .collect();
         (0..impacts.len())
             .map(|n| {
                 let v = &values[16 * n..16 * n + 16];
@@ -193,13 +210,18 @@ fn classification_against_the_critical_impact_parameter() {
                     }
                 }
                 let mass2 = -norm;
-                let potential = |r: f64| (1.0 - 2.0 * MASS / r) * (angular * angular / (r * r) + mass2);
+                let potential =
+                    |r: f64| (1.0 - 2.0 * MASS / r) * (angular * angular / (r * r) + mass2);
                 // V is unimodal on (2M, 100]; golden-section search for its peak.
                 let (mut lo, mut hi) = (2.5 * MASS, 4.0 * MASS);
                 for _ in 0..200 {
                     let a = lo + 0.381_966_011_250_105 * (hi - lo);
                     let c = hi - 0.381_966_011_250_105 * (hi - lo);
-                    if potential(a) < potential(c) { lo = a } else { hi = c }
+                    if potential(a) < potential(c) {
+                        lo = a
+                    } else {
+                        hi = c
+                    }
                 }
                 let margin = (energy * energy - potential(0.5 * (lo + hi))) / (energy * energy);
                 (b, v[3] as u32, v[11] as u32, margin, v[15])
@@ -211,8 +233,9 @@ fn classification_against_the_critical_impact_parameter() {
     let coarse: Vec<f32> = (0..64).map(|i| 5.0 + 0.4 * i as f32 / 63.0).collect();
     let rays = run(&coarse, 0.0, 0.0, 0.0);
     let index = rays.iter().position(|r| r.3 < 0.0).unwrap();
-    let centre = coarse[index - 1] + (coarse[index] - coarse[index - 1])
-        * (rays[index - 1].3 / (rays[index - 1].3 - rays[index].3)) as f32;
+    let centre = coarse[index - 1]
+        + (coarse[index] - coarse[index - 1])
+            * (rays[index - 1].3 / (rays[index - 1].3 - rays[index].3)) as f32;
     let mut impacts = Vec::new();
     let mut impact = f32::from_bits(centre.to_bits() - 128);
     for _ in 0..256 {
@@ -233,7 +256,9 @@ fn classification_against_the_critical_impact_parameter() {
                 // Smallest |margin| among definitive answers.
                 let mut closest = f64::INFINITY;
                 for (impact, (b, status, steps, margin, winding)) in
-                    impacts.iter().zip(run(&impacts, disk_inner, dormand_prince, step_factor))
+                    impacts
+                        .iter()
+                        .zip(run(&impacts, disk_inner, dormand_prince, step_factor))
                 {
                     counts[status as usize] += 1;
                     // Positive margin: E² exceeds the potential barrier, so the ray is captured.
@@ -242,7 +267,16 @@ fn classification_against_the_critical_impact_parameter() {
                     if result == 1 || result == 2 {
                         closest = closest.min(margin.abs());
                         if result != exact {
-                            wrong.push((name, step_factor, *impact, b - critical, margin, status, steps, winding));
+                            wrong.push((
+                                name,
+                                step_factor,
+                                *impact,
+                                b - critical,
+                                margin,
+                                status,
+                                steps,
+                                winding,
+                            ));
                         }
                     } else if margin.abs() > SAFE_MARGIN {
                         unresolved_safe.push((name, step_factor, *impact, margin, status, winding));
@@ -250,7 +284,11 @@ fn classification_against_the_critical_impact_parameter() {
                 }
                 println!(
                     "{name} step factor {step_factor} disk inner {disk_inner}: captured/escaped/early/band/other unresolved {}/{}/{}/{}/{}; closest definitive |margin| {closest:.2e}",
-                    counts[1], counts[2], counts[4], counts[5], counts[0] + counts[3]
+                    counts[1],
+                    counts[2],
+                    counts[4],
+                    counts[5],
+                    counts[0] + counts[3]
                 );
             }
         }
@@ -260,8 +298,15 @@ fn classification_against_the_critical_impact_parameter() {
             "{name} {factor}: misclassified impact {impact}: b - b_c = {offset:.3e}, (E² - V_max)/E² = {margin:.3e}, status {status}, {steps} steps, winding {winding:.2} rad"
         );
     }
-    assert!(wrong.is_empty(), "{} definitive answers contradict the reference", wrong.len());
-    assert!(unresolved_safe.is_empty(), "rays away from the critical margin left unresolved: {unresolved_safe:?}");
+    assert!(
+        wrong.is_empty(),
+        "{} definitive answers contradict the reference",
+        wrong.len()
+    );
+    assert!(
+        unresolved_safe.is_empty(),
+        "rays away from the critical margin left unresolved: {unresolved_safe:?}"
+    );
 }
 
 #[test]
@@ -293,17 +338,25 @@ fn kerr_early_capture_matches_the_equatorial_radial_potential() {
         let optimized = run(4.0);
         let mut early = 0;
         let mut saved_steps = 0;
-        for (old, new) in baseline.as_chunks::<16>().0.iter().zip(optimized.as_chunks::<16>().0) {
+        for (old, new) in baseline
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(optimized.as_chunks::<16>().0)
+        {
             let [x, z, pt, px, pz] = [new[0], new[2], new[4], new[5], new[7]].map(f64::from);
             let lambda = (z * px - x * pz) / -pt;
             // For equatorial null rays R(r)/r is a cubic with at most one exterior minimum.
             let min_r = ((lambda * lambda - a * a).max(0.0) / 3.0)
                 .sqrt()
                 .max(horizon);
-            let minimum = min_r * (min_r * min_r + a * a - lambda * lambda)
-                + 2.0 * (lambda - a).powi(2);
+            let minimum =
+                min_r * (min_r * min_r + a * a - lambda * lambda) + 2.0 * (lambda - a).powi(2);
             if old[3] == 2.0 {
-                assert_eq!(new[3], 2.0, "baseline escape changed at spin {a}, λ {lambda}");
+                assert_eq!(
+                    new[3], 2.0,
+                    "baseline escape changed at spin {a}, λ {lambda}"
+                );
             }
             if new[3] == 4.0 {
                 assert!(
@@ -328,4 +381,3 @@ fn kerr_early_capture_matches_the_equatorial_radial_potential() {
         assert!(early > 0 && saved_steps > 0);
     }
 }
-
