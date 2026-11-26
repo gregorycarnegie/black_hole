@@ -102,6 +102,8 @@ pub struct GeodesicPipeline {
     bound_other_sky_handle: Option<Handle<Image>>,
     last_objects: Option<GpuObjectsUniform>,
     last_disk: Option<GpuDiskUniform>,
+    /// Costliest-tiles-first order for the single-hole kernels (checklist P1.5).
+    tile_order: Option<TileOrder>,
     swarm: SwarmDevice,
     /// RT-core swarm queries: None until RTX is first switched on, then the started
     /// renderer, or None inside if OptiX could not start.
@@ -251,6 +253,7 @@ pub fn init_geodesic_pipeline(mut commands: Commands) {
         bound_other_sky_handle: None,
         last_objects: None,
         last_disk: None,
+        tile_order: None,
         swarm: SwarmDevice::new(),
         // Started on demand: OptiX reserves a 512 MB queue.
         #[cfg(feature = "optix")]
@@ -553,6 +556,7 @@ pub fn dispatch_geodesic(
         ref skybox_buf,
         ref other_skybox_buf,
         ref swarm,
+        ref mut tile_order,
         width,
         height,
         sky_width,
@@ -608,6 +612,39 @@ pub fn dispatch_geodesic(
         );
         return;
     }
+    let tiles = cfg.grid_dim.0 * cfg.grid_dim.1;
+    if enabled == 0 && single_source && tiles >= ORDER_MIN_WAVES * cuda.ordered_resident_blocks {
+        // Many waves: start the tiles that were costliest last frame first.
+        let order = tile_order
+            .take()
+            .filter(|order| order.tiles == tiles)
+            .unwrap_or_else(|| TileOrder::new(tiles));
+        let order = tile_order.insert(order);
+        let kernel = if scalar {
+            &cuda.geodesic_scalar
+        } else {
+            &cuda.geodesic_single
+        };
+        let mut builder = cuda.stream.launch_builder(kernel);
+        builder.arg(geodesic_buf);
+        builder.arg(camera_buf);
+        builder.arg(disk_buf);
+        builder.arg(objects_buf);
+        builder.arg(skybox_buf);
+        builder.arg(&width);
+        builder.arg(&height);
+        builder.arg(&sky_width);
+        builder.arg(&sky_height);
+        builder.arg(&order.order);
+        builder.arg(&mut order.costs);
+        unsafe {
+            builder
+                .launch(cfg)
+                .expect("CUDA bh_geodesic kernel launch failed");
+        }
+        order.reorder();
+        return;
+    }
     let kernel = match enabled {
         0 if scalar => &cuda.geodesic_scalar,
         0 if single_source => &cuda.geodesic_single,
@@ -627,6 +664,9 @@ pub fn dispatch_geodesic(
     builder.arg(&sky_height);
     if enabled > 1 {
         builder.arg(&enabled);
+    } else if takes_tile_order(kernel) {
+        builder.arg(&NO_TILE_ORDER);
+        builder.arg(&NO_TILE_ORDER);
     }
     unsafe {
         builder
@@ -676,6 +716,78 @@ fn active_experiments(single_source: bool, experiments: Option<&RayExperiments>)
         0
     };
     single | (u32::from(experiments.rk4) << 2) | (u32::from(experiments.coupled_transfer) << 3)
+}
+
+/// The order in which the single-hole kernels render their tiles (checklist P1.5). The
+/// frame is latency-bound: a few hundred near-critical rays take over a thousand steps
+/// each, so when the grid needs several waves, the tiles that were costliest in the last
+/// frame start first and overlap their latency with the rest of the frame.
+struct TileOrder {
+    tiles: u32,
+    /// Tile rendered by each block, costliest first; row order until a frame is measured.
+    order: CudaSlice<u32>,
+    /// Each tile's most iterations this frame; zeroed again by `bh_tile_order`.
+    costs: CudaSlice<u32>,
+    /// `bh_tile_histogram`'s counts, then `bh_tile_order`'s cursors.
+    buckets: CudaSlice<u32>,
+}
+
+/// Waves of resident blocks from which `dispatch_geodesic` orders the tiles. In
+/// `costliest_tiles_first` on an RTX 4090 (256 resident blocks), ordering cost 2–10%
+/// at 400×300 (3.8 waves), where the slowest rays' own latency sets the frame, and
+/// saved up to 13% at 640×480 (9.4 waves) and 8–23% at 960×540 (15.8 waves).
+const ORDER_MIN_WAVES: u32 = 8;
+
+/// A null `order` or `costs` argument: `bh_geodesic_single` and `bh_geodesic_scalar`
+/// then render in row order and record no costs.
+const NO_TILE_ORDER: u64 = 0;
+
+/// Whether `kernel` takes the tile `order` and `costs` arguments.
+fn takes_tile_order(kernel: &cudarc::driver::CudaFunction) -> bool {
+    let cuda = shared_cuda();
+    std::ptr::eq(kernel, &cuda.geodesic_single) || std::ptr::eq(kernel, &cuda.geodesic_scalar)
+}
+
+/// Cost buckets in `bh_tile_histogram` (`TILE_BUCKETS` in the CUDA kernels).
+const TILE_BUCKETS: usize = 32;
+
+impl TileOrder {
+    fn new(tiles: u32) -> Self {
+        let cuda = shared_cuda();
+        Self {
+            tiles,
+            order: cuda.clone_htod(&(0..tiles).collect::<Vec<u32>>()),
+            costs: cuda.alloc_zeros(tiles as usize),
+            buckets: cuda.alloc_zeros(2 * TILE_BUCKETS),
+        }
+    }
+
+    /// Orders the tiles by the costs the frame just recorded, for the next frame.
+    fn reorder(&mut self) {
+        let cuda = shared_cuda();
+        let cfg = LaunchConfig {
+            grid_dim: (self.tiles.div_ceil(128), 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda.stream
+            .memset_zeros(&mut self.buckets)
+            .expect("CUDA memset failed");
+        let (mut histogram, mut cursors) = self.buckets.split_at_mut(TILE_BUCKETS);
+        let mut builder = cuda.stream.launch_builder(&cuda.tile_histogram);
+        builder.arg(&self.costs);
+        builder.arg(&mut histogram);
+        builder.arg(&self.tiles);
+        unsafe { builder.launch(cfg).expect("CUDA bh_tile_histogram launch failed") };
+        drop(builder);
+        let mut builder = cuda.stream.launch_builder(&cuda.tile_order);
+        builder.arg(&mut self.costs);
+        builder.arg(&mut histogram);
+        builder.arg(&mut cursors);
+        builder.arg(&mut self.order);
+        builder.arg(&self.tiles);
+        unsafe { builder.launch(cfg).expect("CUDA bh_tile_order launch failed") };
+    }
 }
 
 fn ray_launch_config(width: u32, height: u32, single_source_kerr: bool) -> LaunchConfig {
@@ -1652,6 +1764,9 @@ fn render_single_hole(
     builder.arg(&1u32);
     if let Some(experiments) = &experiments {
         builder.arg(experiments);
+    } else if takes_tile_order(kernel) {
+        builder.arg(&NO_TILE_ORDER);
+        builder.arg(&NO_TILE_ORDER);
     }
     unsafe {
         builder
@@ -2821,6 +2936,9 @@ fn baseline_profile() {
             if let Some(diagnostics) = diagnostics {
                 builder.arg(diagnostics);
                 builder.arg(&production);
+            } else if takes_tile_order(kernel) {
+                builder.arg(&NO_TILE_ORDER);
+                builder.arg(&NO_TILE_ORDER);
             }
             unsafe { builder.launch(cfg).unwrap() };
             drop(builder);
@@ -2949,3 +3067,331 @@ fn baseline_profile() {
     std::fs::create_dir_all("target").unwrap();
     std::fs::write("target/baseline-profile.csv", csv).unwrap();
 }
+
+/// Checklist P1.5: the warp work a capped first pass plus compacted resume passes would
+/// save, modelled from per-ray attempt counts (steps plus rejected attempts) of the
+/// diagnostics kernel. Warps are the production 32-wide scanline rows; survivors are
+/// packed in pixel order, 32 to a warp, and each pass resumes them for another `cap`.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn long_tail_model() {
+    use crate::simulation::{DiskModel, KERR_SPIN};
+    let default = crate::camera::OrbitalCamera::default().elevation;
+    let scenes = [
+        ("thin disk", (KERR_SPIN, DiskModel::ThinNt, 0u32), default),
+        ("thin disk, view 2", (KERR_SPIN, DiskModel::ThinNt, 2), default),
+        ("hot flow, view 5", (KERR_SPIN, DiskModel::TruncatedHotFlow, 5), default),
+        ("thin disk, elevation 0.2", (KERR_SPIN, DiskModel::ThinNt, 0), 0.2),
+    ];
+    for (width, height) in [(400u32, 300u32), (960, 540)] {
+        for (name, mode, elevation) in &scenes {
+            let cam = crate::camera::OrbitalCamera {
+                elevation: *elevation,
+                ..Default::default()
+            };
+            let (_, data) = diagnose_single_hole(0, mode.clone(), &cam, (width, height));
+            let attempts: Vec<u64> = data
+                .as_chunks::<RAY_FIELDS>()
+                .0
+                .iter()
+                .map(|ray| u64::from(ray[1] + ray[2]).max(1))
+                .collect();
+            let warp = |lanes: &[u64]| 32 * lanes.iter().max().copied().unwrap_or(0);
+            let rows: Vec<&[u64]> = attempts
+                .chunks(width as usize)
+                .flat_map(|row| row.chunks(32))
+                .collect();
+            let full: u64 = rows.iter().map(|w| warp(w)).sum();
+            let total: u64 = attempts.iter().sum();
+            let mut sorted = attempts.clone();
+            sorted.sort_unstable();
+            let q = |f: f64| sorted[((sorted.len() - 1) as f64 * f) as usize];
+            println!(
+                "{width}×{height} {name}: attempts p50 {} p90 {} p99 {} max {}; lane efficiency {:.1}%; longest warp {:.2}% of warp work",
+                q(0.5), q(0.9), q(0.99), sorted[sorted.len() - 1],
+                100.0 * total as f64 / full as f64,
+                100.0 * warp(&sorted[sorted.len() - 1..]) as f64 / full as f64,
+            );
+            for cap in [32u64, 64, 128, 256, 512] {
+                let first: u64 = rows
+                    .iter()
+                    .map(|w| warp(&w.iter().map(|a| (*a).min(cap)).collect::<Vec<_>>()))
+                    .sum();
+                let mut left: Vec<u64> =
+                    attempts.iter().filter(|a| **a > cap).map(|a| a - cap).collect();
+                let survivors = left.len();
+                let (mut resumed, mut passes) = (0u64, 1);
+                while !left.is_empty() {
+                    resumed += left
+                        .chunks(32)
+                        .map(|w| warp(&w.iter().map(|a| (*a).min(cap)).collect::<Vec<_>>()))
+                        .sum::<u64>();
+                    left = left.iter().filter(|a| **a > cap).map(|a| a - cap).collect();
+                    passes += 1;
+                }
+                // One final pass that runs the survivors to completion.
+                let mut tail: Vec<u64> =
+                    attempts.iter().filter(|a| **a > cap).map(|a| a - cap).collect();
+                let once: u64 = tail.chunks(32).map(warp).sum();
+                tail.sort_unstable();
+                let sorted_once: u64 = tail.chunks(32).map(warp).sum();
+                println!(
+                    "    cap {cap}: survivors {:.2}%; repeated passes ({passes}) {:.1}% of warp work; one resume pass {:.1}% (cost-sorted {:.1}%)",
+                    100.0 * survivors as f64 / attempts.len() as f64,
+                    100.0 * (first + resumed) as f64 / full as f64,
+                    100.0 * (first + once) as f64 / full as f64,
+                    100.0 * (first + sorted_once) as f64 / full as f64,
+                );
+            }
+        }
+    }
+}
+
+/// Checklist P1.5: production-kernel time with the iteration limit cut to a first-pass
+/// cap, against the full limit. The difference bounds what resuming only the survivors
+/// could save, before the cost of the resume pass itself.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn long_tail_time() {
+    use crate::simulation::{DiskModel, KERR_SPIN};
+    const SAMPLES: usize = 30;
+    let cuda = shared_cuda();
+    let default = crate::camera::OrbitalCamera::default().elevation;
+    let scenes = [
+        ("thin disk", (KERR_SPIN, DiskModel::ThinNt, 0u32), default, &cuda.geodesic_scalar),
+        ("thin disk, view 2", (KERR_SPIN, DiskModel::ThinNt, 2), default, &cuda.geodesic_single),
+        ("hot flow, view 5", (KERR_SPIN, DiskModel::TruncatedHotFlow, 5), default, &cuda.geodesic_single),
+        ("thin disk, elevation 0.2", (KERR_SPIN, DiskModel::ThinNt, 0), 0.2, &cuda.geodesic_scalar),
+    ];
+    let caps = [10_000u32, 512, 256, 128, 64, 32, 1];
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    for (width, height) in [(400u32, 300u32), (960, 540)] {
+        let mut output = cuda.alloc_zeros::<f32>((width * height * 4) as usize);
+        for (name, mode, elevation, kernel) in &scenes {
+            let buffers: Vec<_> = caps
+                .iter()
+                .map(|&max_iter| {
+                    let cam = crate::camera::OrbitalCamera {
+                        elevation: *elevation,
+                        max_iter,
+                        ..Default::default()
+                    };
+                    scene_buffers(mode.clone(), &cam, (width, height), false)
+                })
+                .collect();
+            let mut times = vec![Vec::new(); caps.len()];
+            for round in 0..SAMPLES + 5 {
+                for n in 0..caps.len() {
+                    let n = if round % 2 == 0 { n } else { caps.len() - 1 - n };
+                    let [camera, disk, objects, sky] = &buffers[n];
+                    let start = cuda.stream.record_event(timing).unwrap();
+                    let mut builder = cuda.stream.launch_builder(kernel);
+                    builder.arg(&mut output);
+                    builder.arg(camera);
+                    builder.arg(disk);
+                    builder.arg(objects);
+                    builder.arg(sky);
+                    builder.arg(&width);
+                    builder.arg(&height);
+                    builder.arg(&2u32);
+                    builder.arg(&1u32);
+                    builder.arg(&NO_TILE_ORDER);
+                    builder.arg(&NO_TILE_ORDER);
+                    unsafe { builder.launch(ray_launch_config(width, height, true)).unwrap() };
+                    drop(builder);
+                    let end = cuda.stream.record_event(timing).unwrap();
+                    end.synchronize().unwrap();
+                    if round >= 5 {
+                        times[n].push(start.elapsed_ms(&end).unwrap());
+                    }
+                }
+            }
+            let medians: Vec<String> = times
+                .iter_mut()
+                .zip(caps)
+                .map(|(t, cap)| {
+                    t.sort_unstable_by(f32::total_cmp);
+                    format!("{cap}: {:.2}", 0.5 * (t[SAMPLES / 2 - 1] + t[SAMPLES / 2]))
+                })
+                .collect();
+            println!("{width}×{height} {name}: median ms by iteration cap {}", medians.join(", "));
+        }
+    }
+}
+
+/// Checklist P1.5: the costliest rays of each scene, with their diagnostics.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn long_tail_rays() {
+    use crate::simulation::{DiskModel, KERR_SPIN};
+    let default = crate::camera::OrbitalCamera::default().elevation;
+    let (width, height) = (400u32, 300u32);
+    for (name, mode, elevation) in [
+        ("thin disk", (KERR_SPIN, DiskModel::ThinNt, 0u32), default),
+        ("hot flow", (KERR_SPIN, DiskModel::TruncatedHotFlow, 5), default),
+    ] {
+        let cam = crate::camera::OrbitalCamera { elevation, ..Default::default() };
+        let (_, data) = diagnose_single_hole(0, mode, &cam, (width, height));
+        let rays = data.as_chunks::<RAY_FIELDS>().0;
+        let mut order: Vec<usize> = (0..rays.len()).collect();
+        order.sort_unstable_by_key(|&i| std::cmp::Reverse(rays[i][1] + rays[i][2]));
+        println!("{name}: x y | iterations steps rejected near_horizon far disk controller exit wide plasma vacuum_disk");
+        for &i in &order[..24] {
+            let r = &rays[i];
+            println!(
+                "  {} {} | {} {} {} {} {} {} {} {} {} {} {}",
+                i % width as usize, i / width as usize,
+                r[0], r[1], r[2], r[3], r[4], r[5], r[6],
+                super::profile::RAY_EXITS[r[7] as usize], r[8], r[12], r[13]
+            );
+        }
+        let mut exits = std::collections::BTreeMap::new();
+        for &i in &order[..rays.len() / 1000] {
+            *exits.entry(super::profile::RAY_EXITS[rays[i][7] as usize]).or_insert(0) += 1;
+        }
+        println!("  exits of the costliest 0.1%: {exits:?}");
+    }
+}
+
+/// Checklist P1.5: the single-hole kernels in row order against costliest tiles first,
+/// as `dispatch_geodesic` runs them (the order from the previous launch's costs, and
+/// the reordering kernels timed with the frame). Images must be bit-identical and the
+/// order a permutation of the tiles, costliest half-octave first; prints medians of 30
+/// alternating launches and whether the app would order the grid.
+#[cfg(test)]
+#[test]
+#[ignore = "requires a CUDA GPU; run with --release -- --ignored --nocapture"]
+fn costliest_tiles_first() {
+    use crate::simulation::{DiskModel, KERR_SPIN};
+    const SAMPLES: usize = 30;
+    let cuda = shared_cuda();
+    let default = crate::camera::OrbitalCamera::default().elevation;
+    let scenes = [
+        ("thin disk", (KERR_SPIN, DiskModel::ThinNt, 0u32), default, true),
+        ("thin disk, view 2", (KERR_SPIN, DiskModel::ThinNt, 2), default, false),
+        ("hot flow, view 5", (KERR_SPIN, DiskModel::TruncatedHotFlow, 5), default, false),
+        ("thin disk, elevation 0.2", (KERR_SPIN, DiskModel::ThinNt, 0), 0.2, true),
+    ];
+    let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
+    println!("resident blocks: {}", cuda.ordered_resident_blocks);
+    // `tile_bucket` in the CUDA kernels: half octaves of iterations, costliest first.
+    let bucket = |cost: u32| {
+        if cost == 0 {
+            return 31;
+        }
+        let octave = cost.ilog2();
+        30u32.saturating_sub(2 * octave + u32::from(octave > 0 && cost >= 3 << (octave - 1)))
+    };
+    for (width, height) in [(400u32, 300u32), (640, 480), (960, 540), (1280, 720), (1920, 1080)] {
+        let pixels = (width * height) as usize;
+        let cfg = ray_launch_config(width, height, true);
+        let tiles = cfg.grid_dim.0 * cfg.grid_dim.1;
+        let mut output = cuda.alloc_zeros::<f32>(pixels * 4);
+        for (name, mode, elevation, scalar) in &scenes {
+            let cam = crate::camera::OrbitalCamera {
+                elevation: *elevation,
+                ..Default::default()
+            };
+            let [camera, disk, objects, sky] =
+                &scene_buffers(mode.clone(), &cam, (width, height), false);
+            let kernel = if *scalar {
+                &cuda.geodesic_scalar
+            } else {
+                &cuda.geodesic_single
+            };
+            let mut order = TileOrder::new(tiles);
+            let run = |ordering: bool, output: &mut CudaSlice<f32>, order: &mut TileOrder| -> f32 {
+                let start = cuda.stream.record_event(timing).unwrap();
+                let mut builder = cuda.stream.launch_builder(kernel);
+                builder.arg(&mut *output);
+                builder.arg(camera);
+                builder.arg(disk);
+                builder.arg(objects);
+                builder.arg(sky);
+                builder.arg(&width);
+                builder.arg(&height);
+                builder.arg(&2u32);
+                builder.arg(&1u32);
+                if ordering {
+                    builder.arg(&order.order);
+                    builder.arg(&mut order.costs);
+                } else {
+                    builder.arg(&NO_TILE_ORDER);
+                    builder.arg(&NO_TILE_ORDER);
+                }
+                unsafe { builder.launch(cfg).unwrap() };
+                drop(builder);
+                if ordering {
+                    order.reorder();
+                }
+                let end = cuda.stream.record_event(timing).unwrap();
+                end.synchronize().unwrap();
+                start.elapsed_ms(&end).unwrap()
+            };
+            run(false, &mut output, &mut order);
+            let reference = cuda.clone_dtoh(&output);
+            // The first ordered frame measures the costs; the second uses them.
+            for _ in 0..2 {
+                cuda.stream.memset_zeros(&mut output).unwrap();
+                run(true, &mut output, &mut order);
+                let image = cuda.clone_dtoh(&output);
+                assert!(
+                    image.iter().zip(&reference).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{name}: ordering changes the image"
+                );
+            }
+            // The order the last frame left, and this frame's costs, the same as its own.
+            let used = cuda.clone_dtoh(&order.order);
+            let mut builder = cuda.stream.launch_builder(kernel);
+            builder.arg(&mut output);
+            builder.arg(camera);
+            builder.arg(disk);
+            builder.arg(objects);
+            builder.arg(sky);
+            builder.arg(&width);
+            builder.arg(&height);
+            builder.arg(&2u32);
+            builder.arg(&1u32);
+            builder.arg(&order.order);
+            builder.arg(&mut order.costs);
+            unsafe { builder.launch(cfg).unwrap() };
+            drop(builder);
+            let costs = cuda.clone_dtoh(&order.costs);
+            let mut seen = vec![false; tiles as usize];
+            for &tile in &used {
+                assert!(!std::mem::replace(&mut seen[tile as usize], true), "{name}: tile {tile} twice");
+            }
+            assert!(
+                used.windows(2).all(|w| bucket(costs[w[0] as usize]) <= bucket(costs[w[1] as usize])),
+                "{name}: tiles out of cost order"
+            );
+            order.reorder();
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..SAMPLES + 5 {
+                for variant in [round % 2, 1 - round % 2] {
+                    let ms = run(variant == 1, &mut output, &mut order);
+                    if round >= 5 {
+                        times[variant].push(ms);
+                    }
+                }
+            }
+            let [rows, first] = times.map(|mut t| {
+                t.sort_unstable_by(f32::total_cmp);
+                0.5 * (t[SAMPLES / 2 - 1] + t[SAMPLES / 2])
+            });
+            println!(
+                "{width}×{height} ({tiles} tiles{}) {name}: row order {rows:.2} ms, costliest first {first:.2} ms ({:+.1}%)",
+                if tiles >= ORDER_MIN_WAVES * cuda.ordered_resident_blocks {
+                    ", ordered in the app"
+                } else {
+                    ""
+                },
+                100.0 * (first / rows - 1.0)
+            );
+        }
+    }
+}
+

@@ -10,7 +10,7 @@ use cudarc::{
 
 pub const PTX: &str = include_str!("kernels.ptx");
 
-pub const KERNEL_NAMES: [&str; 27] = [
+pub const KERNEL_NAMES: [&str; 29] = [
     "bh_test_dust",
     "bh_wormhole",
     "bh_test_wormhole",
@@ -20,6 +20,8 @@ pub const KERNEL_NAMES: [&str; 27] = [
     "bh_geodesic_full_trace",
     "bh_geodesic_experiments",
     "bh_geodesic_diagnostics",
+    "bh_tile_histogram",
+    "bh_tile_order",
     "bh_geodesic_swarm",
     "bh_geodesic_swarm_record",
     "bh_swarm_first_hit",
@@ -49,6 +51,11 @@ pub struct CudaKernels {
     pub geodesic: CudaFunction,
     pub geodesic_single: CudaFunction,
     pub geodesic_scalar: CudaFunction,
+    pub tile_histogram: CudaFunction,
+    pub tile_order: CudaFunction,
+    /// Blocks of 128 threads of the single-hole kernels resident on the whole GPU at once:
+    /// a grid with more tiles than this runs in several waves (checklist P1.5).
+    pub ordered_resident_blocks: u32,
     pub geodesic_full_trace: CudaFunction,
     pub geodesic_experiments: CudaFunction,
     pub geodesic_swarm: CudaFunction,
@@ -102,13 +109,29 @@ impl CudaKernels {
                 .map_err(|err| format!("CUDA load function `{name}`: {err}"))
         };
 
+        let geodesic_single = load("bh_geodesic_single")?;
+        let geodesic_scalar = load("bh_geodesic_scalar")?;
+        let sm_count = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .map_err(|err| format!("CUDA SM count: {err}"))?;
+        let resident = |kernel: &CudaFunction| {
+            kernel
+                .occupancy_max_active_blocks_per_multiprocessor(128, 0, None)
+                .map_err(|err| format!("CUDA occupancy: {err}"))
+        };
+        let ordered_resident_blocks = sm_count as u32
+            * resident(&geodesic_single)?.min(resident(&geodesic_scalar)?);
+
         Ok(Self {
+            tile_histogram: load("bh_tile_histogram")?,
+            tile_order: load("bh_tile_order")?,
+            ordered_resident_blocks,
             test_dust: load("bh_test_dust")?,
             wormhole: load("bh_wormhole")?,
             test_wormhole: load("bh_test_wormhole")?,
             geodesic: load("bh_geodesic")?,
-            geodesic_single: load("bh_geodesic_single")?,
-            geodesic_scalar: load("bh_geodesic_scalar")?,
+            geodesic_single,
+            geodesic_scalar,
             geodesic_full_trace: load("bh_geodesic_full_trace")?,
             geodesic_experiments: load("bh_geodesic_experiments")?,
             geodesic_swarm: load("bh_geodesic_swarm")?,
@@ -336,3 +359,4 @@ fn sha256_hex(data: &[u8]) -> String {
     }
     out
 }
+

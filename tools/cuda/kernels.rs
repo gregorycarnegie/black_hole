@@ -3629,7 +3629,11 @@ pub unsafe fn bh_geodesic_full_trace(
     }
 }
 
-/// `bh_geodesic` for a scene with exactly one source (checklist P1.2).
+/// `bh_geodesic` for a scene with exactly one source (checklist P1.2). With `order` not
+/// null, block b (row-major) renders tile `order[b]` of the grid, so the costliest tiles
+/// can start first (checklist P1.5); null renders block b's own tile. With `costs` not
+/// null, each tile's most iterations go to `costs` (by `red.max`, so the caller zeroes
+/// it) for `bh_tile_histogram` and `bh_tile_order`. Blocks must be 32 threads wide.
 #[cuda_device::kernel]
 pub unsafe fn bh_geodesic_single(
     out_image: *mut Vec4,
@@ -3641,14 +3645,18 @@ pub unsafe fn bh_geodesic_single(
     height: u32,
     sky_w: u32,
     sky_h: u32,
+    order: *const u32,
+    costs: *mut u32,
 ) {
-    unsafe {
+    let (tile, pix_x, pix_y) = ordered_pixel(order, width);
+    let iterations = unsafe {
         render_geodesic::<false, false, SINGLE, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), true, true, true, true, true, 0,
-            gid_x(), gid_y(), no_swarm,
-        );
-    }
+            pix_x, pix_y, no_swarm,
+        )
+    };
+    record_tile_cost(costs, tile, iterations);
 }
 
 /// `bh_geodesic_single` for thermal intensity alone: no polarization view and no hot
@@ -3664,13 +3672,112 @@ pub unsafe fn bh_geodesic_scalar(
     height: u32,
     sky_w: u32,
     sky_h: u32,
+    order: *const u32,
+    costs: *mut u32,
 ) {
-    unsafe {
+    let (tile, pix_x, pix_y) = ordered_pixel(order, width);
+    let iterations = unsafe {
         render_geodesic::<false, false, SINGLE_SCALAR, false, _>(
             out_image, cam, disk, objects, skybox, width, height, sky_w, sky_h,
             core::ptr::null_mut(), true, true, true, true, true, 0,
-            gid_x(), gid_y(), no_swarm,
-        );
+            pix_x, pix_y, no_swarm,
+        )
+    };
+    record_tile_cost(costs, tile, iterations);
+}
+
+/// The tile block b (row-major) renders, `order[b]` (b itself when `order` is null),
+/// and this thread's pixel in it.
+#[inline(always)]
+fn ordered_pixel(order: *const u32, width: u32) -> (u32, u32, u32) {
+    use cuda_device::thread::*;
+    let tiles_x = width.div_ceil(blockDim_x());
+    let block = blockIdx_y() * tiles_x + blockIdx_x();
+    let tile = if order.is_null() { block } else { unsafe { *order.add(block as usize) } };
+    (
+        tile,
+        (tile % tiles_x) * blockDim_x() + threadIdx_x(),
+        (tile / tiles_x) * blockDim_y() + threadIdx_y(),
+    )
+}
+
+/// Raises `costs[tile]` to the warp's most iterations, unless `costs` is null; the warp
+/// is one 32-wide row of the tile.
+#[inline(always)]
+fn record_tile_cost(costs: *mut u32, tile: u32, iterations: u32) {
+    if costs.is_null() {
+        return;
+    }
+    // cuda-oxide refuses `redux.sync` below sm_100a, so reduce by butterfly shuffles.
+    let mut most = iterations;
+    let mut lane_mask = 16u32;
+    while lane_mask > 0 {
+        let other: u32;
+        unsafe {
+            cuda_device::ptx_asm!(
+                "shfl.sync.bfly.b32 %0, %1, %2, 31, 0xffffffff;",
+                out("=r") other, in("r") most, in("r") lane_mask
+            )
+        };
+        most = most.max(other);
+        lane_mask >>= 1;
+    }
+    if cuda_device::thread::threadIdx_x() == 0 {
+        atomic_max_u32(unsafe { costs.add(tile as usize) }, most);
+    }
+}
+
+/// Tile cost buckets, costliest first: half octaves of iterations, the last for none.
+const TILE_BUCKETS: u32 = 32;
+
+#[inline(always)]
+fn tile_bucket(cost: u32) -> u32 {
+    if cost == 0 {
+        return TILE_BUCKETS - 1;
+    }
+    let octave = 31 - cost.leading_zeros();
+    // The upper half of the octave starts at 1.5 * 2^octave.
+    let upper = (octave > 0 && cost >= 3 << (octave - 1)) as u32;
+    (TILE_BUCKETS - 2).saturating_sub(2 * octave + upper)
+}
+
+/// Counts the tiles in each cost bucket into `histogram` (zeroed by the caller).
+#[cuda_device::kernel]
+pub unsafe fn bh_tile_histogram(costs: *const u32, histogram: *mut u32, tiles: u32) {
+    let tile = gid_x();
+    if tile >= tiles {
+        return;
+    }
+    let bucket = tile_bucket(unsafe { *costs.add(tile as usize) });
+    atomic_add_u32(unsafe { histogram.add(bucket as usize) }, 1);
+}
+
+/// Orders the tiles costliest bucket first from `bh_tile_histogram`'s counts, using
+/// `cursors` (zeroed by the caller) to place tiles within a bucket, and zeroes `costs`
+/// for the next frame. Order within a bucket follows the atomics, not the tile index.
+#[cuda_device::kernel]
+pub unsafe fn bh_tile_order(
+    costs: *mut u32,
+    histogram: *const u32,
+    cursors: *mut u32,
+    order: *mut u32,
+    tiles: u32,
+) {
+    let tile = gid_x();
+    if tile >= tiles {
+        return;
+    }
+    let bucket = tile_bucket(unsafe { *costs.add(tile as usize) });
+    let mut start = 0u32;
+    let mut b = 0u32;
+    while b < bucket {
+        start += unsafe { *histogram.add(b as usize) };
+        b += 1;
+    }
+    let slot = start + atomic_add_u32(unsafe { cursors.add(bucket as usize) }, 1);
+    unsafe {
+        *order.add(slot as usize) = tile;
+        *costs.add(tile as usize) = 0;
     }
 }
 
@@ -4097,8 +4204,9 @@ fn leg_bounds<const BAND: bool>(ray: Ray, metric: &Metric, spin_sq: f32, leg_sq:
     (0.0, 0.0)
 }
 
-/// Renders pixel (`pix_x`, `pix_y`). With SWARM, `swarm_hit(start, end, t0, t1, state)`
-/// tests each accepted step against the swarm, as `swarm_segment_hit` does.
+/// Renders pixel (`pix_x`, `pix_y`) and returns its iterations (0 outside the image or
+/// for an invalid camera). With SWARM, `swarm_hit(start, end, t0, t1, state)` tests
+/// each accepted step against the swarm, as `swarm_segment_hit` does.
 #[inline(always)]
 unsafe fn render_geodesic<
     const DIAGNOSTICS: bool,
@@ -4126,9 +4234,9 @@ unsafe fn render_geodesic<
     pix_x: u32,
     pix_y: u32,
     swarm_hit: F,
-) {
+) -> u32 {
     if pix_x >= width || pix_y >= height {
-        return;
+        return 0;
     }
     let cam = unsafe { &*cam };
     let disk = unsafe { &*disk };
@@ -4147,7 +4255,7 @@ unsafe fn render_geodesic<
             unsafe { *diagnostics.add(idx) = stats };
         }
         unsafe { *out_image.add(idx) = vec4(0.0, 0.0, 0.0, 1.0) };
-        return;
+        return 0;
     }
     let mut ray = init_ray(cam.pos, dir, metric, cam);
     let mut rgb = vec3_splat(0.0);
@@ -4437,6 +4545,7 @@ unsafe fn render_geodesic<
     unsafe {
         *out_image.add(idx) = vec4_v3_f(output, 1.0);
     }
+    iterations
 }
 
 #[cuda_device::kernel]

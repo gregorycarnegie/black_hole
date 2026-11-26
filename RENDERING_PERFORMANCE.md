@@ -338,6 +338,59 @@ On the GPU the band legs remove another 55–62% of the steps in thin-disk views
 
 **Not covered.** Inside r = 12 and inside the band the trace stays numerical, as do inward legs to the horizon. Early capture already ends most of those with a proved Kerr test. Cheaper band legs would need the binary64 setup and rebuild cut down, or warp-synchronous scheduling of the legs; the step counts above bound the possible gain.
 
+## Long-tail scheduling (checklist P1.5)
+
+A few rays take far longer than the rest, so the checklist proposed a hybrid scheduler: a first pass of N iterations per ray, then a compacted resume pass for the rays still running. The measurements below show that the long tail is the latency of a few hundred rays, not idle lanes. The hybrid scheduler is therefore slower at every N tested, and was removed. What helps is starting the costliest tiles first, which is now the default when the grid needs at least 8 waves of blocks.
+
+```
+cargo test --release --bin black_hole long_tail -- --ignored --nocapture
+cargo test --release --bin black_hole costliest_tiles_first -- --ignored --nocapture
+```
+
+**Setup.** RTX 4090, the production single-hole kernels (`bh_geodesic_scalar` for thermal views, `bh_geodesic_single` for polarized views and the hot flow), 32×4 blocks, the default camera and two-texel test sky. Each kernel fits 2 blocks of 128 threads per SM, so 256 blocks are resident at once and a 400×300 frame (975 tiles) runs in about 4 waves. Medians of 30 launches after 5 warm-up rounds, variants alternating.
+
+**Lanes are not the problem.** `long_tail_model` takes each ray's attempts (accepted steps plus rejected tries) from the diagnostics kernel. The median ray takes 15–36 attempts, the 99th percentile 89–108, and the slowest 707–1,335. Warp lane efficiency is 70–87%. Suppose capping every ray at N attempts and packing the survivors into full warps cost nothing. One resume pass would then save at most 4–12% of warp work, and repeated passes at N = 32 (up to 42 of them) 7–19%.
+
+**Time is.** `long_tail_time` cuts the iteration limit instead. The table gives frame times in ms; the survivors are the rays still running at each limit.
+
+| Scene | 10,000 (default) | 512 | 256 | 128 | 64 |
+|---|---:|---:|---:|---:|---:|
+| 400×300 thin disk | 8.98 | 5.17 | 3.84 | 2.81 | 1.76 |
+| 400×300 hot flow, view 5 | 13.48 | 8.44 | 6.90 | 5.28 | 3.70 |
+| 960×540 thin disk | 11.49 | 7.49 | 5.99 | 5.10 | 4.15 |
+| 960×540 hot flow, view 5 | 19.85 | 15.47 | 13.77 | 13.33 | 12.34 |
+
+At 400×300, 0.35% of the rays run past 128 iterations and take 69% of the thin-disk frame. The 29 rays past 512 alone add 3.8 ms. Once the other blocks have finished, a lone warp takes about 5 µs per step, so a ray of 1,250 steps sets the frame time by itself.
+
+**The slowest rays.** `long_tail_rays` lists them. At 400×300 they form a short vertical line of pixels at x = 183, 17 pixels left of the image centre, in the thin disk and the hot flow alike. Nearly all end in early capture after winding less than the 14-rad unresolved band: they are near-critical rays that skim the hole before falling in. About 1,200 of their 1,250 steps are within clearance 1 of the horizon, where the step is limited to 0.12 × clearance; the Dormand–Prince controller limits at most 31 of them. Early capture ends a ray only once its binary64 test rules out a turning point.
+
+**Suspend and resume: slower.** The hybrid scheduler was built and measured. The first pass suspended each ray still running after N iterations into a structure-of-arrays queue: 35 words of ray state, and an atomic slot per ray. If the queue was full, the ray finished in place. A resume pass then ran the survivors to completion, one thread per slot. It recomputed each ray's metric the same way the last step had, so images were bit-identical to the single pass. The pair of kernels was slower than the single pass at every cap:
+
+| Scene | N = 64 | N = 128 | N = 256 | N = 512 |
+|---|---:|---:|---:|---:|
+| 400×300, four scenes | +7% to +12% | +21% to +32% | +21% to +31% | +12% to +26% |
+| 960×540, four scenes | +28% to +32% | +39% to +43% | +35% to +41% | +20% to +29% |
+
+Suspending a ray only moves its remaining steps after the first pass, so the frame waits for the first pass and then for the slowest ray's full latency. The kernels were removed: unused, the four of them and the ordering experiment's two kernels added 13 s (46%) to the driver's first, uncached PTX compilation (28.9 s to 42.2 s). A full wavefront scheduler was not tried, because the checklist makes it conditional on the hybrid one winning.
+
+**Costliest tiles first (default).** `bh_geodesic_single` and `bh_geodesic_scalar` take a tile `order` and a `costs` buffer. Block b renders tile `order[b]`. Each warp raises its tile's cost to its most iterations, using shuffles and one `red.max`. After the frame, `bh_tile_histogram` and `bh_tile_order` sort the tiles costliest first into half-octave buckets of iterations, all on the GPU. The next frame starts with the tiles that were costliest in this one, so the slowest rays overlap their latency with the rest of the frame. Ordering cannot change a pixel. `costliest_tiles_first` checks that each image is bit-identical and that the order is a permutation of the tiles, sorted by bucket. Times include the two ordering kernels:
+
+| Size (waves) | Thin disk | Thin disk, view 2 | Hot flow, view 5 | Thin disk, elevation 0.2 |
+|---|---:|---:|---:|---:|
+| 400×300 (3.8) | +3.9% to +5.9% | +8.5% to +9.8% | +3.7% to +4.9% | −0.8% to +1.6% |
+| 640×480 (9.4) | −3.0% to −1.1% | −2.3% to +0.7% | −9.7% to −8.5% | −7.0% to −4.9% |
+| 960×540 (15.8) | −8.7% to −7.7% | −9.3% to −7.5% | −24.3% to −22.5% | −9.3% to −6.4% |
+| 1280×720 (28.1) | −18.3% to −18.1% | −18.7% to −17.3% | −13.7% to −12.6% | −22.2% to −21.0% |
+| 1920×1080 (63.3) | −18.5% to −16.3% | −14.8% to −14.2% | −0.5% to +1.0% | −0.6% to +1.6% |
+
+Ranges are over three runs. The two 1920×1080 scenes that do not gain spend their time on throughput, not on the slowest rays. At 400×300 the slowest rays' own latency is longer than the rest of the frame, so starting them early cannot shorten it. Starting them together slows them. Strict sorting, sorting by summed iterations, moving only the 64 or 256 costliest tiles forward, and moving only tiles above 4 or 16 times the median cost all timed within noise of each other, with the same 400×300 loss. `dispatch_geodesic` therefore orders the tiles only when the grid has at least 8 times as many tiles as there are resident blocks (`ORDER_MIN_WAVES`), and passes null pointers otherwise. With null pointers the kernels render in row order. They are 0.7% slower on average than before the change, within the run-to-run spread (−1.9% to +2.6%), and the images are bit-identical.
+
+**Not covered.**
+- **The default view does not change.** The app's 800×600 window at render scale 0.5 renders 400×300, below the threshold. That frame is set by about 30 near-critical rays. Only fewer steps for them would shorten it: for example a step limit that lets the controller lead near the photon orbit, or analytic legs inside the disk's inner edge. Both change trajectories, so they need the separated reference checks (P1.6, P1.8).
+- **The binary, swarm and experiment kernels** still render in row order. The binary's 8×8 blocks do not fit the one-row-per-warp cost recording.
+- **A moving camera.** The order comes from the previous frame. In a still frame it is exact, but it was not timed while the camera orbits.
+- **Other GPUs.** The 8-wave threshold comes from one RTX 4090.
+
 ## Separated Kerr reference (checklist P1.7)
 
 `black_hole::separated` solves a single-hole null geodesic in binary64 from E, L and Q. It finds the radial roots with Ferrari's resolvent and Newton polishing, classifies the ray as captured, escaped or unresolved, and returns the state where the ray first reaches a target radius going outward. Unresolved covers critical double roots (relative root gap below 1e-7), bound orbits, rays exactly on the spin axis, and escaping rays with Q <= 0. The state at the target radius is computed two independent ways:
@@ -435,7 +488,7 @@ p95 is run 1's. The pinned kernel's p95 is 3–24% above its median, against 2�
 At 400×300 the shares are similar: the costliest 1% of rays make 2.0–4.2% of the attempts, and warp lane efficiency is 83.9–94.1% (lowest for the hot flow close-up).
 
 What this says about the next steps:
-- **Long tails are small.** No scene loses more than about 10% of its lanes to waiting on slower rays in the same warp (16% for the 400×300 close-up). That bounds what the long-tail scheduler (P1.5) can recover by regrouping rays, before its own compaction and relaunch costs.
+- **Long tails are small.** No scene loses more than about 10% of its lanes to waiting on slower rays in the same warp (16% for the 400×300 close-up). That bounds what the long-tail scheduler (P1.5) can recover by regrouping rays, before its own compaction and relaunch costs. "Long-tail scheduling" below found that the tail is the slowest rays' latency instead.
 - **Time goes into each step.** The scenes take 86–90 attempts per median ray, yet the polarized hot flow takes 1.8 times as long as the thermal thin disk at 960×540. The difference is per-step work: polarized transport and plasma sampling.
 - **The binary stagnates.** 5,123 binary rays (1.0%) end in affine stagnation, against at most 1 per single-hole frame.
 
