@@ -5,7 +5,11 @@
 
 use std::f64::consts::TAU;
 
-use bevy::{prelude::*, render::extract_resource::ExtractResource};
+use bevy::{
+    prelude::*,
+    render::extract_resource::ExtractResource,
+    tasks::{ComputeTaskPool, TaskPool},
+};
 
 use crate::camera::OrbitalCamera;
 
@@ -98,15 +102,108 @@ const STEP_SPAN: f64 = 12.0;
 /// Rays older than SLICES × SLICE_WIDTH fall back to brute force.
 pub(crate) const SLICES: u32 = 40;
 const LEAF_SIZE: usize = 4;
+/// Slice trees are cached on a grid of absolute coordinate time with spacing
+/// SLICE_WIDTH / TREES_PER_SLICE: tree m covers [m GRID - TREE_SPAN, m GRID], which
+/// holds every slice window ending in (m GRID - GRID, m GRID], so a tree serves
+/// frames until it ages out. Wider trees cull worse on the GPU: a grid of 8 cost
+/// ~1 ms at 4096 bodies, 2 was within noise of exact windows.
+const TREES_PER_SLICE: u32 = 4;
+const GRID: f64 = SLICE_WIDTH / TREES_PER_SLICE as f64;
+const TREE_SPAN: f64 = SLICE_WIDTH + STEP_SPAN + GRID;
+/// Slice k uses tree `newest - k TREES_PER_SLICE`, so this many trees are live.
+pub(crate) const TREE_SLOTS: usize = ((SLICES - 1) * TREES_PER_SLICE + 1) as usize;
 
-/// One bounding-volume hierarchy per time slice, in the kernel's layout: node i
-/// is `nodes[2i]` (minimum, then the right child or first item as bits) and
+/// One slice's bounding-volume hierarchy in the kernel's layout: node i is
+/// `nodes[2i]` (minimum, then the right child or first item as bits) and
 /// `nodes[2i + 1]` (maximum, then 0 or the leaf's item count as bits).
 #[derive(Default)]
 pub(crate) struct SwarmBvh {
     pub nodes: Vec<[f32; 4]>,
     pub items: Vec<u32>,
-    pub roots: Vec<u32>,
+}
+
+/// Slice trees cached by absolute time, tree m in slot m mod TREE_SLOTS of the
+/// device buffers, so a frame builds and uploads only the trees new to it.
+#[derive(Default)]
+pub(crate) struct SwarmTrees {
+    /// Body count and spin bits the held trees were built for.
+    key: Option<(u32, u32)>,
+    /// Tree index held in each slot.
+    held: Vec<Option<i64>>,
+    /// Nodes per tree: the median split makes it depend only on the body count.
+    pub nodes_per_tree: usize,
+}
+
+impl SwarmTrees {
+    /// Readies the trees for camera time `time`. Returns each slice's root and the
+    /// newly built trees with their slots, linked for those slots.
+    pub(crate) fn update(
+        &mut self,
+        count: u32,
+        spin: f32,
+        time: f64,
+    ) -> (Vec<u32>, Vec<(usize, SwarmBvh)>) {
+        let key = Some((count, spin.to_bits()));
+        if self.key != key {
+            *self = Self {
+                key,
+                held: vec![None; TREE_SLOTS],
+                nodes_per_tree: 0,
+            };
+        }
+        // Integer offsets from one rounding keep the live trees in distinct slots.
+        let newest = ((time + 0.5 * STEP_SPAN) / GRID).ceil() as i64;
+        let wanted: Vec<i64> = (0..SLICES)
+            .map(|k| newest - i64::from(k * TREES_PER_SLICE))
+            .collect();
+        let slot = |m: i64| m.rem_euclid(TREE_SLOTS as i64) as usize;
+        let missing: Vec<i64> = wanted
+            .iter()
+            .copied()
+            .filter(|&m| self.held[slot(m)] != Some(m))
+            .collect();
+        let pool = ComputeTaskPool::get_or_init(TaskPool::default);
+        let built = pool.scope(|scope| {
+            for &m in &missing {
+                scope.spawn(async move { slice_tree(count, spin, m) });
+            }
+        });
+        let mut fresh = Vec::with_capacity(missing.len());
+        for (m, mut tree) in missing.into_iter().zip(built) {
+            self.nodes_per_tree = tree.nodes.len() / 2;
+            let s = slot(m);
+            self.held[s] = Some(m);
+            // A non-zero count marks a leaf, whose link is its first item.
+            let (node_base, item_base) = ((s * self.nodes_per_tree) as u32, s as u32 * count);
+            for [lo, hi] in tree.nodes.as_chunks_mut::<2>().0 {
+                let base = if hi[3].to_bits() == 0 {
+                    node_base
+                } else {
+                    item_base
+                };
+                lo[3] = f32::from_bits(lo[3].to_bits() + base);
+            }
+            fresh.push((s, tree));
+        }
+        let roots = wanted
+            .iter()
+            .map(|&m| (slot(m) * self.nodes_per_tree) as u32)
+            .collect();
+        (roots, fresh)
+    }
+}
+
+/// Tree `m`, with links local to it.
+fn slice_tree(count: u32, spin: f32, m: i64) -> SwarmBvh {
+    let bodies = swarm_bodies(count, spin, m as f64 * GRID);
+    let boxes: Vec<_> = bodies
+        .iter()
+        .map(|b| b.swept_box(-TREE_SPAN, 0.0))
+        .collect();
+    let mut items: Vec<u32> = (0..count).collect();
+    let mut tree = SwarmBvh::default();
+    build_node(&mut tree, &boxes, &mut items);
+    tree
 }
 
 /// (inner, outer, spread) for `beyond_belt` in `tools/cuda/kernels.rs`: every body
@@ -122,19 +219,6 @@ pub(crate) fn swarm_belt(bodies: &[GpuSwarmBody]) -> (f32, f32, f32) {
         spread = spread.max(0.125 * orbit * omega * omega * 1.001);
     }
     (inner, outer, spread)
-}
-
-pub(crate) fn swarm_bvh(bodies: &[GpuSwarmBody]) -> SwarmBvh {
-    let mut bvh = SwarmBvh::default();
-    for slice in 0..SLICES {
-        let late = -f64::from(slice) * SLICE_WIDTH + 0.5 * STEP_SPAN;
-        let early = -f64::from(slice + 1) * SLICE_WIDTH - 0.5 * STEP_SPAN;
-        let boxes: Vec<_> = bodies.iter().map(|b| b.swept_box(early, late)).collect();
-        let mut items: Vec<u32> = (0..bodies.len() as u32).collect();
-        let root = build_node(&mut bvh, &boxes, &mut items);
-        bvh.roots.push(root);
-    }
-    bvh
 }
 
 fn build_node(bvh: &mut SwarmBvh, boxes: &[[[f32; 3]; 2]], items: &mut [u32]) -> u32 {
@@ -281,41 +365,74 @@ mod tests {
     #[rstest]
     #[case::one_leaf(3)]
     #[case::uneven(1000)]
-    #[case::largest_preset(4096)]
-    fn each_slice_tree_holds_every_body_once_inside_nested_boxes(#[case] count: u32) {
-        let bodies = swarm_bodies(count, 0.82, 77.0);
-        let bvh = swarm_bvh(&bodies);
-        assert_eq!(bvh.roots.len(), SLICES as usize);
-        let contains = |outer: usize, inner: usize| {
-            (0..3).all(|k| {
-                bvh.nodes[2 * outer][k] <= bvh.nodes[2 * inner][k]
-                    && bvh.nodes[2 * outer + 1][k] >= bvh.nodes[2 * inner + 1][k]
-            })
-        };
-        for (slice, &root) in bvh.roots.iter().enumerate() {
-            let mut seen = vec![0u32; count as usize];
-            let mut stack = vec![root as usize];
-            while let Some(node) = stack.pop() {
-                let link = bvh.nodes[2 * node][3].to_bits() as usize;
-                let leaf = bvh.nodes[2 * node + 1][3].to_bits() as usize;
-                if leaf == 0 {
-                    assert!(contains(node, node + 1) && contains(node, link));
-                    stack.extend([node + 1, link]);
-                } else {
-                    assert!(leaf <= LEAF_SIZE);
-                    for &item in &bvh.items[link..link + leaf] {
-                        seen[item as usize] += 1;
-                        // The body's box over the slice's whole window fits its leaf.
-                        let late = -(slice as f64) * SLICE_WIDTH + 0.5 * STEP_SPAN;
-                        let early = late - SLICE_WIDTH - STEP_SPAN;
-                        let b = bodies[item as usize].swept_box(early, late);
-                        assert!((0..3).all(|k| bvh.nodes[2 * node][k] <= b[0][k]
-                            && bvh.nodes[2 * node + 1][k] >= b[1][k]));
+    fn each_slice_root_holds_every_body_once_inside_nested_boxes(#[case] count: u32) {
+        // Follow the cache across frames on a host copy of the device buffers.
+        let mut trees = SwarmTrees::default();
+        let (mut nodes, mut items) = (Vec::new(), Vec::new());
+        let mut time = 77.0;
+        // Steps shorter and longer than the grid, then a spin change that rebuilds all.
+        let steps = [0.3, 1.7, 2.0, 9.0, 0.05].into_iter().cycle().take(60);
+        for (frame, dt) in steps.enumerate() {
+            let spin = if frame < 50 { 0.82 } else { 0.5 };
+            time += dt;
+            let (roots, fresh) = trees.update(count, spin, time);
+            let (n, c) = (trees.nodes_per_tree, count as usize);
+            nodes.resize(2 * n * TREE_SLOTS, [f32::NAN; 4]);
+            items.resize(c * TREE_SLOTS, u32::MAX);
+            for (slot, tree) in fresh {
+                nodes[2 * n * slot..2 * n * (slot + 1)].copy_from_slice(&tree.nodes);
+                items[c * slot..c * (slot + 1)].copy_from_slice(&tree.items);
+            }
+            assert_eq!(roots.len(), SLICES as usize);
+            let bodies = swarm_bodies(count, spin, time);
+            let contains = |outer: usize, inner: usize| {
+                (0..3).all(|k| {
+                    nodes[2 * outer][k] <= nodes[2 * inner][k]
+                        && nodes[2 * outer + 1][k] >= nodes[2 * inner + 1][k]
+                })
+            };
+            for (slice, &root) in roots.iter().enumerate() {
+                let mut seen = vec![0u32; c];
+                let mut stack = vec![root as usize];
+                while let Some(node) = stack.pop() {
+                    let link = nodes[2 * node][3].to_bits() as usize;
+                    let leaf = nodes[2 * node + 1][3].to_bits() as usize;
+                    if leaf == 0 {
+                        assert!(contains(node, node + 1) && contains(node, link));
+                        stack.extend([node + 1, link]);
+                    } else {
+                        assert!(leaf <= LEAF_SIZE);
+                        for &item in &items[link..link + leaf] {
+                            seen[item as usize] += 1;
+                            // This frame's box over the slice's whole window fits the leaf.
+                            let late = -(slice as f64) * SLICE_WIDTH + 0.5 * STEP_SPAN;
+                            let early = late - SLICE_WIDTH - STEP_SPAN;
+                            let b = bodies[item as usize].swept_box(early, late);
+                            assert!((0..3).all(|k| nodes[2 * node][k] <= b[0][k]
+                                && nodes[2 * node + 1][k] >= b[1][k]));
+                        }
                     }
                 }
+                assert!(seen.iter().all(|&n| n == 1), "frame {frame} slice {slice}");
             }
-            assert!(seen.iter().all(|&n| n == 1), "slice {slice}");
         }
+    }
+
+    #[test]
+    fn steady_frames_build_at_most_one_tree() {
+        let mut trees = SwarmTrees::default();
+        // GRID / 8 per frame: the newest tree index advances every eighth frame.
+        let built: Vec<usize> = (0..400)
+            .map(|frame| trees.update(16, 0.82, frame as f64 * GRID / 8.0).1.len())
+            .collect();
+        assert_eq!(built[0], SLICES as usize);
+        // Once TREES_PER_SLICE grid steps have filled every slot, one tree enters per step.
+        let warm = 8 * TREES_PER_SLICE as usize + 1;
+        for (frame, &n) in built.iter().enumerate().skip(warm) {
+            // ceil((t + STEP_SPAN / 2) / GRID) = ceil(frame / 8) + 3 steps up on frames 1 mod 8.
+            assert_eq!(n, usize::from(frame % 8 == 1), "frame {frame}: {built:?}");
+        }
+        assert_eq!(trees.update(16, 0.82, 399.0 * GRID / 8.0).1.len(), 0);
     }
 
     proptest! {

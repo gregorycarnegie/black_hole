@@ -2,8 +2,8 @@ use std::sync::{Arc, OnceLock};
 
 use cudarc::{
     driver::{
-        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DeviceRepr, LaunchConfig,
-        PushKernelArg, ValidAsZeroBits, result, sys,
+        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtrMut, DeviceRepr,
+        LaunchConfig, PushKernelArg, ValidAsZeroBits, result, sys,
     },
     nvrtc::Ptx,
 };
@@ -119,8 +119,8 @@ impl CudaKernels {
                 .occupancy_max_active_blocks_per_multiprocessor(128, 0, None)
                 .map_err(|err| format!("CUDA occupancy: {err}"))
         };
-        let ordered_resident_blocks = sm_count as u32
-            * resident(&geodesic_single)?.min(resident(&geodesic_scalar)?);
+        let ordered_resident_blocks =
+            sm_count as u32 * resident(&geodesic_single)?.min(resident(&geodesic_scalar)?);
 
         Ok(Self {
             tile_histogram: load("bh_tile_histogram")?,
@@ -174,7 +174,7 @@ impl CudaKernels {
             .expect("CUDA clone_htod failed")
     }
 
-    pub fn memcpy_htod<T: DeviceRepr + Copy>(&self, src: &[T], dst: &mut CudaSlice<T>) {
+    pub fn memcpy_htod<T: DeviceRepr + Copy>(&self, src: &[T], dst: &mut impl DevicePtrMut<T>) {
         self.bind_to_thread();
         self.stream
             .memcpy_htod(src, dst)
@@ -359,4 +359,3 @@ fn sha256_hex(data: &[u8]) -> String {
     }
     out
 }
-

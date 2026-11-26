@@ -94,7 +94,20 @@ fn setup_fps_ui(mut commands: Commands) {
     ));
 }
 
-fn update_fps_text(diagnostics: Res<DiagnosticsStore>, mut query: Query<&mut Text, With<FpsText>>) {
+/// Seconds between FPS counter refreshes, slow enough to read.
+const FPS_REFRESH: f32 = 0.5;
+
+fn update_fps_text(
+    time: Res<Time>,
+    mut since: Local<f32>,
+    diagnostics: Res<DiagnosticsStore>,
+    mut query: Query<&mut Text, With<FpsText>>,
+) {
+    *since += time.delta_secs();
+    if *since < FPS_REFRESH {
+        return;
+    }
+    *since = 0.0;
     let Ok(mut text) = query.single_mut() else {
         return;
     };

@@ -90,7 +90,11 @@ fn cbrt_meets_the_lean_hypothesis() {
     }
     println!("cbrtf {:.3} u", worst / UNIT);
     // 2⁻²³ = 2 u, less a margin for the binary64 reference.
-    assert!(worst <= 2.0 * UNIT * (1.0 - 1e-9), "cbrtf error {} u", worst / UNIT);
+    assert!(
+        worst <= 2.0 * UNIT * (1.0 - 1e-9),
+        "cbrtf error {} u",
+        worst / UNIT
+    );
 }
 
 #[test]
@@ -115,9 +119,26 @@ fn every_binary32_spin() {
         total.isco / UNIT
     );
     let nan_patterns = (1u64 << 24) - 2;
-    assert_eq!(total.nonfinite_horizon, 0, "horizon must be finite for every input");
-    assert_eq!(total.nan_isco, nan_patterns, "every NaN spin propagates to the ISCO");
-    assert_eq!(total.other_nonfinite_isco, 0, "non-NaN spins give finite ISCO");
-    assert!(total.horizon <= 7.0 * UNIT, "horizon error {} u", total.horizon / UNIT);
-    assert!(total.isco <= 18.0 * UNIT, "isco error {} u", total.isco / UNIT);
+    assert_eq!(
+        total.nonfinite_horizon, 0,
+        "horizon must be finite for every input"
+    );
+    assert_eq!(
+        total.nan_isco, nan_patterns,
+        "every NaN spin propagates to the ISCO"
+    );
+    assert_eq!(
+        total.other_nonfinite_isco, 0,
+        "non-NaN spins give finite ISCO"
+    );
+    assert!(
+        total.horizon <= 7.0 * UNIT,
+        "horizon error {} u",
+        total.horizon / UNIT
+    );
+    assert!(
+        total.isco <= 18.0 * UNIT,
+        "isco error {} u",
+        total.isco / UNIT
+    );
 }

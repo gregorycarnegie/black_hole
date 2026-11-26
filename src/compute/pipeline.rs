@@ -16,7 +16,7 @@ use crate::{
     simulation::{
         BINARY_DISK_INNER_RS, SCHWARZSCHILD_RADIUS, kerr_horizon_radius, kerr_isco_radius,
     },
-    swarm::{GpuSwarmBody, SLICES, Swarm, swarm_belt, swarm_bodies, swarm_bvh},
+    swarm::{GpuSwarmBody, SLICES, Swarm, SwarmTrees, TREE_SLOTS, swarm_belt, swarm_bodies},
 };
 
 // ── GPU-layout structs (repr C, bytemuck) ───────────────────────────────────
@@ -146,6 +146,7 @@ pub(super) struct SwarmDevice {
     slices: u32,
     /// From `swarm_belt`.
     belt: (f32, f32, f32),
+    trees: SwarmTrees,
 }
 
 impl SwarmDevice {
@@ -159,11 +160,13 @@ impl SwarmDevice {
             count: 0,
             slices: 0,
             belt: (0.0, 0.0, 0.0),
+            trees: SwarmTrees::default(),
         }
     }
 
-    /// Uploads `bodies`, with their BVHs unless `brute_force`.
-    fn upload(&mut self, bodies: &[GpuSwarmBody], brute_force: bool) {
+    /// Uploads the bodies at camera `time`, with their BVHs unless `brute_force`,
+    /// and returns the bodies.
+    fn upload(&mut self, count: u32, spin: f32, time: f64, brute_force: bool) -> Vec<GpuSwarmBody> {
         fn write(buffer: &mut CudaSlice<u8>, bytes: &[u8]) {
             let cuda = shared_cuda();
             if buffer.len() == bytes.len() {
@@ -172,17 +175,39 @@ impl SwarmDevice {
                 *buffer = cuda.clone_htod(bytes);
             }
         }
-        write(&mut self.bodies, bytemuck::cast_slice(bodies));
-        self.count = bodies.len() as u32;
+        let bodies = swarm_bodies(count, spin, time);
+        write(&mut self.bodies, bytemuck::cast_slice(&bodies));
+        self.count = count;
         self.slices = 0;
-        self.belt = swarm_belt(bodies);
-        if !brute_force && !bodies.is_empty() {
-            let bvh = swarm_bvh(bodies);
-            write(&mut self.nodes, bytemuck::cast_slice(&bvh.nodes));
-            write(&mut self.items, bytemuck::cast_slice(&bvh.items));
-            write(&mut self.roots, bytemuck::cast_slice(&bvh.roots));
+        self.belt = swarm_belt(&bodies);
+        if !brute_force && count > 0 {
+            let (roots, fresh) = self.trees.update(count, spin, time);
+            let cuda = shared_cuda();
+            // One fixed slot per tree, resized only with the count, which rebuilds every tree.
+            let node_bytes = self.trees.nodes_per_tree * size_of::<[[f32; 4]; 2]>();
+            let item_bytes = count as usize * size_of::<u32>();
+            if self.nodes.len() != TREE_SLOTS * node_bytes {
+                self.nodes = cuda.alloc_zeros(TREE_SLOTS * node_bytes);
+            }
+            if self.items.len() != TREE_SLOTS * item_bytes {
+                self.items = cuda.alloc_zeros(TREE_SLOTS * item_bytes);
+            }
+            for (slot, tree) in fresh {
+                let nodes = slot * node_bytes..(slot + 1) * node_bytes;
+                let items = slot * item_bytes..(slot + 1) * item_bytes;
+                cuda.memcpy_htod(
+                    bytemuck::cast_slice(&tree.nodes),
+                    &mut self.nodes.slice_mut(nodes),
+                );
+                cuda.memcpy_htod(
+                    bytemuck::cast_slice(&tree.items),
+                    &mut self.items.slice_mut(items),
+                );
+            }
+            write(&mut self.roots, bytemuck::cast_slice(&roots));
             self.slices = SLICES;
         }
+        bodies
     }
 
     fn launch(
@@ -375,10 +400,12 @@ pub fn prepare_bind_group(sources: GeodesicSources, gpu_images: Res<RenderAssets
     #[cfg(feature = "optix")]
     pipeline.optix_bodies.clear();
     if let Some(swarm) = sources.swarm.filter(|swarm| swarm.count > 0) {
-        let bodies = swarm_bodies(swarm.count, disk_config.spin, swarm.time);
         // OptiX builds its own motion GAS, so skip the software BVH then.
         let optix = pipeline.use_optix(swarm.rtx);
-        pipeline.swarm.upload(&bodies, optix);
+        #[cfg_attr(not(feature = "optix"), allow(unused_variables))]
+        let bodies = pipeline
+            .swarm
+            .upload(swarm.count, disk_config.spin, swarm.time, optix);
         #[cfg(feature = "optix")]
         if optix {
             pipeline.optix_bodies = bodies;
@@ -778,7 +805,11 @@ impl TileOrder {
         builder.arg(&self.costs);
         builder.arg(&mut histogram);
         builder.arg(&self.tiles);
-        unsafe { builder.launch(cfg).expect("CUDA bh_tile_histogram launch failed") };
+        unsafe {
+            builder
+                .launch(cfg)
+                .expect("CUDA bh_tile_histogram launch failed")
+        };
         drop(builder);
         let mut builder = cuda.stream.launch_builder(&cuda.tile_order);
         builder.arg(&mut self.costs);
@@ -786,7 +817,11 @@ impl TileOrder {
         builder.arg(&mut cursors);
         builder.arg(&mut self.order);
         builder.arg(&self.tiles);
-        unsafe { builder.launch(cfg).expect("CUDA bh_tile_order launch failed") };
+        unsafe {
+            builder
+                .launch(cfg)
+                .expect("CUDA bh_tile_order launch failed")
+        };
     }
 }
 
@@ -1052,7 +1087,9 @@ mod swarm_gpu {
             disk: cuda.clone_htod(bytemuck::bytes_of(&disk)),
             objects: cuda.clone_htod(bytemuck::bytes_of(&objects)),
             // A 2×1 sky, so the escape direction shows up in the image.
-            sky: cuda.clone_htod(bytemuck::cast_slice(&[0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0])),
+            sky: cuda.clone_htod(bytemuck::cast_slice(&[
+                0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0,
+            ])),
         }
     }
 
@@ -1102,9 +1139,10 @@ mod swarm_gpu {
         (cuda.clone_dtoh(&output), elapsed)
     }
 
-    fn device(bodies: &[GpuSwarmBody], brute_force: bool) -> SwarmDevice {
+    /// The device holding `swarm_bodies(count, SPIN, 1000.0)`.
+    fn device(count: u32, brute_force: bool) -> SwarmDevice {
         let mut device = SwarmDevice::new();
-        device.upload(bodies, brute_force);
+        device.upload(count, SPIN, 1000.0, brute_force);
         device
     }
 
@@ -1119,7 +1157,7 @@ mod swarm_gpu {
         // The swarm kernels trace numerically to the sky sphere: compare with the ordinary
         // image without analytic vacuum legs (experiment bit 8, checklist P1.8).
         let (ordinary, _) = render_with(&scene, None, 256);
-        let (swarm, _) = render(&scene, Some(&device(&[], true)));
+        let (swarm, _) = render(&scene, Some(&device(0, true)));
         assert!(
             ordinary
                 .iter()
@@ -1291,10 +1329,14 @@ mod swarm_gpu {
         plain.sort_by(f64::total_cmp);
         println!("without a swarm: {:.1} ms", plain[2]);
         // The app only takes the OptiX path with bodies to trace.
-        for count in crate::swarm::SWARM_COUNTS.into_iter().skip(1).chain([16384]) {
+        for count in crate::swarm::SWARM_COUNTS
+            .into_iter()
+            .skip(1)
+            .chain([16384])
+        {
             let bodies = swarm_bodies(count.max(1), SPIN, 1000.0);
             let bodies = &bodies[..count as usize];
-            let bvh = device(bodies, false);
+            let bvh = device(count, false);
             render(&scene, Some(&bvh));
             let mut bvh_times: Vec<f64> = (0..5).map(|_| render(&scene, Some(&bvh)).1).collect();
             bvh_times.sort_by(f64::total_cmp);
@@ -1309,7 +1351,7 @@ mod swarm_gpu {
             runs.sort_by(|a, b| a.0.total_cmp(&b.0));
             let (image, _, _) = render_optix(&mut optix, &scene, bodies, 0);
             let differing = if count <= 1024 {
-                let (brute, _) = render(&scene, Some(&device(bodies, true)));
+                let (brute, _) = render(&scene, Some(&device(count, true)));
                 brute
                     .iter()
                     .zip(&image)
@@ -1331,9 +1373,8 @@ mod swarm_gpu {
     #[ignore = "requires a CUDA GPU"]
     fn the_bvh_renders_the_brute_force_image() {
         let scene = single_hole();
-        let bodies = swarm_bodies(1024, SPIN, 1000.0);
-        let (brute, _) = render(&scene, Some(&device(&bodies, true)));
-        let (bvh, _) = render(&scene, Some(&device(&bodies, false)));
+        let (brute, _) = render(&scene, Some(&device(1024, true)));
+        let (bvh, _) = render(&scene, Some(&device(1024, false)));
         let differing = brute
             .iter()
             .zip(&bvh)
@@ -1353,15 +1394,18 @@ mod swarm_gpu {
         let mut optix = crate::compute::optix::OptixRender::new().unwrap();
         let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
         for count in [256, 1024, 4096] {
-            let bodies = swarm_bodies(count, SPIN, 1000.0);
             for brute_force in [true, false] {
-                let swarm = device(&bodies, brute_force);
+                let swarm = device(count, brute_force);
                 let early = render_with(&scene, Some(&swarm), 0).0;
                 let full = render_with(&scene, Some(&swarm), 1).0;
-                assert!(same(&early, &full), "{count} bodies, brute force {brute_force}");
+                assert!(
+                    same(&early, &full),
+                    "{count} bodies, brute force {brute_force}"
+                );
             }
             #[cfg(feature = "optix")]
             {
+                let bodies = swarm_bodies(count, SPIN, 1000.0);
                 render_optix(&mut optix, &scene, &bodies, 0);
                 let early = render_optix(&mut optix, &scene, &bodies, 0).0;
                 let full = render_optix(&mut optix, &scene, &bodies, 1).0;
@@ -1384,8 +1428,7 @@ mod swarm_gpu {
             v[v.len() / 2]
         };
         for count in crate::swarm::SWARM_COUNTS.into_iter().chain([16384]) {
-            let bodies = swarm_bodies(count, SPIN, 1000.0);
-            let bvh = (count > 0).then(|| device(&bodies, false));
+            let bvh = (count > 0).then(|| device(count, false));
             let mut times = [Vec::new(), Vec::new()];
             for sample in 0..6 {
                 for (variant, experiments) in [4, 0].into_iter().enumerate() {
@@ -1399,12 +1442,18 @@ mod swarm_gpu {
             #[cfg_attr(not(feature = "optix"), allow(unused_mut))]
             let mut row = format!("{count:>6} bodies: BVH rk4 {rk4:6.1} ms, dp45 {dp45:6.1} ms");
             if (1..=1024).contains(&count) {
-                let brute = render_with(&scene, Some(&device(&bodies, true)), 0).0;
+                let brute = render_with(&scene, Some(&device(count, true)), 0).0;
                 let fast = render_with(&scene, bvh.as_ref(), 0).0;
-                assert!(brute.iter().zip(&fast).all(|(a, b)| a.to_bits() == b.to_bits()));
+                assert!(
+                    brute
+                        .iter()
+                        .zip(&fast)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
             }
             #[cfg(feature = "optix")]
             if count > 0 {
+                let bodies = swarm_bodies(count, SPIN, 1000.0);
                 let mut times = [Vec::new(), Vec::new()];
                 for sample in 0..6 {
                     for (variant, experiments) in [4, 0].into_iter().enumerate() {
@@ -1417,9 +1466,14 @@ mod swarm_gpu {
                 let [rk4, dp45] = times.map(median);
                 row += &format!("; OptiX rk4 {rk4:6.1} ms, dp45 {dp45:6.1} ms");
                 if count <= 1024 {
-                    let brute = render_with(&scene, Some(&device(&bodies, true)), 0).0;
+                    let brute = render_with(&scene, Some(&device(count, true)), 0).0;
                     let image = render_optix(&mut optix, &scene, &bodies, 0).0;
-                    assert!(brute.iter().zip(&image).all(|(a, b)| a.to_bits() == b.to_bits()));
+                    assert!(
+                        brute
+                            .iter()
+                            .zip(&image)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                    );
                 }
             }
             println!("{row}");
@@ -1432,7 +1486,6 @@ mod swarm_gpu {
     fn swarm_bvh_against_brute_force() {
         let scene = single_hole();
         for count in crate::swarm::SWARM_COUNTS.into_iter().chain([16384]) {
-            let bodies = swarm_bodies(count, SPIN, 1000.0);
             let mut row = format!("{count:>6} bodies:");
             for brute_force in [true, false] {
                 if brute_force && count > 4096 {
@@ -1440,7 +1493,7 @@ mod swarm_gpu {
                     continue;
                 }
                 let start = std::time::Instant::now();
-                let swarm = device(&bodies, brute_force);
+                let swarm = device(count, brute_force);
                 let build = start.elapsed().as_secs_f64() * 1000.0;
                 render(&scene, Some(&swarm));
                 let mut times: Vec<f64> = (0..5).map(|_| render(&scene, Some(&swarm)).1).collect();
@@ -2182,13 +2235,16 @@ fn gpu_escapes_match_the_separated_solution() {
     let sky: CudaSlice<u8> = cuda.clone_htod(bytemuck::cast_slice(&[
         0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0,
     ]));
-    let diagnostics_kernel = cuda.module.load_function("bh_geodesic_diagnostics").unwrap();
+    let diagnostics_kernel = cuda
+        .module
+        .load_function("bh_geodesic_diagnostics")
+        .unwrap();
     let pixel_kernel = cuda.module.load_function("bh_test_pixel_ray").unwrap();
     // Experiment bit 3 restores the coupled transfer, whose disk limit shortens the
-    // geodesic step (checklist P1.9).
+    // geodesic step (checklist P1.9); bit 9 adds the legs that end at the disk's band.
     let runs = [0.0_f32, 0.5, -0.9, 0.99]
         .into_iter()
-        .flat_map(|s| [(s, 0u32), (s, 8)]);
+        .flat_map(|s| [(s, 0u32), (s, 8), (s, 512)]);
     for (spin, experiments) in runs {
         for elevation in [std::f64::consts::FRAC_PI_2 - 0.1, 0.4] {
             let scene = scene_objects(spin, false, false, 0.0, default_binary_spins());
@@ -2242,11 +2298,22 @@ fn gpu_escapes_match_the_separated_solution() {
             launch.arg(&1u32);
             launch.arg(&mut diagnostics);
             launch.arg(&experiments);
-            unsafe { launch.launch(ray_launch_config(width, height, true)).unwrap() };
+            unsafe {
+                launch
+                    .launch(ray_launch_config(width, height, true))
+                    .unwrap()
+            };
             drop(launch);
             let rays = cuda.clone_dtoh(&diagnostics);
             let input: Vec<f32> = (0..pixels as u32)
-                .flat_map(|i| [(i % width) as f32, (i / width) as f32, width as f32, height as f32])
+                .flat_map(|i| {
+                    [
+                        (i % width) as f32,
+                        (i / width) as f32,
+                        width as f32,
+                        height as f32,
+                    ]
+                })
                 .collect();
             let d_pixels = cuda.clone_htod(&input);
             let mut d_states = cuda.alloc_zeros::<f32>(pixels * 12);
@@ -2276,7 +2343,9 @@ fn gpu_escapes_match_the_separated_solution() {
                     .collect();
                 let (pos, p) = ([v[0], v[1], v[2]], [v[4], v[5], v[6], v[7]]);
                 let reference = match propagate(a, pos, p, 1600.0, Method::Elliptic) {
-                    Err(Unresolved::Unsupported) => propagate(a, pos, p, 1600.0, Method::Quadrature),
+                    Err(Unresolved::Unsupported) => {
+                        propagate(a, pos, p, 1600.0, Method::Quadrature)
+                    }
                     other => other,
                 };
                 let escaped = ray[7] == ESCAPED;
@@ -2384,11 +2453,15 @@ fn dp45_disagreements_against_a_binary64_reference() {
     let d_camera = cuda.clone_htod(bytemuck::bytes_of(&camera));
     let d_disk = cuda.clone_htod(bytemuck::bytes_of(&disk));
     let d_objects = cuda.clone_htod(bytemuck::bytes_of(&objects));
-    let sky: CudaSlice<u8> =
-        cuda.clone_htod(bytemuck::cast_slice(&[0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0]));
+    let sky: CudaSlice<u8> = cuda.clone_htod(bytemuck::cast_slice(&[
+        0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0,
+    ]));
 
     // Escape direction per pixel, or None, for the RK4 (4) and default DP45 (0) controllers.
-    let diagnostics_kernel = cuda.module.load_function("bh_geodesic_diagnostics").unwrap();
+    let diagnostics_kernel = cuda
+        .module
+        .load_function("bh_geodesic_diagnostics")
+        .unwrap();
     let directions = [4u32, 0].map(|experiments| {
         let pixels = (width * height) as usize;
         let mut image = cuda.alloc_zeros::<f32>(pixels * 4);
@@ -2405,7 +2478,11 @@ fn dp45_disagreements_against_a_binary64_reference() {
         launch.arg(&1u32);
         launch.arg(&mut diagnostics);
         launch.arg(&experiments);
-        unsafe { launch.launch(ray_launch_config(width, height, true)).unwrap() };
+        unsafe {
+            launch
+                .launch(ray_launch_config(width, height, true))
+                .unwrap()
+        };
         drop(launch);
         let data = cuda.clone_dtoh(&diagnostics);
         // RayDiagnostics: exit at field 7 (7 = escaped), sky direction at 9..12.
@@ -2421,10 +2498,12 @@ fn dp45_disagreements_against_a_binary64_reference() {
         (dot / (norm(a) * norm(b))).clamp(-1.0, 1.0).acos()
     };
     let mut disagreements: Vec<(f64, u32)> = (0..width * height)
-        .filter_map(|i| match (directions[0][i as usize], directions[1][i as usize]) {
-            (Some(a), Some(b)) => Some((angle(a, b), i)),
-            _ => None,
-        })
+        .filter_map(
+            |i| match (directions[0][i as usize], directions[1][i as usize]) {
+                (Some(a), Some(b)) => Some((angle(a, b), i)),
+                _ => None,
+            },
+        )
         .collect();
     disagreements.sort_by(|a, b| b.0.total_cmp(&a.0));
     // The 16 largest disagreements, then four ordinary pixels as a set-up check.
@@ -2434,7 +2513,14 @@ fn dp45_disagreements_against_a_binary64_reference() {
 
     let pixel_input: Vec<f32> = chosen
         .iter()
-        .flat_map(|&i| [(i % width) as f32, (i / width) as f32, width as f32, height as f32])
+        .flat_map(|&i| {
+            [
+                (i % width) as f32,
+                (i / width) as f32,
+                width as f32,
+                height as f32,
+            ]
+        })
         .collect();
     let d_pixels = cuda.clone_htod(&pixel_input);
     let mut d_states = cuda.alloc_zeros::<f32>(chosen.len() * 12);
@@ -2464,9 +2550,17 @@ fn dp45_disagreements_against_a_binary64_reference() {
     let reference = |start, factor| binary64_reference(&kerr, horizon, start, factor);
     let (mut rk4_closer, mut dp45_closer) = (0, 0);
     for (n, &i) in chosen.iter().enumerate() {
-        let v: Vec<f64> = states[12 * n..12 * n + 12].iter().map(|&x| f64::from(x)).collect();
-        let start = [v[0], v[1], v[2], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]];
-        let (rk4, dp45) = (directions[0][i as usize].unwrap(), directions[1][i as usize].unwrap());
+        let v: Vec<f64> = states[12 * n..12 * n + 12]
+            .iter()
+            .map(|&x| f64::from(x))
+            .collect();
+        let start = [
+            v[0], v[1], v[2], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11],
+        ];
+        let (rk4, dp45) = (
+            directions[0][i as usize].unwrap(),
+            directions[1][i as usize].unwrap(),
+        );
         let (x, y) = (i % width, i / width);
         let (Some(coarse), Some(fine)) = (reference(start, 0.004), reference(start, 0.002)) else {
             println!("({x}, {y}): reference reached the horizon");
@@ -2542,9 +2636,13 @@ fn early_capture_matches_the_full_trace() {
     cuda.bind_to_thread();
     let (width, height) = (160u32, 120u32);
     let pixels = (width * height) as usize;
-    let sky: CudaSlice<u8> =
-        cuda.clone_htod(bytemuck::cast_slice(&[0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0]));
-    let diagnostics_kernel = cuda.module.load_function("bh_geodesic_diagnostics").unwrap();
+    let sky: CudaSlice<u8> = cuda.clone_htod(bytemuck::cast_slice(&[
+        0.2_f32, 0.3, 0.9, 1.0, 0.9, 0.5, 0.2, 1.0,
+    ]));
+    let diagnostics_kernel = cuda
+        .module
+        .load_function("bh_geodesic_diagnostics")
+        .unwrap();
     let pixel_kernel = cuda.module.load_function("bh_test_pixel_ray").unwrap();
     let models = [
         DiskModel::ThinNt,
@@ -2616,8 +2714,7 @@ fn early_capture_matches_the_full_trace() {
                         let [(early_image, early_rays), (full_image, _)] =
                             [0u32, 1].map(|experiments| {
                                 let mut image = cuda.alloc_zeros::<f32>(pixels * 4);
-                                let mut diagnostics =
-                                    cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);
+                                let mut diagnostics = cuda.alloc_zeros::<u32>(pixels * RAY_FIELDS);
                                 let mut launch = cuda.stream.launch_builder(&diagnostics_kernel);
                                 launch.arg(&mut image);
                                 launch.arg(&d_camera);
@@ -2666,7 +2763,12 @@ fn early_capture_matches_the_full_trace() {
                         let input: Vec<f32> = chosen
                             .iter()
                             .flat_map(|&i| {
-                                [(i % width) as f32, (i / width) as f32, width as f32, height as f32]
+                                [
+                                    (i % width) as f32,
+                                    (i / width) as f32,
+                                    width as f32,
+                                    height as f32,
+                                ]
                             })
                             .collect();
                         let d_pixels = cuda.clone_htod(&input);
@@ -2692,10 +2794,13 @@ fn early_capture_matches_the_full_trace() {
                         let a = f64::from(spin);
                         let horizon = 1.0 + (1.0 - a * a).sqrt();
                         for (n, &i) in chosen.iter().enumerate() {
-                            let v: Vec<f64> =
-                                states[12 * n..12 * n + 12].iter().map(|&x| f64::from(x)).collect();
-                            let start =
-                                [v[0], v[1], v[2], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11]];
+                            let v: Vec<f64> = states[12 * n..12 * n + 12]
+                                .iter()
+                                .map(|&x| f64::from(x))
+                                .collect();
+                            let start = [
+                                v[0], v[1], v[2], v[4], v[5], v[6], v[7], v[8], v[9], v[10], v[11],
+                            ];
                             assert!(
                                 binary64_reference(&kerr, horizon, start, 0.004).is_none(),
                                 "early-captured pixel {i} escapes in binary64 at spin {spin}, {model:?}, elevation {elevation}"
@@ -2750,7 +2855,11 @@ fn the_capture_guard_is_certified_on_the_cpu() {
             let (x, y, z) = (w * phi.cos(), r * cos, w * phi.sin());
             // Null p for g^-1 = eta - 2h l#l#^T, with the backward-ray root p_t > 0.
             let h = r * r * r / (r.powi(4) + a * a * y * y);
-            let l = [(r * x - a * z) / (r * r + a * a), y / r, (r * z + a * x) / (r * r + a * a)];
+            let l = [
+                (r * x - a * z) / (r * r + a * a),
+                y / r,
+                (r * z + a * x) / (r * r + a * a),
+            ];
             // A random direction plus an inward pull, so that many states are captured.
             let norm = (x * x + y * y + z * z).sqrt();
             let pull = 6.0 * uniform();
@@ -2785,7 +2894,10 @@ fn the_capture_guard_is_certified_on_the_cpu() {
             let [[x, y, z, _], p] = *state;
             let certified = black_hole::certified::capture_certified(spin, 4.0, [x, y, z], p);
             if accepted == 1 {
-                assert!(certified, "spin {spin}: GPU capture of {state:?} is not certified");
+                assert!(
+                    certified,
+                    "spin {spin}: GPU capture of {state:?} is not certified"
+                );
                 captured += 1;
             } else if certified {
                 cpu_only += 1;
@@ -3080,9 +3192,21 @@ fn long_tail_model() {
     let default = crate::camera::OrbitalCamera::default().elevation;
     let scenes = [
         ("thin disk", (KERR_SPIN, DiskModel::ThinNt, 0u32), default),
-        ("thin disk, view 2", (KERR_SPIN, DiskModel::ThinNt, 2), default),
-        ("hot flow, view 5", (KERR_SPIN, DiskModel::TruncatedHotFlow, 5), default),
-        ("thin disk, elevation 0.2", (KERR_SPIN, DiskModel::ThinNt, 0), 0.2),
+        (
+            "thin disk, view 2",
+            (KERR_SPIN, DiskModel::ThinNt, 2),
+            default,
+        ),
+        (
+            "hot flow, view 5",
+            (KERR_SPIN, DiskModel::TruncatedHotFlow, 5),
+            default,
+        ),
+        (
+            "thin disk, elevation 0.2",
+            (KERR_SPIN, DiskModel::ThinNt, 0),
+            0.2,
+        ),
     ];
     for (width, height) in [(400u32, 300u32), (960, 540)] {
         for (name, mode, elevation) in &scenes {
@@ -3109,7 +3233,10 @@ fn long_tail_model() {
             let q = |f: f64| sorted[((sorted.len() - 1) as f64 * f) as usize];
             println!(
                 "{width}×{height} {name}: attempts p50 {} p90 {} p99 {} max {}; lane efficiency {:.1}%; longest warp {:.2}% of warp work",
-                q(0.5), q(0.9), q(0.99), sorted[sorted.len() - 1],
+                q(0.5),
+                q(0.9),
+                q(0.99),
+                sorted[sorted.len() - 1],
                 100.0 * total as f64 / full as f64,
                 100.0 * warp(&sorted[sorted.len() - 1..]) as f64 / full as f64,
             );
@@ -3118,8 +3245,11 @@ fn long_tail_model() {
                     .iter()
                     .map(|w| warp(&w.iter().map(|a| (*a).min(cap)).collect::<Vec<_>>()))
                     .sum();
-                let mut left: Vec<u64> =
-                    attempts.iter().filter(|a| **a > cap).map(|a| a - cap).collect();
+                let mut left: Vec<u64> = attempts
+                    .iter()
+                    .filter(|a| **a > cap)
+                    .map(|a| a - cap)
+                    .collect();
                 let survivors = left.len();
                 let (mut resumed, mut passes) = (0u64, 1);
                 while !left.is_empty() {
@@ -3131,8 +3261,11 @@ fn long_tail_model() {
                     passes += 1;
                 }
                 // One final pass that runs the survivors to completion.
-                let mut tail: Vec<u64> =
-                    attempts.iter().filter(|a| **a > cap).map(|a| a - cap).collect();
+                let mut tail: Vec<u64> = attempts
+                    .iter()
+                    .filter(|a| **a > cap)
+                    .map(|a| a - cap)
+                    .collect();
                 let once: u64 = tail.chunks(32).map(warp).sum();
                 tail.sort_unstable();
                 let sorted_once: u64 = tail.chunks(32).map(warp).sum();
@@ -3160,10 +3293,30 @@ fn long_tail_time() {
     let cuda = shared_cuda();
     let default = crate::camera::OrbitalCamera::default().elevation;
     let scenes = [
-        ("thin disk", (KERR_SPIN, DiskModel::ThinNt, 0u32), default, &cuda.geodesic_scalar),
-        ("thin disk, view 2", (KERR_SPIN, DiskModel::ThinNt, 2), default, &cuda.geodesic_single),
-        ("hot flow, view 5", (KERR_SPIN, DiskModel::TruncatedHotFlow, 5), default, &cuda.geodesic_single),
-        ("thin disk, elevation 0.2", (KERR_SPIN, DiskModel::ThinNt, 0), 0.2, &cuda.geodesic_scalar),
+        (
+            "thin disk",
+            (KERR_SPIN, DiskModel::ThinNt, 0u32),
+            default,
+            &cuda.geodesic_scalar,
+        ),
+        (
+            "thin disk, view 2",
+            (KERR_SPIN, DiskModel::ThinNt, 2),
+            default,
+            &cuda.geodesic_single,
+        ),
+        (
+            "hot flow, view 5",
+            (KERR_SPIN, DiskModel::TruncatedHotFlow, 5),
+            default,
+            &cuda.geodesic_single,
+        ),
+        (
+            "thin disk, elevation 0.2",
+            (KERR_SPIN, DiskModel::ThinNt, 0),
+            0.2,
+            &cuda.geodesic_scalar,
+        ),
     ];
     let caps = [10_000u32, 512, 256, 128, 64, 32, 1];
     let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
@@ -3184,7 +3337,11 @@ fn long_tail_time() {
             let mut times = vec![Vec::new(); caps.len()];
             for round in 0..SAMPLES + 5 {
                 for n in 0..caps.len() {
-                    let n = if round % 2 == 0 { n } else { caps.len() - 1 - n };
+                    let n = if round % 2 == 0 {
+                        n
+                    } else {
+                        caps.len() - 1 - n
+                    };
                     let [camera, disk, objects, sky] = &buffers[n];
                     let start = cuda.stream.record_event(timing).unwrap();
                     let mut builder = cuda.stream.launch_builder(kernel);
@@ -3199,7 +3356,11 @@ fn long_tail_time() {
                     builder.arg(&1u32);
                     builder.arg(&NO_TILE_ORDER);
                     builder.arg(&NO_TILE_ORDER);
-                    unsafe { builder.launch(ray_launch_config(width, height, true)).unwrap() };
+                    unsafe {
+                        builder
+                            .launch(ray_launch_config(width, height, true))
+                            .unwrap()
+                    };
                     drop(builder);
                     let end = cuda.stream.record_event(timing).unwrap();
                     end.synchronize().unwrap();
@@ -3216,7 +3377,10 @@ fn long_tail_time() {
                     format!("{cap}: {:.2}", 0.5 * (t[SAMPLES / 2 - 1] + t[SAMPLES / 2]))
                 })
                 .collect();
-            println!("{width}×{height} {name}: median ms by iteration cap {}", medians.join(", "));
+            println!(
+                "{width}×{height} {name}: median ms by iteration cap {}",
+                medians.join(", ")
+            );
         }
     }
 }
@@ -3231,26 +3395,47 @@ fn long_tail_rays() {
     let (width, height) = (400u32, 300u32);
     for (name, mode, elevation) in [
         ("thin disk", (KERR_SPIN, DiskModel::ThinNt, 0u32), default),
-        ("hot flow", (KERR_SPIN, DiskModel::TruncatedHotFlow, 5), default),
+        (
+            "hot flow",
+            (KERR_SPIN, DiskModel::TruncatedHotFlow, 5),
+            default,
+        ),
     ] {
-        let cam = crate::camera::OrbitalCamera { elevation, ..Default::default() };
+        let cam = crate::camera::OrbitalCamera {
+            elevation,
+            ..Default::default()
+        };
         let (_, data) = diagnose_single_hole(0, mode, &cam, (width, height));
         let rays = data.as_chunks::<RAY_FIELDS>().0;
         let mut order: Vec<usize> = (0..rays.len()).collect();
         order.sort_unstable_by_key(|&i| std::cmp::Reverse(rays[i][1] + rays[i][2]));
-        println!("{name}: x y | iterations steps rejected near_horizon far disk controller exit wide plasma vacuum_disk");
+        println!(
+            "{name}: x y | iterations steps rejected near_horizon far disk controller exit wide plasma vacuum_disk"
+        );
         for &i in &order[..24] {
             let r = &rays[i];
             println!(
                 "  {} {} | {} {} {} {} {} {} {} {} {} {} {}",
-                i % width as usize, i / width as usize,
-                r[0], r[1], r[2], r[3], r[4], r[5], r[6],
-                super::profile::RAY_EXITS[r[7] as usize], r[8], r[12], r[13]
+                i % width as usize,
+                i / width as usize,
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4],
+                r[5],
+                r[6],
+                super::profile::RAY_EXITS[r[7] as usize],
+                r[8],
+                r[12],
+                r[13]
             );
         }
         let mut exits = std::collections::BTreeMap::new();
         for &i in &order[..rays.len() / 1000] {
-            *exits.entry(super::profile::RAY_EXITS[rays[i][7] as usize]).or_insert(0) += 1;
+            *exits
+                .entry(super::profile::RAY_EXITS[rays[i][7] as usize])
+                .or_insert(0) += 1;
         }
         println!("  exits of the costliest 0.1%: {exits:?}");
     }
@@ -3274,10 +3459,22 @@ fn near_critical_capture_margin() {
     let [d_camera, _, d_objects, _] = scene_buffers(mode, &cam, (width, height), false);
     let config = DiskConfig::for_model(DiskModel::ThinNt, KERR_SPIN);
     let r1 = f64::from(
-        build_disk_uniform(&DiskConfigUniform { spin: config.spin, binary_enabled: false, ..DiskConfigUniform::default() }).r1,
+        build_disk_uniform(&DiskConfigUniform {
+            spin: config.spin,
+            binary_enabled: false,
+            ..DiskConfigUniform::default()
+        })
+        .r1,
     );
     let input: Vec<f32> = (0..pixels as u32)
-        .flat_map(|i| [(i % width) as f32, (i / width) as f32, width as f32, height as f32])
+        .flat_map(|i| {
+            [
+                (i % width) as f32,
+                (i / width) as f32,
+                width as f32,
+                height as f32,
+            ]
+        })
         .collect();
     let d_pixels = cuda.clone_htod(&input);
     let mut d_states = cuda.alloc_zeros::<f32>(pixels * 12);
@@ -3289,7 +3486,11 @@ fn near_critical_capture_margin() {
     launch.arg(&d_pixels);
     launch.arg(&mut d_states);
     launch.arg(&count);
-    let cfg = LaunchConfig { grid_dim: (count.div_ceil(64), 1, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 };
+    let cfg = LaunchConfig {
+        grid_dim: (count.div_ceil(64), 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
     unsafe { launch.launch(cfg).unwrap() };
     drop(launch);
     let states = cuda.clone_dtoh(&d_states);
@@ -3297,12 +3498,17 @@ fn near_critical_capture_margin() {
     let horizon = 1.0 + (1.0 - a * a).sqrt();
     let entry = r1 - 0.05;
     println!("r1 {r1:.4} horizon {horizon:.4}");
-    println!("x y | iterations exit | lambda K | s_min R_min R_min/P(s_min)^2 | R(entry) loose(entry)");
+    println!(
+        "x y | iterations exit | lambda K | s_min R_min R_min/P(s_min)^2 | R(entry) loose(entry)"
+    );
     let mut slow: Vec<usize> = (0..pixels).filter(|&i| rays[i][0] > 128).collect();
     slow.sort_unstable_by_key(|&i| std::cmp::Reverse(rays[i][0]));
     let (mut positive, mut total) = (0, 0);
     for &i in &slow {
-        let v: Vec<f64> = states[12 * i..12 * i + 12].iter().map(|&x| f64::from(x)).collect();
+        let v: Vec<f64> = states[12 * i..12 * i + 12]
+            .iter()
+            .map(|&x| f64::from(x))
+            .collect();
         let c = black_hole::separated::constants(a, [v[0], v[1], v[2]], [v[4], v[5], v[6], v[7]]);
         let lambda = c.angular / c.energy;
         let k = c.carter / (c.energy * c.energy) + (lambda - a) * (lambda - a);
@@ -3328,8 +3534,13 @@ fn near_critical_capture_margin() {
         if total <= 40 || r_min <= 0.0 {
             println!(
                 "{} {} | {} {} | {lambda:.5} {k:.5} | {s_min:.4} {r_min:.3e} {:.3e} | {:.3e} {:.3e}",
-                i % width as usize, i / width as usize, rays[i][0],
-                super::profile::RAY_EXITS[rays[i][7] as usize], r_min / (p * p), radial(entry), loose(entry)
+                i % width as usize,
+                i / width as usize,
+                rays[i][0],
+                super::profile::RAY_EXITS[rays[i][7] as usize],
+                r_min / (p * p),
+                radial(entry),
+                loose(entry)
             );
         }
     }
@@ -3350,10 +3561,30 @@ fn costliest_tiles_first() {
     let cuda = shared_cuda();
     let default = crate::camera::OrbitalCamera::default().elevation;
     let scenes = [
-        ("thin disk", (KERR_SPIN, DiskModel::ThinNt, 0u32), default, true),
-        ("thin disk, view 2", (KERR_SPIN, DiskModel::ThinNt, 2), default, false),
-        ("hot flow, view 5", (KERR_SPIN, DiskModel::TruncatedHotFlow, 5), default, false),
-        ("thin disk, elevation 0.2", (KERR_SPIN, DiskModel::ThinNt, 0), 0.2, true),
+        (
+            "thin disk",
+            (KERR_SPIN, DiskModel::ThinNt, 0u32),
+            default,
+            true,
+        ),
+        (
+            "thin disk, view 2",
+            (KERR_SPIN, DiskModel::ThinNt, 2),
+            default,
+            false,
+        ),
+        (
+            "hot flow, view 5",
+            (KERR_SPIN, DiskModel::TruncatedHotFlow, 5),
+            default,
+            false,
+        ),
+        (
+            "thin disk, elevation 0.2",
+            (KERR_SPIN, DiskModel::ThinNt, 0),
+            0.2,
+            true,
+        ),
     ];
     let timing = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT);
     println!("resident blocks: {}", cuda.ordered_resident_blocks);
@@ -3365,7 +3596,13 @@ fn costliest_tiles_first() {
         let octave = cost.ilog2();
         30u32.saturating_sub(2 * octave + u32::from(octave > 0 && cost >= 3 << (octave - 1)))
     };
-    for (width, height) in [(400u32, 300u32), (640, 480), (960, 540), (1280, 720), (1920, 1080)] {
+    for (width, height) in [
+        (400u32, 300u32),
+        (640, 480),
+        (960, 540),
+        (1280, 720),
+        (1920, 1080),
+    ] {
         let pixels = (width * height) as usize;
         let cfg = ray_launch_config(width, height, true);
         let tiles = cfg.grid_dim.0 * cfg.grid_dim.1;
@@ -3419,7 +3656,10 @@ fn costliest_tiles_first() {
                 run(true, &mut output, &mut order);
                 let image = cuda.clone_dtoh(&output);
                 assert!(
-                    image.iter().zip(&reference).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    image
+                        .iter()
+                        .zip(&reference)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
                     "{name}: ordering changes the image"
                 );
             }
@@ -3442,10 +3682,14 @@ fn costliest_tiles_first() {
             let costs = cuda.clone_dtoh(&order.costs);
             let mut seen = vec![false; tiles as usize];
             for &tile in &used {
-                assert!(!std::mem::replace(&mut seen[tile as usize], true), "{name}: tile {tile} twice");
+                assert!(
+                    !std::mem::replace(&mut seen[tile as usize], true),
+                    "{name}: tile {tile} twice"
+                );
             }
             assert!(
-                used.windows(2).all(|w| bucket(costs[w[0] as usize]) <= bucket(costs[w[1] as usize])),
+                used.windows(2)
+                    .all(|w| bucket(costs[w[0] as usize]) <= bucket(costs[w[1] as usize])),
                 "{name}: tiles out of cost order"
             );
             order.reorder();
@@ -3474,4 +3718,3 @@ fn costliest_tiles_first() {
         }
     }
 }
-

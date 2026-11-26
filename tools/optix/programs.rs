@@ -47,7 +47,9 @@ fn get_payload(slot: u32) -> u32 {
 
 #[inline(always)]
 fn set_payload(slot: u32, value: u32) {
-    unsafe { cuda_device::ptx_asm!("call _optix_set_payload, (%0, %1);", in("r") slot, in("r") value) };
+    unsafe {
+        cuda_device::ptx_asm!("call _optix_set_payload, (%0, %1);", in("r") slot, in("r") value)
+    };
 }
 
 #[inline(always)]
@@ -59,7 +61,14 @@ fn primitive_index() -> u32 {
 
 /// `optixTrace` with three payload values; the third is passed in only.
 #[inline(always)]
-fn trace3(handle: u64, origin: Vec3, direction: Vec3, tmax: f32, time: f32, p: [u32; 3]) -> (u32, u32) {
+fn trace3(
+    handle: u64,
+    origin: Vec3,
+    direction: Vec3,
+    tmax: f32,
+    time: f32,
+    p: [u32; 3],
+) -> (u32, u32) {
     let (p0, p1): (u32, u32);
     unsafe {
         cuda_device::ptx_asm!(

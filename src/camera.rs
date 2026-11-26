@@ -1,4 +1,5 @@
 use bevy::{
+    camera::visibility::RenderLayers,
     input::{
         InputSystems,
         mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll},
@@ -120,8 +121,18 @@ pub struct PerspectiveCamera;
 #[derive(Component)]
 pub struct BackgroundCamera;
 
+/// Gizmos draw only on this layer, which the 2D background camera does not see;
+/// otherwise it also draws them, in pixels, as a tiny copy at the screen centre.
+const GIZMO_LAYER: usize = 1;
+
 #[cfg_attr(test, mutants::skip)] // entity spawning only
-fn setup_cameras(mut commands: Commands) {
+fn setup_cameras(mut commands: Commands, gizmo_store: Option<ResMut<GizmoConfigStore>>) {
+    if let Some(mut store) = gizmo_store {
+        store
+            .config_mut::<DefaultGizmoConfigGroup>()
+            .0
+            .render_layers = RenderLayers::layer(GIZMO_LAYER);
+    }
     // 2D camera renders the compute-output sprite as a background (order 0).
     commands.spawn((
         Camera2d,
@@ -141,6 +152,7 @@ fn setup_cameras(mut commands: Commands) {
             ..default()
         },
         PerspectiveCamera,
+        RenderLayers::from_layers(&[0, GIZMO_LAYER]),
     ));
 }
 

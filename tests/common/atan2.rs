@@ -39,6 +39,9 @@ fn atan2_arith_meets_the_wgsl_bound() {
         let exact = (if y == 0.0 { 0.0 } else { y }).atan2(x);
         worst = worst.max((f64::from(values[n]) - exact).abs() / UNIT);
     }
-    println!("atan2_arith: {} points, worst error {worst:.3} u", points.len());
+    println!(
+        "atan2_arith: {} points, worst error {worst:.3} u",
+        points.len()
+    );
     assert!(worst <= 128.0, "atan2_arith error {worst} u");
 }

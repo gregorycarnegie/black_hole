@@ -61,8 +61,21 @@ pub fn capture_certified(spin: f32, disk_inner: f32, pos: [f32; 3], p: [f32; 4])
 
 /// Whether `radial_piece_certified` holds on each of `n` pieces of `[lo, hi]` that share
 /// their knots, so that they cover it.
-fn radial_pieces_certified(lo: f64, hi: f64, n: u32, aa: Interval, k: Interval, a2: Interval) -> bool {
-    let knot = |j: u32| if j == n { hi } else { lo + (hi - lo) * (f64::from(j) / f64::from(n)) };
+fn radial_pieces_certified(
+    lo: f64,
+    hi: f64,
+    n: u32,
+    aa: Interval,
+    k: Interval,
+    a2: Interval,
+) -> bool {
+    let knot = |j: u32| {
+        if j == n {
+            hi
+        } else {
+            lo + (hi - lo) * (f64::from(j) / f64::from(n))
+        }
+    };
     (1..=n).all(|j| radial_piece_certified(knot(j - 1), knot(j), aa, k, a2))
 }
 
@@ -108,7 +121,10 @@ mod tests {
     #[case::inside_the_disk_edge([1.0, -5.0, 0.0, 0.0], 3.0, false)]
     #[case::forward_ray([-1.0, 5.0, 0.0, 0.0], 6.0, false)]
     fn radial_rays(#[case] p: [f32; 4], #[case] disk_inner: f32, #[case] certified: bool) {
-        assert_eq!(capture_certified(0.0, disk_inner, [3.0, 0.0, 0.0], p), certified);
+        assert_eq!(
+            capture_certified(0.0, disk_inner, [3.0, 0.0, 0.0], p),
+            certified
+        );
     }
 
     fn radial(a: f64, lambda: f64, k: f64, s: f64) -> f64 {
@@ -173,6 +189,11 @@ mod tests {
 
     #[test]
     fn spin_beyond_extremal_is_undecided() {
-        assert!(!capture_certified(1.5, 6.0, [3.0, 0.0, 0.0], [1.0, -5.0, 0.0, 0.0]));
+        assert!(!capture_certified(
+            1.5,
+            6.0,
+            [3.0, 0.0, 0.0],
+            [1.0, -5.0, 0.0, 0.0]
+        ));
     }
 }
