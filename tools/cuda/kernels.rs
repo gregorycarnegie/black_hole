@@ -3236,27 +3236,50 @@ fn leg_band_time(cos: f64, rate: f64, band: f64, a2: f64, lambda: f64, eta: f64)
     if !(start > band) {
         return -1.0;
     }
-    let (scale, top32, a2_32) = ((eta / up) as f32, top as f32, a2 as f32);
-    // ∫ dμ / √M from |cos θ| = lo to hi, as one or two pieces.
-    let toward = cos * rate <= 0.0;
-    let mut total = 0.0_f64;
-    let mut piece = 0;
-    while piece < if toward { 1 } else { 2 } {
-        let (lo, hi) = if toward { (band, start) } else if piece == 0 { (start, top) } else { (band, top) };
-        let (t_lo, t_hi) = (sqrt64((top - hi).max(0.0)), sqrt64(top - lo));
-        let (mid, half) = ((0.5 * (t_hi + t_lo)) as f32, (0.5 * (t_hi - t_lo)) as f32);
-        let mut sum = 0.0_f32;
-        let mut i = 0;
-        while i < 8 {
-            let t = mid + if i % 2 == 0 { -1.0 } else { 1.0 } * half * LEG_GL_NODES[i / 2] as f32;
-            let mu = top32 - t * t;
-            sum += LEG_GL_WEIGHTS[i / 2] as f32 * 2.0 / sqrt((top32 + mu) * (scale + a2_32 * mu * mu));
-            i += 1;
-        }
-        total += f64::from(sum * half);
-        piece += 1;
+    // The elliptic form F(φ, k) / √D of `band_time`, with sin φ, cos φ and Δ in binary64.
+    let (scale, d) = (eta / up, eta / up + a2 * up);
+    let k2 = a2 * up / d;
+    let (s1, c1, d1) = (sqrt64((top - band) * (top + band)) / top, band / top, sqrt64((scale + a2 * band * band) / d));
+    let (s2, c2, d2) = (sqrt64((top - start) * (top + start)) / top, start / top, sqrt64((scale + a2 * start * start) / d));
+    let elliptic = if cos * rate <= 0.0 {
+        // Toward the equator: F(φ_band) - F(φ_start) = F(ψ) by the addition theorem.
+        let s = (s1 * c2 * d2 - s2 * c1 * d1) / (1.0 - k2 * s1 * s1 * s2 * s2);
+        let cos2 = ((1.0 - s) * (1.0 + s)).max(0.0);
+        f64::from(s as f32 * leg_rf(cos2 as f32, (1.0 - k2 * s * s) as f32))
+    } else {
+        // Out to μ₊ and back.
+        f64::from(s2 as f32 * leg_rf((c2 * c2) as f32, (d2 * d2) as f32))
+            + f64::from(s1 as f32 * leg_rf((c1 * c1) as f32, (d1 * d1) as f32))
+    };
+    elliptic / sqrt64(d)
+}
+
+/// Duplication steps of `leg_rf` (`separated::escape::RF_STEPS`).
+const LEG_RF_STEPS: i32 = 5;
+
+/// Carlson's R_F(x, y, 1) for x, y in (0, 1] (`separated::escape::rf32`).
+#[inline(always)]
+fn leg_rf(x: f32, y: f32) -> f32 {
+    let a0 = (x + y + 1.0) / 3.0;
+    let (mut x_n, mut y_n, mut z_n, mut a) = (x, y, 1.0_f32, a0);
+    let mut scale = 1.0_f32;
+    let mut i = 0;
+    while i < LEG_RF_STEPS {
+        let (sx, sy, sz) = (sqrt(x_n), sqrt(y_n), sqrt(z_n));
+        let lambda = sx * sy + sy * sz + sz * sx;
+        a = 0.25 * (a + lambda);
+        x_n = 0.25 * (x_n + lambda);
+        y_n = 0.25 * (y_n + lambda);
+        z_n = 0.25 * (z_n + lambda);
+        scale *= 0.25;
+        i += 1;
     }
-    total
+    let dx = (a0 - x) * scale / a;
+    let dy = (a0 - y) * scale / a;
+    let dz = -dx - dy;
+    let e2 = dx * dy - dz * dz;
+    let e3 = dx * dy * dz;
+    (1.0 - e2 / 10.0 + e3 / 14.0 + e2 * e2 / 24.0 - 3.0 * e2 * e3 / 44.0) / sqrt(a)
 }
 
 /// The polar perturbation's rates (`separated::escape::vacuum_leg`): with

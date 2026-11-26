@@ -134,10 +134,38 @@ fn piece_sum(
     (f64::from(floor) > RADIAL_FLOOR).then(|| (f64::from(mino) * half, f64::from(phi) * half))
 }
 
+/// Duplication steps of [`rf32`]. Four already reach binary32 rounding in
+/// [`band_time`] for disks down to H/R = 5e-4; one more is margin.
+const RF_STEPS: i32 = 5;
+
+/// Carlson's R_F(x, y, 1) for x, y in (0, 1], in binary32 with a fixed number of
+/// duplications as on the GPU (`elliptic::rf` is the binary64 reference).
+fn rf32(x: f32, y: f32) -> f32 {
+    let a0 = (x + y + 1.0) / 3.0;
+    let (mut x_n, mut y_n, mut z_n, mut a) = (x, y, 1.0_f32, a0);
+    for _ in 0..RF_STEPS {
+        let (sx, sy, sz) = (x_n.sqrt(), y_n.sqrt(), z_n.sqrt());
+        let lambda = sx * sy + sy * sz + sz * sx;
+        a = 0.25 * (a + lambda);
+        x_n = 0.25 * (x_n + lambda);
+        y_n = 0.25 * (y_n + lambda);
+        z_n = 0.25 * (z_n + lambda);
+    }
+    let scale = 0.25_f32.powi(RF_STEPS);
+    let dx = (a0 - x) * scale / a;
+    let dy = (a0 - y) * scale / a;
+    let dz = -dx - dy;
+    let e2 = dx * dy - dz * dz;
+    let e3 = dx * dy * dz;
+    (1.0 - e2 / 10.0 + e3 / 14.0 + e2 * e2 / 24.0 - 3.0 * e2 * e3 / 44.0) / a.sqrt()
+}
+
 /// Mino time until |cos θ| first falls to `band`, from cos θ = `cos` moving at
-/// d(cos θ)/dτ = `rate`. (d cos θ / dτ)² = M = (μ₊² - cos²θ)(η / μ₊² + a² cos²θ), and
-/// t = √(μ₊ - |cos θ|) removes the turning point. Infinite for vortical rays (η < 0)
-/// that stay outside the band; `None` for the others and for a start inside the band.
+/// d(cos θ)/dτ = `rate`. (d cos θ / dτ)² = M = (μ₊² - cos²θ)(η / μ₊² + a² cos²θ);
+/// with |cos θ| = μ₊ cos φ the time from μ₊ is the elliptic integral F(φ, k) / √D,
+/// D = η / μ₊² + a² μ₊², k² = a² μ₊² / D. A Gauss–Legendre sum missed the near
+/// pole of M at small η by up to 5e-3. Infinite for vortical rays (η < 0) that
+/// stay outside the band; `None` for the others and for a start inside the band.
 #[allow(
     clippy::neg_cmp_op_on_partial_ord,
     reason = "NaN must fail every guard"
@@ -156,27 +184,30 @@ fn band_time(cos: f64, rate: f64, band: f64, (a2, lambda, eta): (f64, f64, f64))
     if !(start > band) {
         return None;
     }
-    let (scale, top32, a2_32) = ((eta / up) as f32, top as f32, a2 as f32);
-    // ∫ dμ / √M from |cos θ| = lo to hi <= μ₊.
-    let integral = |lo: f64, hi: f64| {
-        let (t_lo, t_hi) = ((top - hi).max(0.0).sqrt(), (top - lo).sqrt());
-        let (mid, half) = ((0.5 * (t_hi + t_lo)) as f32, (0.5 * (t_hi - t_lo)) as f32);
-        let mut sum = 0.0_f32;
-        for (node, weight) in GL_NODES.iter().zip(GL_WEIGHTS) {
-            for side in [-1.0_f32, 1.0] {
-                let t = mid + side * half * *node as f32;
-                let mu = top32 - t * t;
-                sum += weight as f32 * 2.0 / ((top32 + mu) * (scale + a2_32 * mu * mu)).sqrt();
-            }
-        }
-        f64::from(sum * half)
+    let (scale, d) = (eta / up, eta / up + a2 * up);
+    // sin φ, cos φ and Δ = √(1 - k² sin²φ) at |cos θ| = μ, in binary64.
+    let angle = |mu: f64| {
+        let sin = ((top - mu) * (top + mu)).sqrt() / top;
+        (sin, mu / top, ((scale + a2 * mu * mu) / d).sqrt())
     };
-    // Toward the equator directly, or out to μ₊ and back.
-    Some(if cos * rate <= 0.0 {
-        integral(band, start)
+    // F(φ) = sin φ R_F(cos²φ, Δ², 1), for 0 ≤ φ < π/2.
+    let f =
+        |sin: f64, cos2: f64, delta2: f64| f64::from(sin as f32 * rf32(cos2 as f32, delta2 as f32));
+    let [(s1, c1, d1), (s2, c2, d2)] = [angle(band), angle(start)];
+    let elliptic = if cos * rate <= 0.0 {
+        // Toward the equator: F(φ_band) - F(φ_start) = F(ψ) by the addition theorem,
+        // which keeps the difference accurate when the start is near the band.
+        let sin = (s1 * c2 * d2 - s2 * c1 * d1) / (1.0 - a2 * up / d * s1 * s1 * s2 * s2);
+        f(
+            sin,
+            ((1.0 - sin) * (1.0 + sin)).max(0.0),
+            1.0 - a2 * up / d * sin * sin,
+        )
     } else {
-        integral(start, top) + integral(band, top)
-    })
+        // Out to μ₊ and back.
+        f(s2, c2 * c2, d2 * d2) + f(s1, c1 * c1, d1 * d1)
+    };
+    Some(elliptic / d.sqrt())
 }
 
 /// The end of the vacuum leg from `pos` with covariant momentum `p` (conventions of
